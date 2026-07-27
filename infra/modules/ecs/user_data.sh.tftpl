@@ -1,0 +1,72 @@
+#!/bin/bash
+set -euo pipefail
+exec > >(tee /var/log/fanosbingo-bootstrap.log | logger -t bootstrap -s 2>/dev/console) 2>&1
+
+echo "=== Fanos Bingo container instance bootstrap ==="
+
+# ---------------------------------------------------------------------------
+# 1. Join the ECS cluster
+# ---------------------------------------------------------------------------
+cat >> /etc/ecs/ecs.config <<EOF
+ECS_CLUSTER=${cluster_name}
+ECS_ENABLE_CONTAINER_METADATA=true
+ECS_ENABLE_SPOT_INSTANCE_DRAINING=true
+ECS_CONTAINER_STOP_TIMEOUT=30s
+ECS_IMAGE_PULL_BEHAVIOR=prefer-cached
+EOF
+
+# ---------------------------------------------------------------------------
+# 2. Swap
+#
+# The Realtime container (Elixir/BEAM) is the memory-hungry one at ~400 MB.
+# Total steady-state footprint is ~1.03 GB of the 2 GB on t4g.small, so this is
+# headroom rather than a crutch — but an OOM kill during a join spike would take
+# the game down, and swap turns that into a slowdown instead.
+# ---------------------------------------------------------------------------
+if [ ! -f /swapfile ]; then
+  echo "Creating ${swap_size_mb}MB swapfile"
+  dd if=/dev/zero of=/swapfile bs=1M count=${swap_size_mb} status=none
+  chmod 600 /swapfile
+  mkswap /swapfile
+  swapon /swapfile
+  echo '/swapfile none swap sw 0 0' >> /etc/fstab
+  # Prefer reclaiming page cache over swapping application memory.
+  sysctl -w vm.swappiness=10
+  echo 'vm.swappiness=10' > /etc/sysctl.d/99-swappiness.conf
+fi
+
+# ---------------------------------------------------------------------------
+# 3. Re-attach the Elastic IP
+#
+# The ASG replaces a failed instance with a brand-new one that has a brand-new
+# public IP. Re-associating the environment's Elastic IP here means recovery
+# needs no DNS change and no human — Cloudflare keeps pointing at the same
+# address throughout.
+# ---------------------------------------------------------------------------
+if ! command -v aws >/dev/null 2>&1; then
+  echo "AWS CLI missing; installing"
+  dnf install -y awscli-2 || dnf install -y aws-cli || true
+fi
+
+TOKEN=$(curl -sX PUT "http://169.254.169.254/latest/api/token" \
+  -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+  http://169.254.169.254/latest/meta-data/instance-id)
+
+echo "Associating EIP ${eip_allocation_id} with $INSTANCE_ID"
+if aws ec2 associate-address \
+  --region ${region} \
+  --instance-id "$INSTANCE_ID" \
+  --allocation-id ${eip_allocation_id} \
+  --allow-reassociation; then
+  echo "EIP associated"
+else
+  # Loud, because the symptom otherwise is "the site is down and I don't know
+  # why": the instance is healthy and serving, just not on the address
+  # Cloudflare resolves to.
+  echo "ERROR: EIP association FAILED. The instance is running but unreachable"
+  echo "ERROR: at the expected address. Check the instance role's"
+  echo "ERROR: ec2:AssociateAddress permission and the Environment tag condition."
+fi
+
+echo "=== bootstrap complete ==="

@@ -1,0 +1,347 @@
+name: Terraform
+
+# Infrastructure changes reach AWS through exactly one path: this workflow.
+#
+#   Pull request  -> validate, security-scan, plan dev, comment the plan on the PR
+#   Merge to main -> plan + apply prod, gated by the `prod` GitHub Environment
+#                    AND by the PROD_APPLY_ENABLED repository variable
+#   Manual        -> plan / apply / destroy any environment on demand
+#
+# Dev is deliberately NOT applied on merge: it is on-demand infrastructure, stood
+# up to test something and destroyed afterwards. Leaving it running would roughly
+# double the monthly bill.
+#
+# Authentication is OIDC. There is no AWS access key stored in this repository.
+
+on:
+  pull_request:
+    paths:
+      - 'infra/**'
+      - '.github/workflows/terraform.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'infra/**'
+      - '.github/workflows/terraform.yml'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to act on'
+        required: true
+        type: choice
+        options: [dev, prod]
+        default: dev
+      action:
+        description: 'What to do'
+        required: true
+        type: choice
+        options: [plan, apply, destroy]
+        default: plan
+
+permissions:
+  contents: read
+  id-token: write        # request the OIDC token
+  pull-requests: write   # comment the plan
+
+env:
+  TF_VERSION: '1.15.8'
+  TF_IN_AUTOMATION: 'true'
+  TF_INPUT: '0'
+
+jobs:
+  # ==========================================================================
+  # Resolve the target environment ONCE, so plan and apply can never disagree
+  # about what they are acting on.
+  # ==========================================================================
+  resolve:
+    name: Resolve target
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.target.outputs.environment }}
+    steps:
+      - id: target
+        run: |
+          case "${{ github.event_name }}" in
+            workflow_dispatch) target="${{ github.event.inputs.environment }}" ;;
+            push)              target="prod" ;;   # merge to main targets prod
+            *)                 target="dev"  ;;   # PRs plan against dev
+          esac
+          echo "environment=$target" >> "$GITHUB_OUTPUT"
+          echo "Target environment: $target"
+
+  # ==========================================================================
+  # Static checks. Fast, and they need no AWS credentials at all.
+  # ==========================================================================
+  validate:
+    name: Validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Check formatting
+        run: terraform fmt -check -recursive infra/
+
+      - name: Validate every environment
+        run: |
+          for env_dir in infra/environments/*/; do
+            [ -f "$env_dir/main.tf" ] || { echo "skipping $env_dir (no main.tf)"; continue; }
+            echo "::group::validate $env_dir"
+            # -backend=false: validation needs no state and no credentials.
+            terraform -chdir="$env_dir" init -backend=false
+            terraform -chdir="$env_dir" validate
+            echo "::endgroup::"
+          done
+
+      - name: Security scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: config
+          scan-ref: infra/
+          severity: HIGH,CRITICAL
+          exit-code: '1'
+          trivy-config: .trivy.yaml
+
+  # ==========================================================================
+  # Plan
+  # ==========================================================================
+  plan:
+    name: Plan (${{ needs.resolve.outputs.environment }})
+    needs: [resolve, validate]
+    if: github.event_name != 'workflow_dispatch' || github.event.inputs.action != 'destroy'
+    runs-on: ubuntu-latest
+    environment: ${{ needs.resolve.outputs.environment }}
+    env:
+      TF_DIR: infra/environments/${{ needs.resolve.outputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Assume AWS role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: tf-plan-${{ github.run_id }}
+
+      - name: Terraform init
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform init -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}"
+
+      - name: Terraform plan
+        id: plan
+        working-directory: ${{ env.TF_DIR }}
+        env:
+          TF_VAR_domain_name: ${{ vars.DOMAIN_NAME }}
+          TF_VAR_github_repository: ${{ github.repository }}
+          TF_VAR_alert_emails: '["${{ vars.ALERT_EMAIL }}"]'
+        run: |
+          set +e
+          terraform plan -detailed-exitcode -no-color -out=tfplan > plan.txt 2>&1
+          code=$?
+          set -e
+          # -detailed-exitcode: 0 = no changes, 1 = error, 2 = changes present.
+          case $code in
+            0) echo "has_changes=false" >> "$GITHUB_OUTPUT" ;;
+            2) echo "has_changes=true"  >> "$GITHUB_OUTPUT" ;;
+            *) cat plan.txt; exit 1 ;;
+          esac
+          # PR comments cap out around 65k characters.
+          tail -c 60000 plan.txt > plan-truncated.txt
+
+      - name: Summarise plan
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          {
+            echo "### Plan — ${{ needs.resolve.outputs.environment }}"
+            echo
+            echo '```terraform'
+            tail -c 40000 plan.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Comment plan on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        env:
+          TF_DIR: ${{ env.TF_DIR }}
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync(`${process.env.TF_DIR}/plan-truncated.txt`, 'utf8');
+            const changed = '${{ steps.plan.outputs.has_changes }}' === 'true';
+            const body = [
+              `### Terraform plan — \`${{ needs.resolve.outputs.environment }}\``,
+              '',
+              changed
+                ? 'Changes are pending.'
+                : 'No changes. Infrastructure matches the configuration.',
+              '',
+              '<details><summary>Show plan</summary>',
+              '',
+              '```terraform',
+              plan,
+              '```',
+              '</details>',
+            ].join('\n');
+
+            // Update our previous comment rather than stacking one per push.
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const mine = comments.find(c =>
+              c.user.type === 'Bot' && c.body.includes('### Terraform plan'));
+            if (mine) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                comment_id: mine.id, body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: context.issue.number, body,
+              });
+            }
+
+  # ==========================================================================
+  # Apply
+  #
+  # Two independent gates on the merge-to-main path:
+  #
+  #   1. PROD_APPLY_ENABLED must be the string "true". Until you set it, merging
+  #      infra changes plans but never applies. This exists because a missing
+  #      GitHub Environment is created IMPLICITLY AND WITHOUT PROTECTION RULES —
+  #      so relying on the environment alone would give you no gate at all until
+  #      you had manually created it.
+  #   2. The `prod` GitHub Environment's required reviewers.
+  # ==========================================================================
+  apply:
+    name: Apply (${{ needs.resolve.outputs.environment }})
+    needs: [resolve, plan]
+    if: |
+      (github.event_name == 'push' &&
+       github.ref == 'refs/heads/main' &&
+       vars.PROD_APPLY_ENABLED == 'true') ||
+      (github.event_name == 'workflow_dispatch' &&
+       github.event.inputs.action == 'apply')
+    runs-on: ubuntu-latest
+    environment: ${{ needs.resolve.outputs.environment }}
+    concurrency:
+      # Never let two applies touch one environment at once. State locking would
+      # catch it, but failing here is clearer than a lock timeout.
+      group: terraform-apply-${{ needs.resolve.outputs.environment }}
+      cancel-in-progress: false
+    env:
+      TF_DIR: infra/environments/${{ needs.resolve.outputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Assume AWS role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: tf-apply-${{ github.run_id }}
+
+      - name: Terraform init
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform init -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}"
+
+      # Re-plan rather than applying the artifact from the plan job: a saved plan
+      # may reference a stale state serial by the time an approval lands.
+      - name: Terraform apply
+        working-directory: ${{ env.TF_DIR }}
+        env:
+          TF_VAR_domain_name: ${{ vars.DOMAIN_NAME }}
+          TF_VAR_github_repository: ${{ github.repository }}
+          TF_VAR_alert_emails: '["${{ vars.ALERT_EMAIL }}"]'
+        run: terraform apply -auto-approve
+
+      - name: Summarise outputs
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          {
+            echo "### Applied — ${{ needs.resolve.outputs.environment }}"
+            echo
+            echo '```'
+            terraform output 2>/dev/null || echo "(no outputs)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Operations Terraform cannot express as resources: rebooting RDS so the
+      # static parameters it just wrote take effect, and publishing the
+      # hot-wallet address derived from the KMS public key. Idempotent, so this
+      # is a no-op on a steady-state apply.
+      - name: Install dependencies for wallet derivation
+        run: npm ci --omit=dev --ignore-scripts
+
+      - name: Post-apply operations
+        run: ./scripts/post-apply.sh ${{ needs.resolve.outputs.environment }}
+
+  # ==========================================================================
+  # Destroy. Manual only, and refuses prod outright.
+  # ==========================================================================
+  destroy:
+    name: Destroy (${{ needs.resolve.outputs.environment }})
+    needs: [resolve, validate]
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'destroy'
+    runs-on: ubuntu-latest
+    environment: ${{ needs.resolve.outputs.environment }}
+    concurrency:
+      group: terraform-apply-${{ needs.resolve.outputs.environment }}
+      cancel-in-progress: false
+    env:
+      TF_DIR: infra/environments/${{ needs.resolve.outputs.environment }}
+    steps:
+      - name: Refuse to destroy prod
+        if: needs.resolve.outputs.environment == 'prod'
+        run: |
+          echo "::error::Refusing to destroy prod from CI."
+          echo "Prod holds player balances and a funded hot wallet. If you genuinely"
+          echo "mean to tear it down, do it deliberately from a workstation after"
+          echo "taking a final snapshot and sweeping the wallet."
+          exit 1
+
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Assume AWS role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: tf-destroy-${{ github.run_id }}
+
+      - name: Terraform init
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform init -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}"
+
+      - name: Terraform destroy
+        working-directory: ${{ env.TF_DIR }}
+        env:
+          TF_VAR_domain_name: ${{ vars.DOMAIN_NAME }}
+          TF_VAR_github_repository: ${{ github.repository }}
+          TF_VAR_alert_emails: '["${{ vars.ALERT_EMAIL }}"]'
+        run: terraform destroy -auto-approve
