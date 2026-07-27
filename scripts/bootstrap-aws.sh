@@ -29,14 +29,39 @@ AWS_REGION="${AWS_REGION:-us-east-1}"
 PROJECT="${PROJECT:-fanosbingo}"
 ROLE_NAME="${ROLE_NAME:-${PROJECT}-terraform-executor}"
 
-# Branches permitted to assume the role. Deliberately not "*", which would let a
-# pull request from a fork run Terraform against your account.
-ALLOWED_SUBJECTS=(
-  "repo:${GITHUB_REPOSITORY}:ref:refs/heads/main"
-  "repo:${GITHUB_REPOSITORY}:environment:dev"
-  "repo:${GITHUB_REPOSITORY}:environment:prod"
-  "repo:${GITHUB_REPOSITORY}:pull_request"
+# Contexts permitted to assume the role. Deliberately not a bare "*", which
+# would let any workflow in any repository run Terraform against this account.
+#
+# TWO prefix forms are listed for each context, and this is not redundancy:
+#
+#   repo:owner/name:...              the classic, documented form
+#   repo:owner@<id>/name@<id>:...    GitHub's IMMUTABLE subject prefix
+#
+# GitHub now emits subject claims containing numeric owner and repository IDs,
+# so that renaming an account or repository does not silently break trust
+# policies. The consequence is that a trust policy written the documented way
+# matches nothing, and STS returns a flatly unhelpful "Not authorized to perform
+# sts:AssumeRoleWithWebIdentity". Check which form your repository emits with:
+#
+#   gh api repos/OWNER/NAME/actions/oidc/customization/sub
+#
+# The wildcards only cover the numeric IDs. Account names cannot contain "@", so
+# "owner@*" still pins the owner name exactly — the scoping is not weakened.
+GITHUB_OWNER="${GITHUB_REPOSITORY%%/*}"
+GITHUB_NAME="${GITHUB_REPOSITORY##*/}"
+
+ALLOWED_CONTEXTS=(
+  "ref:refs/heads/main"
+  "environment:dev"
+  "environment:prod"
+  "pull_request"
 )
+
+ALLOWED_SUBJECTS=()
+for ctx in "${ALLOWED_CONTEXTS[@]}"; do
+  ALLOWED_SUBJECTS+=("repo:${GITHUB_REPOSITORY}:${ctx}")
+  ALLOWED_SUBJECTS+=("repo:${GITHUB_OWNER}@*/${GITHUB_NAME}@*:${ctx}")
+done
 
 RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[0;33m'; BOLD=$'\033[1m'; NC=$'\033[0m'
 info()  { echo "${GREEN}==>${NC} $*"; }
@@ -132,6 +157,16 @@ fi
 # 3. Terraform executor role
 # ---------------------------------------------------------------------------
 info "Terraform executor role"
+
+# Report the prefix GitHub actually emits, so a mismatch is visible here rather
+# than as an opaque STS rejection thirty minutes later.
+if command -v gh >/dev/null 2>&1; then
+  actual_prefix="$(gh api "repos/${GITHUB_REPOSITORY}/actions/oidc/customization/sub" \
+    --jq '.sub_claim_prefix' 2>/dev/null || echo "")"
+  if [ -n "$actual_prefix" ]; then
+    info "  GitHub emits subject prefix: ${actual_prefix}"
+  fi
+fi
 
 SUBJECT_JSON="$(printf '%s\n' "${ALLOWED_SUBJECTS[@]}" | jq -R . | jq -sc .)"
 
