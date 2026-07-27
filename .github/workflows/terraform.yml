@@ -144,6 +144,9 @@ jobs:
           TF_VAR_domain_name: ${{ vars.DOMAIN_NAME }}
           TF_VAR_github_repository: ${{ github.repository }}
           TF_VAR_alert_emails: '["${{ vars.ALERT_EMAIL }}"]'
+          # Null until the first image is pushed, which keeps Terraform from
+          # creating a service whose tasks can never start.
+          TF_VAR_ticker_image: ${{ vars.TICKER_IMAGE }}
         run: |
           set +e
           terraform plan -detailed-exitcode -no-color -out=tfplan > plan.txt 2>&1
@@ -275,6 +278,9 @@ jobs:
           TF_VAR_domain_name: ${{ vars.DOMAIN_NAME }}
           TF_VAR_github_repository: ${{ github.repository }}
           TF_VAR_alert_emails: '["${{ vars.ALERT_EMAIL }}"]'
+          # Null until the first image is pushed, which keeps Terraform from
+          # creating a service whose tasks can never start.
+          TF_VAR_ticker_image: ${{ vars.TICKER_IMAGE }}
         run: terraform apply -auto-approve
 
       - name: Summarise outputs
@@ -346,4 +352,7 @@ jobs:
           TF_VAR_domain_name: ${{ vars.DOMAIN_NAME }}
           TF_VAR_github_repository: ${{ github.repository }}
           TF_VAR_alert_emails: '["${{ vars.ALERT_EMAIL }}"]'
+          # Null until the first image is pushed, which keeps Terraform from
+          # creating a service whose tasks can never start.
+          TF_VAR_ticker_image: ${{ vars.TICKER_IMAGE }}
         run: terraform destroy -auto-approve

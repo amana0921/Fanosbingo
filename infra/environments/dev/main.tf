@@ -120,6 +120,65 @@ module "iam" {
   create_github_oidc_provider = var.create_github_oidc_provider
 }
 
+# ---------------------------------------------------------------------------
+# Services
+#
+# The ticker is the game's heartbeat. It is intentionally the first service
+# deployed: it has no ingress, no TLS and no dependency on Caddy, so it proves
+# the container path (image pull, secret injection, logging, IAM) with the
+# fewest moving parts.
+#
+# image is var-driven so CI can deploy a new git-SHA tag without a terraform
+# apply. The service ignores task_definition changes for the same reason.
+# ---------------------------------------------------------------------------
+module "service_ticker" {
+  source = "../../modules/ecs_service"
+
+  # No image, no service. Creating a service that references an image which does
+  # not exist yet produces one that can never start a task and retries forever.
+  # Build and push first (deploy-services workflow), then set TICKER_IMAGE.
+  count = var.ticker_image == null ? 0 : 1
+
+  name_prefix       = local.name_prefix
+  name              = "ticker"
+  cluster_arn       = module.ecs.cluster_arn
+  capacity_provider = module.ecs.capacity_provider_name
+  log_group_name    = module.ecs.log_group_name
+
+  image              = var.ticker_image
+  task_role_arn      = module.iam.task_ticker_role_arn
+  execution_role_arn = module.iam.task_execution_role_arn
+
+  # No ports: the ticker talks only to the database.
+  network_mode       = "bridge"
+  cpu                = 128
+  memory_reservation = 160
+
+  environment_variables = {
+    ENVIRONMENT      = var.environment
+    AWS_REGION       = var.aws_region
+    METRIC_NAMESPACE = module.iam.metric_namespace
+    PGHOST           = module.rds.address
+    PGPORT           = tostring(module.rds.port)
+    PGDATABASE       = module.rds.database_name
+    PGUSER           = "app_service"
+    PGSSLMODE        = "require"
+    TICK_INTERVAL_MS = "1000"
+    CALL_INTERVAL_MS = "3500"
+  }
+
+  # Fetched by the ECS agent at container start. Never in the task definition,
+  # never in Terraform state.
+  secrets = {
+    PGPASSWORD = "/${local.name_prefix}/db/app_password"
+  }
+
+  # Long enough for the shutdown handler to release the advisory lock, so a
+  # standby takes over in milliseconds rather than waiting for the connection
+  # to be reaped.
+  stop_timeout = 30
+}
+
 module "monitoring" {
   source = "../../modules/monitoring"
 

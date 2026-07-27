@@ -1,0 +1,139 @@
+name: Deploy services
+
+# Builds a container image, pushes it to ECR tagged by git SHA, and rolls the
+# ECS service onto it.
+#
+# Images are tagged by COMMIT SHA, never :latest. The ECR repositories are
+# IMMUTABLE, so a tag can never be repointed at different bytes: whatever is
+# running is always traceable to a commit, and a rollback is re-deploying an
+# older SHA rather than rebuilding and hoping.
+#
+# Build is arm64 to match the Graviton (t4g.small) instance. An x86 image will
+# push happily and then fail at runtime with "exec format error", which is a
+# confusing way to learn about architecture.
+
+on:
+  workflow_dispatch:
+    inputs:
+      service:
+        description: 'Service to build and deploy'
+        required: true
+        type: choice
+        options: [ticker, functions, caddy]
+        default: ticker
+      environment:
+        description: 'Environment'
+        required: true
+        type: choice
+        options: [dev, prod]
+        default: dev
+      deploy:
+        description: 'Roll the ECS service after pushing (uncheck to build only)'
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  build:
+    name: ${{ github.event.inputs.service }} -> ${{ github.event.inputs.environment }}
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment }}
+    concurrency:
+      group: deploy-${{ github.event.inputs.environment }}-${{ github.event.inputs.service }}
+      cancel-in-progress: false
+    env:
+      SERVICE: ${{ github.event.inputs.service }}
+      ENVIRONMENT: ${{ github.event.inputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assume AWS role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: deploy-${{ github.run_id }}
+
+      - name: Log in to ECR
+        id: ecr
+        run: |
+          set -euo pipefail
+          ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
+          REGISTRY="${ACCOUNT}.dkr.ecr.${{ vars.AWS_REGION }}.amazonaws.com"
+          aws ecr get-login-password --region "${{ vars.AWS_REGION }}" \
+            | docker login --username AWS --password-stdin "$REGISTRY"
+          echo "registry=$REGISTRY" >> "$GITHUB_OUTPUT"
+          echo "repository=${REGISTRY}/fanosbingo-${ENVIRONMENT}/${SERVICE}" >> "$GITHUB_OUTPUT"
+
+      # QEMU so an x86 runner can build arm64. Slower than a native arm64
+      # runner, but free on private repositories.
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: services/${{ github.event.inputs.service }}
+          platforms: linux/arm64
+          push: true
+          tags: ${{ steps.ecr.outputs.repository }}:${{ github.sha }}
+          # Cache layers in the registry so a source-only change does not
+          # reinstall dependencies under QEMU every time.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+
+      - name: Deploy
+        if: github.event.inputs.deploy == 'true'
+        run: |
+          set -euo pipefail
+          CLUSTER="fanosbingo-${ENVIRONMENT}"
+          FAMILY="fanosbingo-${ENVIRONMENT}-${SERVICE}"
+          IMAGE="${{ steps.ecr.outputs.repository }}:${{ github.sha }}"
+
+          if ! aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" \
+               --query 'services[0].status' --output text 2>/dev/null | grep -q ACTIVE; then
+            echo "::warning::Service '$SERVICE' does not exist yet in $CLUSTER."
+            echo "Image pushed: $IMAGE"
+            echo "Set the ${SERVICE^^}_IMAGE repository variable to this value and run the Terraform workflow to create the service."
+            echo "IMAGE=$IMAGE" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          # Take the live task definition and swap only the image, so any change
+          # Terraform has made to environment, secrets or logging is preserved.
+          TASKDEF="$(aws ecs describe-task-definition --task-definition "$FAMILY" \
+            --query 'taskDefinition' --output json)"
+
+          NEW="$(echo "$TASKDEF" | jq --arg IMAGE "$IMAGE" '
+            .containerDefinitions[0].image = $IMAGE
+            | del(.taskDefinitionArn, .revision, .status, .requiresAttributes,
+                  .compatibilities, .registeredAt, .registeredBy)')"
+
+          REVISION="$(echo "$NEW" | aws ecs register-task-definition \
+            --cli-input-json file:///dev/stdin \
+            --query 'taskDefinition.taskDefinitionArn' --output text)"
+
+          echo "Registered $REVISION"
+
+          aws ecs update-service --cluster "$CLUSTER" --service "$SERVICE" \
+            --task-definition "$REVISION" --query 'service.serviceName' --output text
+
+          echo "Waiting for the service to stabilise"
+          aws ecs wait services-stable --cluster "$CLUSTER" --services "$SERVICE"
+
+          {
+            echo "### Deployed"
+            echo
+            echo "- service: \`$SERVICE\`"
+            echo "- image: \`$IMAGE\`"
+            echo "- revision: \`$REVISION\`"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -73,8 +73,19 @@ function log(level, message, fields = {}) {
   );
 }
 
-if (!DATABASE_URL) {
-  log('error', 'DATABASE_URL is not set');
+// Connection comes from the standard libpq variables (PGHOST, PGPORT, PGUSER,
+// PGPASSWORD, PGDATABASE), which `pg` reads natively. ECS injects PGPASSWORD
+// from SSM at container start.
+//
+// Deliberately not a single DATABASE_URL: assembling one in Terraform would put
+// the password into Terraform state, which is plaintext JSON in S3. DATABASE_URL
+// remains supported as an override for local runs.
+const connectionConfig = DATABASE_URL
+  ? { connectionString: DATABASE_URL }
+  : {};
+
+if (!DATABASE_URL && !process.env.PGHOST) {
+  log('error', 'No database connection configured: set PGHOST (and PGUSER/PGPASSWORD/PGDATABASE) or DATABASE_URL');
   process.exit(1);
 }
 
@@ -90,7 +101,7 @@ let pool = null;
  * will keep for its entire lifetime.
  */
 async function tryAcquireLock() {
-  const client = new pg.Client({ connectionString: DATABASE_URL, application_name: 'ticker-lock' });
+  const client = new pg.Client({ ...connectionConfig, application_name: 'ticker-lock' });
   await client.connect();
 
   const { rows } = await client.query('SELECT pg_try_advisory_lock($1) AS acquired', [
@@ -213,7 +224,7 @@ async function main() {
   });
 
   pool = new pg.Pool({
-    connectionString: DATABASE_URL,
+    ...connectionConfig,
     application_name: 'ticker',
     max: 2,
     idleTimeoutMillis: 30_000,

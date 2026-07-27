@@ -37,6 +37,16 @@ variable "github_repository" {
   type        = string
 }
 
+variable "ticker_image" {
+  description = <<-EOT
+    Full image reference for the ticker, tagged by git SHA. Left null until the
+    first image is pushed; CI then deploys new revisions directly, so this is
+    only the initial value Terraform sets.
+  EOT
+  type        = string
+  default     = null
+}
+
 variable "alert_emails" {
   description = <<-EOT
     Addresses receiving budget and alarm notifications. Each recipient must click
