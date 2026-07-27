@@ -59,6 +59,12 @@ variable "realtime_image" {
   default     = null
 }
 
+variable "caddy_image" {
+  description = "Full image reference for Caddy, tagged by git SHA. Null until first pushed."
+  type        = string
+  default     = null
+}
+
 variable "alert_emails" {
   description = <<-EOT
     Addresses receiving budget and alarm notifications. Each recipient must click

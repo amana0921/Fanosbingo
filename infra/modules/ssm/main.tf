@@ -48,6 +48,8 @@ locals {
     "db/app_password",          # ticker + functions + realtime role password
     "realtime/secret_key_base", # Phoenix session/cookie signing; 64 hex chars
     "realtime/db_enc_key",      # encrypts tenant credentials at rest; EXACTLY 16 chars
+    "tls/origin_cert",          # Cloudflare Origin Certificate (PEM), 15-year validity
+    "tls/origin_key",           # its private key (PEM)
   ]
 }
 

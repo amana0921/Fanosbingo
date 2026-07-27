@@ -28,6 +28,7 @@ locals {
   ticker_image    = trimspace(coalesce(var.ticker_image, "")) == "" ? null : var.ticker_image
   postgrest_image = trimspace(coalesce(var.postgrest_image, "")) == "" ? null : var.postgrest_image
   realtime_image  = trimspace(coalesce(var.realtime_image, "")) == "" ? null : var.realtime_image
+  caddy_image     = trimspace(coalesce(var.caddy_image, "")) == "" ? null : var.caddy_image
 
   # S3 bucket names are globally unique across all AWS accounts, so the account
   # id is appended. Computed here rather than in the s3_cloudfront module so the
@@ -368,6 +369,57 @@ module "service_realtime" {
 
   # Realtime runs its Ecto migrations on boot, which takes a few seconds.
   stop_timeout = 30
+}
+
+# Caddy: TLS termination and routing. The only container reachable from outside.
+#
+# HOST network mode, unlike the others, because it must own :443 on the instance
+# itself. The rest use bridge networking with static host ports, which Caddy
+# reaches at 127.0.0.1.
+#
+# The two Realtime rewrites below are mandatory and were verified end to end
+# locally before this was ever deployed:
+#
+#   /rest/v1/games?select=id     -> /games?select=id            (postgrest:3000)
+#   /realtime/v1/websocket?vsn=1 -> /socket/websocket?vsn=1     (realtime:4000)
+#                                   with Host: realtime-dev.<domain>
+#
+# Without the path rewrite Realtime answers 404; without the Host rewrite it
+# answers 403, because it resolves the tenant from the host subdomain.
+module "service_caddy" {
+  source = "../../modules/ecs_service"
+
+  count = local.caddy_image == null ? 0 : 1
+
+  name_prefix       = local.name_prefix
+  name              = "caddy"
+  cluster_arn       = module.ecs.cluster_arn
+  capacity_provider = module.ecs.capacity_provider_name
+  log_group_name    = module.ecs.log_group_name
+
+  image              = local.caddy_image
+  task_role_arn      = module.iam.task_data_role_arn
+  execution_role_arn = module.iam.task_execution_role_arn
+
+  # host, not bridge: Caddy binds :443 on the instance directly.
+  network_mode = "host"
+
+  cpu                = 128
+  memory_reservation = 64
+
+  environment_variables = {
+    DOMAIN = var.domain_name
+    # Tenant id created by Realtime's SEED_SELF_HOST. It is `realtime-dev`
+    # regardless of environment, so this is not a copy-paste error in prod.
+    REALTIME_TENANT_HOST = "realtime-dev.${var.domain_name}"
+  }
+
+  secrets = {
+    # Cloudflare Origin Certificate. The entrypoint writes these to disk with
+    # 0600 before starting Caddy, so the key never enters the image.
+    ORIGIN_CERT = "/${local.name_prefix}/tls/origin_cert"
+    ORIGIN_KEY  = "/${local.name_prefix}/tls/origin_key"
+  }
 }
 
 module "monitoring" {

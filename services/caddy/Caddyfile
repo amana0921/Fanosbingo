@@ -1,0 +1,115 @@
+# Caddy: TLS termination and routing.
+#
+# Runs in HOST network mode so it owns :443 on the instance directly, and
+# proxies to the other containers at fixed 127.0.0.1 ports (they use bridge
+# networking with static host port bindings).
+#
+# TLS uses a Cloudflare Origin Certificate rather than Let's Encrypt. Cloudflare
+# is the only client that ever reaches this origin -- the security group admits
+# 443 solely from Cloudflare's published ranges -- so a certificate trusted by
+# Cloudflare is exactly the right trust anchor. It also avoids an ACME challenge
+# on a host that is deliberately unreachable from the public internet.
+#
+# Cloudflare SSL mode must be FULL (STRICT).
+
+{
+	# No ACME: the certificate is supplied, not issued.
+	auto_https disable_redirects
+	admin off
+
+	log {
+		output stdout
+		format json
+		level INFO
+	}
+}
+
+# ---------------------------------------------------------------------------
+# API: PostgREST and the ported edge functions
+# ---------------------------------------------------------------------------
+https://api.{$DOMAIN}:{$HTTPS_PORT:443} {
+	tls /etc/caddy/certs/origin.pem /etc/caddy/certs/origin.key
+
+	log {
+		output stdout
+		format json
+	}
+
+	# PostgREST.
+	#
+	# supabase-js calls ${url}/rest/v1/games?select=..., but PostgREST serves
+	# tables at the root (/games). handle_path strips the matched prefix, which
+	# is exactly what Supabase's own gateway does.
+	handle_path /rest/v1/* {
+		reverse_proxy 127.0.0.1:3000 {
+			header_up X-Forwarded-Proto https
+		}
+	}
+
+	# Ported edge functions. Not deployed yet; returns 502 until it is, which is
+	# a clearer signal than a 404 suggesting the route does not exist.
+	handle_path /functions/v1/* {
+		reverse_proxy 127.0.0.1:8080 {
+			header_up X-Forwarded-Proto https
+		}
+	}
+
+	# Cheap liveness probe that touches no upstream, so it stays useful while
+	# diagnosing an upstream that is down.
+	handle /healthz {
+		respond "ok" 200
+	}
+
+	handle {
+		respond "Fanos Bingo API" 200
+	}
+}
+
+# ---------------------------------------------------------------------------
+# Realtime
+#
+# Two rewrites here are mandatory, and both were established by running the
+# image locally rather than read from documentation:
+#
+#   1. PATH. The websocket endpoint is /socket/websocket, not
+#      /realtime/v1/websocket. Supabase's own gateway strips that prefix.
+#      Without the rewrite: 404.
+#
+#   2. HOST. Realtime is multi-tenant and resolves the tenant from the host
+#      SUBDOMAIN. A request arriving with Host: <ip> gets 403; the same request
+#      with Host: realtime-dev.<anything> completes the handshake with 101.
+#      The tenant id is created by SEED_SELF_HOST and is `realtime-dev`
+#      regardless of environment.
+# ---------------------------------------------------------------------------
+https://rt.{$DOMAIN}:{$HTTPS_PORT:443} {
+	tls /etc/caddy/certs/origin.pem /etc/caddy/certs/origin.key
+
+	log {
+		output stdout
+		format json
+	}
+
+	handle_path /realtime/v1/* {
+		rewrite * /socket{path}
+
+		reverse_proxy 127.0.0.1:4000 {
+			header_up Host {$REALTIME_TENANT_HOST}
+			header_up X-Forwarded-Proto https
+
+			# WebSocket connections are long-lived; the default timeouts would
+			# sever an idle game lobby mid-session.
+			transport http {
+				read_timeout 0
+				write_timeout 0
+			}
+		}
+	}
+
+	handle /healthz {
+		respond "ok" 200
+	}
+
+	handle {
+		respond "Fanos Bingo Realtime" 200
+	}
+}
