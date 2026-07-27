@@ -1,0 +1,29 @@
+# Build context is the repository root so services can share docker/, which
+# means everything below would otherwise be shipped to the daemon on every
+# build. Under QEMU emulation that is slow enough to notice.
+
+.git
+.github
+node_modules
+**/node_modules
+dist
+dist-ssr
+
+# Infrastructure and docs are never needed inside an image.
+infra
+supabase
+stress-test
+*.md
+!services/**/*.md
+
+# Never let a local secrets file reach a build context.
+.env
+.env.*
+*.tfvars
+*.tfstate
+*.tfstate.*
+**/.terraform
+
+.vscode
+.idea
+*.log

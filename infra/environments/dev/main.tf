@@ -229,7 +229,7 @@ module "service_postgrest" {
       "dbname=${module.rds.database_name}",
       "user=authenticator",
       "sslmode=verify-full",
-      "sslrootcert=/etc/ssl/certs/rds-global-bundle.pem",
+      "sslrootcert=/opt/rds-global-bundle.pem",
     ])
 
     PGRST_DB_SCHEMAS = "public"
