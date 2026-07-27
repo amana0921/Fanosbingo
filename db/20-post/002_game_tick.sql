@@ -189,12 +189,16 @@ BEGIN
   IF NOT EXISTS (SELECT 1 FROM games WHERE status = 'waiting') THEN
     SELECT coalesce(max(game_number), 0) + 1 INTO v_next_game_number FROM games;
 
+    -- Column list mirrors ensure_waiting_game_exists(), which is the reliable
+    -- reference for the CURRENT shape of this table. `code` was in the original
+    -- CREATE TABLE but dropped by the second migration
+    -- (20251109203630_update_bingo_auto_games), so reading the initial schema
+    -- and stopping there gets you a column that has not existed for months.
     INSERT INTO games (
-      code, status, host_id, called_numbers, game_number,
+      status, host_id, called_numbers, game_number,
       starts_at, selection_closed_at, current_number, winner_ids,
       stake_amount, total_pot, winner_prize, winner_prize_each
     ) VALUES (
-      'G' || lpad(v_next_game_number::text, 6, '0'),
       'waiting',
       'system',
       ARRAY[]::integer[],
