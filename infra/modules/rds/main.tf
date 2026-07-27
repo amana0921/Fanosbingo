@@ -32,8 +32,12 @@
  */
 
 resource "aws_db_subnet_group" "this" {
-  name        = "${var.name_prefix}-db"
-  description = "Isolated subnets — no route to the internet in either direction"
+  name = "${var.name_prefix}-db"
+  # ASCII only. The RDS API rejects non-printable characters in this field, and
+  # counts anything outside ASCII as non-printable: an em-dash here fails the
+  # apply with "DBSubnetGroupDescription must not contain non-printable control
+  # characters". Keep every AWS-bound description plain ASCII.
+  description = "Isolated subnets: no route to the internet in either direction"
   subnet_ids  = var.subnet_ids
 
   tags = merge(var.tags, { Name = "${var.name_prefix}-db-subnets" })

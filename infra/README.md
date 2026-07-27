@@ -197,6 +197,26 @@ Note that Trivy's config file (`.trivy.yaml`) has **no** per-ID ignore
 mechanism; `.trivyignore` is the only one that works. Documenting suppressions
 in config-file comments looks correct and does nothing.
 
+### `must not contain non-printable control characters`
+
+An AWS-bound `description` contains a non-ASCII character. RDS counts anything
+outside ASCII as non-printable, so an em-dash fails the apply. Other services
+(SSM, for one) accept it, which makes this inconsistent and easy to reintroduce.
+
+**Rule: every string sent to AWS — descriptions, names, tags — stays plain
+ASCII.** Terraform *variable* descriptions never leave your machine and can use
+whatever punctuation you like. Find offenders with:
+
+```bash
+grep -rnP '^\s*(description|alarm_description)\s*=.*[^\x00-\x7F]' infra/modules --include=*.tf
+```
+
+### `Volume of size NGB is smaller than snapshot`
+
+The ECS-optimized AL2023 arm64 AMI ships a 30 GiB snapshot and EBS will not
+restore it into a smaller volume. `root_volume_size` must be >= 30; there is a
+validation block enforcing it.
+
 ### Realtime connects but delivers no row changes
 
 `rds.logical_replication` did not take effect. It is a static parameter and

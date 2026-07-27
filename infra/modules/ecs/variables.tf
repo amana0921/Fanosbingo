@@ -59,9 +59,21 @@ variable "instance_count" {
 }
 
 variable "root_volume_size" {
-  description = "Root EBS volume in GiB. Holds container images plus the swapfile."
+  description = <<-EOT
+    Root EBS volume in GiB. Holds container images plus the swapfile.
+
+    MINIMUM 30. The ECS-optimized AL2023 arm64 AMI ships a 30 GiB snapshot, and
+    EBS refuses to restore a snapshot into a smaller volume — the ASG fails with
+    "Volume of size 20GB is smaller than snapshot ..., expect size >= 30GB".
+    Costs ~$0.80/mo more than 20 GiB.
+  EOT
   type        = number
-  default     = 20
+  default     = 30
+
+  validation {
+    condition     = var.root_volume_size >= 30
+    error_message = "root_volume_size must be at least 30; the ECS-optimized AMI snapshot is 30 GiB."
+  }
 }
 
 variable "swap_size_mb" {

@@ -64,8 +64,10 @@ resource "aws_ssm_parameter" "plain" {
 resource "aws_ssm_parameter" "secret" {
   for_each = toset(local.secret_parameters)
 
-  name        = "/${var.name_prefix}/${each.value}"
-  description = "Secret — real value set out-of-band, never through Terraform"
+  name = "/${var.name_prefix}/${each.value}"
+  # ASCII only, for consistency with the RDS constraint. SSM happens to accept
+  # non-ASCII here, but relying on which AWS APIs are lenient is not a strategy.
+  description = "Secret: real value set out-of-band, never through Terraform"
   type        = "SecureString"
   key_id      = var.kms_key_arn
   tier        = "Standard"
