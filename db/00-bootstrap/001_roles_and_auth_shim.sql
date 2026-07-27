@@ -206,6 +206,24 @@ END $$;
 -- ---------------------------------------------------------------------------
 CREATE SCHEMA IF NOT EXISTS _realtime;
 
+-- Ownership, not just USAGE.
+--
+-- Creating the schema is necessary but NOT sufficient: Realtime connects as
+-- app_service and must CREATE TABLE inside it. Without that privilege the
+-- failure looks identical to the schema being absent --
+--
+--   (Postgrex.Error) ERROR 3F000 (invalid_schema_name)
+--   no schema has been selected to create in
+--
+-- because `SET search_path TO _realtime` succeeds, but the search path then
+-- contains no schema the role may create in. Easy to misdiagnose as "the
+-- CREATE SCHEMA did not run".
+--
+-- Ownership rather than a grant list, so Realtime's future migrations can also
+-- alter and drop what they created.
+ALTER SCHEMA _realtime OWNER TO app_service;
+GRANT ALL ON SCHEMA _realtime TO app_service;
+
 -- Realtime consumes a logical replication slot, which requires the REPLICATION
 -- attribute. On RDS that is granted through the rds_replication role, which
 -- does not exist on stock PostgreSQL -- hence the guard, so this file still
