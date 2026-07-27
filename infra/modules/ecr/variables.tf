@@ -5,11 +5,13 @@ variable "name_prefix" {
 
 variable "repository_names" {
   description = <<-EOT
-    Images we build ourselves. PostgREST and Realtime are excluded deliberately:
-    they are pulled from upstream registries, not mirrored.
+    Images we build. This includes postgrest and realtime, which are thin layers
+    over the upstream images adding Amazon's RDS CA bundle -- without it a
+    connection with sslmode=verify-full fails, and the alternative (sslmode=
+    require) encrypts without verifying anything.
   EOT
   type        = list(string)
-  default     = ["caddy", "functions", "ticker"]
+  default     = ["caddy", "functions", "postgrest", "realtime", "ticker"]
 }
 
 variable "keep_last_images" {

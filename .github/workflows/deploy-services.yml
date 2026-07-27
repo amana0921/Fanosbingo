@@ -19,7 +19,7 @@ on:
         description: 'Service to build and deploy'
         required: true
         type: choice
-        options: [ticker, functions, caddy]
+        options: [ticker, postgrest, realtime, functions, caddy]
         default: ticker
       environment:
         description: 'Environment'

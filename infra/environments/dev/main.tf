@@ -179,6 +179,85 @@ module "service_ticker" {
   stop_timeout = 30
 }
 
+# PostgREST: the data API.
+#
+# This is what makes the migration tractable. The SPA's ~200 supabase.from()
+# call sites and all 47 RLS policies work against it unchanged, because it IS
+# the same component Supabase runs. Rewriting those call sites against API
+# Gateway + Lambda would have been weeks of work and would have thrown away RLS
+# as the authorization layer.
+module "service_postgrest" {
+  source = "../../modules/ecs_service"
+
+  count = var.postgrest_image == null ? 0 : 1
+
+  name_prefix       = local.name_prefix
+  name              = "postgrest"
+  cluster_arn       = module.ecs.cluster_arn
+  capacity_provider = module.ecs.capacity_provider_name
+  log_group_name    = module.ecs.log_group_name
+
+  image              = var.postgrest_image
+  task_role_arn      = module.iam.task_data_role_arn
+  execution_role_arn = module.iam.task_execution_role_arn
+
+  # Static host port so Caddy can proxy to a fixed 127.0.0.1:3000.
+  network_mode = "bridge"
+  port_mappings = [{
+    container_port = 3000
+    host_port      = 3000
+  }]
+
+  cpu                = 128
+  memory_reservation = 96
+
+  environment_variables = {
+    # libpq keyword form rather than a URI, so the password can come from
+    # PGPASSWORD instead of being embedded in a connection string that would
+    # then have to live in SSM as one blob.
+    PGRST_DB_URI = join(" ", [
+      "host=${module.rds.address}",
+      "port=${module.rds.port}",
+      "dbname=${module.rds.database_name}",
+      "user=authenticator",
+      "sslmode=verify-full",
+      "sslrootcert=/etc/ssl/certs/rds-global-bundle.pem",
+    ])
+
+    PGRST_DB_SCHEMAS = "public"
+
+    # Requests with no JWT act as `anon`; RLS policies decide what that can see.
+    PGRST_DB_ANON_ROLE = "anon"
+
+    PGRST_SERVER_PORT = "3000"
+    PGRST_DB_POOL     = "10"
+
+    # Puts the verified JWT payload into the request.jwt.claims GUC, which is
+    # exactly what the auth.uid() shim in db/00-bootstrap reads. Without it the
+    # 9 RLS policies referencing auth.uid() silently match nothing.
+    PGRST_DB_USE_LEGACY_GUCS = "false"
+
+    PGRST_LOG_LEVEL = "info"
+  }
+
+  secrets = {
+    # authenticator's password. libpq reads PGPASSWORD.
+    PGPASSWORD = "/${local.name_prefix}/db/postgrest_password"
+    # Must match whatever mints player JWTs, or every authenticated request 401s.
+    PGRST_JWT_SECRET = "/${local.name_prefix}/app/jwt_secret"
+  }
+
+  health_check = {
+    # PostgREST is only useful once it has introspected the schema; until then
+    # it answers connections but not queries.
+    command      = ["CMD-SHELL", "wget -q -O- http://localhost:3000/ >/dev/null 2>&1 || exit 1"]
+    interval     = 30
+    timeout      = 5
+    retries      = 3
+    start_period = 30
+  }
+}
+
 module "monitoring" {
   source = "../../modules/monitoring"
 
