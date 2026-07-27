@@ -18,9 +18,20 @@
   # IDEMPOTENT: safe to re-run. Roles are cluster-wide, so every CREATE ROLE is
   # guarded.
   #
-  # Requires :authenticator_password to be supplied by the migration runner:
-  #   psql -v authenticator_password="$(...)" -f this_file.sql
+  # Reads the authenticator password from the DB_AUTHENTICATOR_PASSWORD
+  # environment variable via \getenv, rather than a -v flag, so the password
+  # never appears in the process list on the runner.
 */
+
+\getenv authenticator_password DB_AUTHENTICATOR_PASSWORD
+
+-- Fail early and clearly rather than creating a role with a literal
+-- ":'authenticator_password'" as its password.
+\if :{?authenticator_password}
+\else
+\echo 'ERROR: DB_AUTHENTICATOR_PASSWORD is not set in the environment.'
+\quit 1
+\endif
 
 -- ---------------------------------------------------------------------------
 -- 1. Roles
@@ -46,18 +57,25 @@ BEGIN
     CREATE ROLE service_role NOLOGIN NOINHERIT BYPASSRLS;
   END IF;
 
-  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticator') THEN
-    EXECUTE format(
-      'CREATE ROLE authenticator LOGIN NOINHERIT PASSWORD %L',
-      :'authenticator_password'
-    );
-  ELSE
-    EXECUTE format(
-      'ALTER ROLE authenticator WITH LOGIN NOINHERIT PASSWORD %L',
-      :'authenticator_password'
-    );
-  END IF;
 END $$;
+
+-- `authenticator` is handled outside the DO block above, because psql does NOT
+-- interpolate :'variables' inside dollar-quoted strings -- $$...$$ is an opaque
+-- string literal to psql, so the reference survives verbatim into the server
+-- and fails with "syntax error at or near :". Building the statement with
+-- format() and running it through \gexec keeps the substitution client-side,
+-- where it works.
+--
+-- %L quotes the password as a literal, so a password containing quotes cannot
+-- break out of the statement.
+SELECT format('CREATE ROLE authenticator LOGIN NOINHERIT PASSWORD %L', :'authenticator_password')
+WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticator')
+\gexec
+
+-- Applied unconditionally so re-running rotates the password to whatever is
+-- currently in SSM.
+SELECT format('ALTER ROLE authenticator WITH LOGIN NOINHERIT PASSWORD %L', :'authenticator_password')
+\gexec
 
 GRANT anon, authenticated, service_role TO authenticator;
 

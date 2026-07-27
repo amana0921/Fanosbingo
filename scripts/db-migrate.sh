@@ -128,10 +128,10 @@ update the recorded checksum deliberately:
   start_ms=$(date +%s%3N)
 
   # --single-transaction so a failure rolls back cleanly. The bootstrap file
-  # needs authenticator_password; other files ignore the unused variable.
+  # reads DB_AUTHENTICATOR_PASSWORD from the environment via \getenv rather than
+  # a -v flag, so the password never lands in the process list.
   if ! output="$("${PSQL[@]}" \
         --single-transaction \
-        --set "authenticator_password=${DB_AUTHENTICATOR_PASSWORD:-changeme_not_set}" \
         -f "$file" 2>&1)"; then
     echo "${RED}FAILED${NC}"
     echo "$output" | sed 's/^/      /'
