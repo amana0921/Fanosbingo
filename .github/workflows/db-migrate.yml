@@ -84,10 +84,19 @@ jobs:
             --with-decryption --query 'Parameter.Value' --output text)"
           export DB_AUTHENTICATOR_PASSWORD
 
-          if [ "$DB_AUTHENTICATOR_PASSWORD" = "PLACEHOLDER_SET_ME_OUT_OF_BAND" ]; then
-            echo "::error::db/postgrest_password is still a placeholder. Run the 'Sync secrets to SSM' workflow first."
-            exit 1
-          fi
+          # app_service is the login role the ticker and functions containers
+          # use; it inherits service_role, unlike authenticator.
+          DB_APP_PASSWORD="$(aws ssm get-parameter \
+            --name "/fanosbingo-${ENVIRONMENT}/db/app_password" \
+            --with-decryption --query 'Parameter.Value' --output text)"
+          export DB_APP_PASSWORD
+
+          for v in DB_AUTHENTICATOR_PASSWORD DB_APP_PASSWORD; do
+            if [ "${!v}" = "PLACEHOLDER_SET_ME_OUT_OF_BAND" ]; then
+              echo "::error::$v is still a placeholder. Run the 'Sync secrets to SSM' workflow first."
+              exit 1
+            fi
+          done
 
           # shellcheck disable=SC1091
           source scripts/db-tunnel.sh "$ENVIRONMENT"

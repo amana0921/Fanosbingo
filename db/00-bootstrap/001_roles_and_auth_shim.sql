@@ -24,12 +24,19 @@
 */
 
 \getenv authenticator_password DB_AUTHENTICATOR_PASSWORD
+\getenv app_password DB_APP_PASSWORD
 
 -- Fail early and clearly rather than creating a role with a literal
 -- ":'authenticator_password'" as its password.
 \if :{?authenticator_password}
 \else
 \echo 'ERROR: DB_AUTHENTICATOR_PASSWORD is not set in the environment.'
+\quit 1
+\endif
+
+\if :{?app_password}
+\else
+\echo 'ERROR: DB_APP_PASSWORD is not set in the environment.'
 \quit 1
 \endif
 
@@ -78,6 +85,22 @@ SELECT format('ALTER ROLE authenticator WITH LOGIN NOINHERIT PASSWORD %L', :'aut
 \gexec
 
 GRANT anon, authenticated, service_role TO authenticator;
+
+-- `app_service` is the login role the ticker and functions containers use. It
+-- INHERITs service_role, unlike authenticator, because those containers are
+-- trusted server-side code that needs privileged access from the moment they
+-- connect -- there is no per-request role switch to perform.
+--
+-- Kept separate from `authenticator` so a leaked PostgREST connection string
+-- cannot drive the game loop or move money.
+SELECT format('CREATE ROLE app_service LOGIN INHERIT PASSWORD %L', :'app_password')
+WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_service')
+\gexec
+
+SELECT format('ALTER ROLE app_service WITH LOGIN INHERIT PASSWORD %L', :'app_password')
+\gexec
+
+GRANT service_role TO app_service;
 
 -- ---------------------------------------------------------------------------
 -- 2. auth schema shim
