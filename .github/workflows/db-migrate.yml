@@ -137,7 +137,7 @@ jobs:
               '### Pending database migrations — `dev`',
               '',
               '```',
-              out.replace(/\[[0-9;]*m/g, '').slice(-60000),
+              out.replace(/\u001b\[[0-9;]*m/g, '').slice(-60000),
               '```',
             ].join('\n');
             const { data: comments } = await github.rest.issues.listComments({
