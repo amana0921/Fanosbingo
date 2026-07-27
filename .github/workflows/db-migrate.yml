@@ -104,7 +104,10 @@ jobs:
 
           ./scripts/db-migrate.sh $DRY_RUN_FLAG | tee /tmp/migrate-output.txt
 
-      - name: Verify Realtime prerequisites
+      # One tunnel for every check. Each `source db-tunnel.sh` opens a separate
+      # SSM session, and a just-closed session can still hold its local port,
+      # which presents as a confusing "tunnel did not become ready".
+      - name: Verify database state and game loop
         if: github.event_name != 'pull_request' && github.event.inputs.dry_run != 'true'
         run: |
           set -euo pipefail
@@ -135,14 +138,7 @@ jobs:
 
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Smoke-test the game loop
-        if: github.event_name != 'pull_request' && github.event.inputs.dry_run != 'true'
-        run: |
-          set -euo pipefail
-          # shellcheck disable=SC1091
-          source scripts/db-tunnel.sh "$ENVIRONMENT"
-          trap stop_db_tunnel EXIT
-
+          # --- Game loop smoke test, on the SAME tunnel -----------------------
           echo "### Game loop smoke test" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 

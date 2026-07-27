@@ -96,7 +96,25 @@ _info "  ${DB_NAME} on ${DB_HOST}"
 
 # ---------------------------------------------------------------------------
 # Open the tunnel
+#
+# Pick a free local port rather than assuming one. A previous session's port can
+# still be held for a while after it closes, and the failure mode is a bare
+# "tunnel did not become ready" that looks like an SSM or network problem rather
+# than a port collision.
 # ---------------------------------------------------------------------------
+_port_free() {
+  ! (exec 3<>/dev/tcp/127.0.0.1/"$1") 2>/dev/null
+}
+
+_start_port="$LOCAL_PORT"
+for _ in $(seq 0 20); do
+  _port_free "$LOCAL_PORT" && break
+  LOCAL_PORT=$((LOCAL_PORT + 1))
+done
+
+_port_free "$LOCAL_PORT" || _die "No free local port found between ${_start_port} and ${LOCAL_PORT}"
+[ "$LOCAL_PORT" = "$_start_port" ] || _warn "Port ${_start_port} busy; using ${LOCAL_PORT}"
+
 _info "Opening tunnel localhost:${LOCAL_PORT} -> ${DB_HOST}:${DB_PORT}"
 
 aws ssm start-session \
