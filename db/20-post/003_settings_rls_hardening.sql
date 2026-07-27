@@ -33,9 +33,35 @@
 
 -- ---------------------------------------------------------------------------
 -- 1. Deny-by-default read policy
+--
+-- Drops every existing SELECT policy by ENUMERATION rather than by name.
+--
+-- The first attempt at this migration hardcoded DROP POLICY "Anyone can view
+-- settings". The actual policy is "Anyone can read settings" -- view vs read.
+-- DROP POLICY IF EXISTS on a wrong name is a SILENT no-op, and because
+-- PostgreSQL ORs permissive policies together, the original USING (true)
+-- survived and the secrets stayed readable. The migration reported success.
+--
+-- Enumerating pg_policies removes the guess entirely, and keeps working if
+-- someone adds another permissive policy later.
 -- ---------------------------------------------------------------------------
-DROP POLICY IF EXISTS "Anyone can view settings" ON settings;
-DROP POLICY IF EXISTS "Public can read non-secret settings" ON settings;
+DO $$
+DECLARE
+  v_policy record;
+BEGIN
+  FOR v_policy IN
+    SELECT policyname
+    FROM pg_policies
+    WHERE schemaname = 'public'
+      AND tablename = 'settings'
+      AND cmd IN ('SELECT', 'ALL')
+      -- Leave the service_role policy alone: privileged server-side code needs it.
+      AND policyname <> 'Service role can manage settings'
+  LOOP
+    EXECUTE format('DROP POLICY IF EXISTS %I ON settings', v_policy.policyname);
+    RAISE NOTICE 'Dropped policy % on settings', v_policy.policyname;
+  END LOOP;
+END $$;
 
 CREATE POLICY "Public can read non-secret settings"
   ON settings
@@ -94,37 +120,58 @@ WHERE id IN (
 AND value <> '';
 
 -- ---------------------------------------------------------------------------
--- 3. Assert the fix actually holds
+-- 3. Assert the fix actually holds, BY EXECUTING IT AS anon
 --
--- Evaluates the policy as `anon` would, so this fails the migration if the
--- allowlist is ever widened to include a secret.
+-- The previous version of this check compared two hardcoded lists, which is
+-- worthless: it verified that a string I wrote was absent from another string I
+-- wrote, and passed cheerfully while the real policy still exposed everything.
+--
+-- This one SET ROLE anon and queries the table. It is the same code path an
+-- anonymous HTTP request takes through PostgREST, so it cannot pass while the
+-- data is reachable. A static assertion about a security control is not a test
+-- of that control.
 -- ---------------------------------------------------------------------------
 DO $$
 DECLARE
-  v_leaked text;
+  v_visible text;
 BEGIN
+  SET LOCAL ROLE anon;
+
   SELECT string_agg(id, ', ')
-  INTO v_leaked
+  INTO v_visible
   FROM settings
   WHERE id IN (
     'telegram_bot_token', 'sms_api_key', 'deposit_bsc_rpc_url',
     'deposit_contract_private_key', 'withdrawal_contract_private_key'
-  )
-  AND id IN (
-    SELECT unnest(ARRAY[
-      'deposit_contract_address', 'deposit_contract_chain_id',
-      'deposit_conversion_rate', 'deposit_minimum_bnb',
-      'deposit_required_confirmations', 'withdrawal_contract_address',
-      'withdrawal_credits_to_bnb_rate', 'withdrawal_min_bnb',
-      'withdrawal_max_daily_bnb', 'withdrawal_max_weekly_bnb',
-      'commission_rate', 'telegram_bot_username', 'support_contact',
-      'user_instructions', 'game_url'
-    ])
   );
 
-  IF v_leaked IS NOT NULL THEN
-    RAISE EXCEPTION 'Secret-bearing settings appear in the public allowlist: %', v_leaked;
+  RESET ROLE;
+
+  IF v_visible IS NOT NULL THEN
+    RAISE EXCEPTION
+      'anon can still read secret settings: %. RLS is NOT protecting this table.',
+      v_visible;
   END IF;
 
-  RAISE NOTICE 'settings RLS: deny-by-default allowlist in force';
+  RAISE NOTICE 'Verified as anon: no secret settings are readable';
 END $$;
+
+-- Same technique for the rest of the sensitive tables, so a permissive policy
+-- anywhere else fails the migration instead of being found by probing the live
+-- endpoint -- which is how the settings exposure was actually discovered.
+DO $$
+DECLARE
+  v_count bigint;
+BEGIN
+  SET LOCAL ROLE anon;
+
+  SELECT count(*) INTO v_count FROM telegram_users;
+  IF v_count > 0 THEN
+    RESET ROLE;
+    RAISE EXCEPTION 'anon can read % rows from telegram_users (balances).', v_count;
+  END IF;
+
+  RESET ROLE;
+  RAISE NOTICE 'Verified as anon: telegram_users is not readable';
+END $$;
+
