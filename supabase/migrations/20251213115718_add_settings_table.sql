@@ -44,7 +44,12 @@ CREATE POLICY "Service role can manage settings"
 INSERT INTO settings (id, value, description, updated_by)
 VALUES (
   'telegram_bot_token',
-  '8562944272:AAFWEAECu2-CLG4z3ASMohPxhdWgZ2u2CKE',
+  -- REDACTED. A live Telegram bot token was committed here and was
+  -- publicly readable via PostgREST until db/20-post/003 closed the RLS
+  -- hole. The token has been revoked. On AWS this value comes from SSM
+  -- Parameter Store, injected as an environment variable -- the database
+  -- is the wrong place for it.
+  '',
   'Telegram Bot API Token for sending notifications',
   'system'
 )

@@ -96,7 +96,7 @@ jobs:
             echo "::endgroup::"
           done
 
-      - name: Security scan
+      - name: Security scan (infrastructure misconfiguration)
         uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: config
@@ -106,6 +106,28 @@ jobs:
           # Accepted findings live in .trivyignore, each with its justification.
           # Anything not listed there fails the build.
           trivyignores: .trivyignore
+
+      # Secret scanning over the WHOLE repository, not just infra/.
+      #
+      # Narrow scanning is how a live Telegram bot token sat in
+      # supabase/migrations for months. Trivy's built-in ruleset also missed it
+      # entirely, so trivy-secret.yaml adds rules for Telegram tokens and EVM
+      # private keys -- the two credential shapes this repository has actually
+      # leaked. Both rules were verified against synthetic bait; the private-key
+      # rule is anchored to an adjacent identifier so it does not flag ordinary
+      # 64-hex values such as migration checksums.
+      - name: Security scan (secrets)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: secret
+          severity: CRITICAL
+          exit-code: '1'
+          trivy-config: ''
+        env:
+          TRIVY_SECRET_CONFIG: trivy-secret.yaml
+          TRIVY_SKIP_DIRS: node_modules,.git,dist
 
   # ==========================================================================
   # Plan

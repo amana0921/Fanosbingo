@@ -175,3 +175,25 @@ BEGIN
   RAISE NOTICE 'Verified as anon: telegram_users is not readable';
 END $$;
 
+
+-- ---------------------------------------------------------------------------
+-- 4. Accept the deliberate redaction of an already-applied migration
+--
+-- 20251213115718_add_settings_table.sql contained a live Telegram bot token as
+-- a literal. Leaving a real credential in the repository was not acceptable, so
+-- the literal was replaced with an empty string.
+--
+-- That changes the file's checksum, and the migration runner treats a changed
+-- VERSIONED migration as an error -- correctly, since editing applied
+-- migrations is how databases silently drift from their own history. This is
+-- the documented escape hatch for a deliberate edit: record the new checksum so
+-- the runner recognises the change as intended rather than accidental.
+--
+-- The edit is safe to apply retroactively because the INSERT uses
+-- ON CONFLICT DO NOTHING, so it only affects databases created from scratch;
+-- existing rows are untouched, and section 2 above has already redacted them.
+-- ---------------------------------------------------------------------------
+UPDATE schema_migrations
+SET checksum = 'fbb9c1326068e7f8e1bc7b44f1eebe2d3ab4d0b9f8f1d48ad91ca7047db70ae5'
+WHERE version = '20251213115718_add_settings_table'
+  AND checksum <> 'fbb9c1326068e7f8e1bc7b44f1eebe2d3ab4d0b9f8f1d48ad91ca7047db70ae5';
