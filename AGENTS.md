@@ -7,6 +7,50 @@ top to bottom once, then used as reference.
 
 ---
 
+## 0. Start here
+
+**If you are picking this up cold, do these three things first.**
+
+1. **Read §6 (Gotchas).** Ten CI round trips were burned on symptoms that
+   actively mislead. Fifteen minutes there saves hours.
+2. **Verify locally before pushing.** Podman, psql and arm64 emulation are
+   installed for exactly this. See §5 — it is the single biggest factor in how
+   fast this work goes.
+3. **Check what is actually running** before trusting this document:
+   ```bash
+   aws sts get-caller-identity          # `aws login` if the session expired
+   aws ecs describe-services --cluster fanosbingo-dev \
+     --services ticker postgrest realtime caddy \
+     --query 'services[].[serviceName,runningCount]' --output text
+   ./scripts/probe-public-access.sh https://api.yisakmesifin.org
+   ```
+
+### The next task, in one line
+
+**Phase 4 (auth) — then finish the functions port.** Reasoning in §7. The short
+version: `initData` HMAC is never verified, so anyone can currently claim any
+player's identity. Porting money-moving endpoints onto that surface is the wrong
+order.
+
+### Three things that are true and easy to get wrong
+
+- **The game no longer depends on a browser being open.** `game_tick()` owns
+  number calling, game start, countdown rolls, claim-window finalization and
+  next-game creation. Do not reintroduce client-driven game logic.
+- **`rds.force_ssl` stays on**, and every service verifies TLS against
+  `docker/rds-global-bundle.pem`. Do not weaken this to accommodate a client.
+- **Secrets never enter Terraform state.** GitHub Secrets → SSM SecureString →
+  injected at container start. The hot-wallet key is non-exportable in KMS.
+
+### What this session did NOT do
+
+- Port the 25 edge functions (Phase 3's remainder)
+- Any of Phase 4, 5 or 6
+- Apply prod — it exists in Terraform and has never run
+- Sweep the old BSC wallet (**operator action, still outstanding**)
+
+---
+
 ## 1. What this is, and where it stands
 
 Fanos Bingo is a real-money multiplayer bingo game delivered as a Telegram Mini
@@ -343,30 +387,135 @@ Every one of these cost real time.
 | Stale AWS secrets in GitHub | LOW | Delete `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEPLOY_ROLE_ARN` — leftovers from pre-OIDC. IAM user `nati` has no access keys, so they are inert, but they invite confusion |
 | Bot token in 2 git commits | LOW | Rotation makes it inert. History rewrite is optional cleanup |
 
-### Engineering work
+### Engineering roadmap
 
-**Phase 3 (remaining): port the 25 edge functions.** `supabase/functions/*` are
-Deno handlers; they become routes in one Node/Express container (`services/functions`,
-host port 8080 — Caddy already routes `/functions/v1/*` there). Mostly mechanical
-(`Deno.serve` → route, `Deno.env.get` → `process.env`), with two real changes:
+> **Recommended sequence: do Phase 4 (auth) BEFORE finishing Phase 3.**
+>
+> The functions port makes more endpoints reachable; auth decides whether that is
+> safe. Porting money-moving handlers onto a surface where `initData` is never
+> verified and CORS is `*` is the wrong order. If you want to keep momentum on
+> the port instead, at minimum land the CORS lockdown and `initData` verification
+> first — those two are small and close the widest holes.
 
-- **`claim-bingo`** — delete the post-response `setTimeout`. The ticker owns
-  claim-window finalization now (`game_tick()`).
-- **The three `ethers` signing functions** — take the key from **KMS**, not the
-  `settings` table.
+---
 
-**Phase 4 (auth) matters before real money.** Right now:
-- Telegram `initData` HMAC is **never verified** — anyone can claim any identity
-- Wallet connection has no signature challenge
-- Admin access is one shared string held in browser React state
-- All 25 functions send `Access-Control-Allow-Origin: *`, including money-moving ones
+#### Phase 3 (remaining) — port 25 edge functions, ~4,516 lines
 
-**Known-deliberate weaknesses**, accepted at this tier:
-- Single instance / single AZ (see §2)
-- `telegram_bot_token` is still in SSM *and* readable by the app; Phase 4 should
+Target: `services/functions`, one Node/Express container on host port 8080.
+Caddy **already routes** `/functions/v1/*` there, so no proxy work is needed.
+
+The 25 are not equal. Surveyed and categorised:
+
+**A. Delete — do not port (2)**
+
+| Function | Why |
+|---|---|
+| `bingo-auto-caller` | 123 lines, **0 client references**. `game_tick()` replaced it |
+| `force-finish-game` | 139 lines, 1 reference — [GameRoom.tsx:167](src/components/GameRoom.tsx:167), the browser-driven stuck-game recovery the ticker now owns. Remove the client call too |
+
+**B. Real changes, not mechanical (5)**
+
+| Function | Change required |
+|---|---|
+| `claim-bingo` (99) | **Delete the post-response `setTimeout`.** This is a bug fix, not a port: serverless can freeze the isolate after responding, so winners could never be paid. The ticker owns claim-window finalization via `game_tick()`. The old query also had no game-id filter, so it could finalize the wrong game |
+| `claim-winnings-to-contract` (239) | Sign via **KMS** (`kms:Sign`, key alias `fanosbingo-<env>-wallet-signing`), not a private key from the `settings` table |
+| `credit-win-to-contract` (123) | Same |
+| `get-withdrawal-wallet-info` (73) | Derive the address from the KMS public key — see `scripts/derive-wallet-address.mjs`; the address is already published to SSM at `/fanosbingo-<env>/bsc/hot_wallet_address` |
+| `update-settings` (220) | Allowlist already added in Phase 0. Swap `ADMIN_KEY` for Cognito in Phase 4 |
+
+**C. Mechanical (18).** `Deno.serve(handler)` → Express route, `Deno.env.get(x)`
+→ `process.env.x`, `npm:@supabase/supabase-js` → plain `pg` or direct HTTP to
+PostgREST. Largest is `telegram-bot-webhook` (807 lines) but it is mostly a
+message-handling switch.
+
+Also fold in: **`monitor-deposits` (220) becomes a scheduled job inside the
+ticker container**, not an HTTP route. Today it only runs when an admin clicks a
+button ([DepositManagement.tsx:81](src/components/DepositManagement.tsx:81)),
+which means **deposits are not credited unless someone has the admin page open**.
+
+Suggested batching — prove the path before touching money:
+1. Container skeleton + 2–3 trivial routes (`get-card-layouts`, `mark-cell`) → deploy → verify through Caddy
+2. The other mechanical routes
+3. `claim-bingo` and the KMS signing functions, tested against **BSC testnet** locally first
+
+---
+
+#### Phase 4 — auth hardening. **The gate before real money.**
+
+Four gaps, and they compound:
+
+| Gap | Consequence |
+|---|---|
+| Telegram `initData` HMAC **never verified** | Anyone can claim any Telegram identity. With RLS keyed on `auth.uid()`, that is full account takeover |
+| No wallet signature challenge | A client asserts an address without proving control of it |
+| Admin = one shared string in browser React state | [Admin.tsx:348](src/components/Admin.tsx:348). Non-constant-time compare, no per-admin identity, no audit trail. **6 functions** gate on it |
+| `Access-Control-Allow-Origin: *` on **15 functions** | Includes `process-withdrawal` and `transfer-balance` |
+
+Work:
+- An `auth` route that verifies `initData` HMAC against the bot token and mints a
+  short-lived (15 min) JWT whose claims match what PostgREST and Realtime expect.
+  **`app/jwt_secret` in SSM is already shared by both** — a token accepted by one
+  must be accepted by the other.
+- SIWE-style nonce challenge for wallet auth.
+- Cognito user pool with TOTP required; replace `accessKey` React state with a
+  Cognito session; add `admin_audit_log` written on every privileged mutation.
+- Lock CORS to `https://<domain>` — the value is already in SSM at
+  `/fanosbingo-<env>/app/allowed_origin`.
+
+---
+
+#### Phase 5 — frontend and CDN
+
+Point `VITE_SUPABASE_URL` at `https://api.<domain>`. **The URL shape was
+preserved deliberately** (`/rest/v1`, `/realtime/v1`, `/functions/v1`), so all
+~200 `supabase.from()` calls and 10 `postgres_changes` subscriptions should work
+unchanged. That was the entire point of self-hosting PostgREST and Realtime.
+
+Then: S3 + CloudFront with OAC (`infra/modules/s3_cloudfront` exists but is
+**unused and unwritten**), a `deploy-spa.yml` workflow, service-worker cache
+versioning in [public/sw.js](public/sw.js) with `skipWaiting`, and **deletion of
+the client-side game logic the ticker replaced** (`Lobby.tsx` game creation,
+game start, countdown roll).
+
+Note: `vite.config.ts` sets `drop_console: true`, so all client logging vanishes
+in production builds. Consider an error boundary before go-live.
+
+---
+
+#### Phase 6 — observability and cutover
+
+- Alarms on `SecondsSinceLastNumberCalled` (**the ticker already publishes it;
+  nothing alarms on it yet**), stuck games, payout failure, hot-wallet balance
+- Runbooks: game loop stalled, RDS restore, RPC failover, instance replacement
+- Run `stress-test/k6-spike-test.js` at its 400-concurrent target
+- Confirm instance memory stays under ~1.6 GB — this is what validates `t4g.small`
+- Cutover: staging on testnet → maintenance window → DNS → re-register the
+  Telegram webhook → keep the old Supabase warm for 7 days as rollback
+
+---
+
+#### Then: prod
+
+**Prod has never been applied.** Before it can be:
+- Create the `prod` GitHub Environment **with required reviewers**
+- Set `PROD_APPLY_ENABLED=true` (deliberately unset — it is the second gate)
+- Set `prod`-scoped image variables
+- Mainnet: `bsc_chain_id = 56`, real RPC endpoints, real contract addresses
+- Consider `multi_az = true` and `instance_count = 2` — see the Stage 2 upgrade
+  ladder in the plan file
+
+---
+
+### Known-deliberate weaknesses, accepted at this tier
+
+- **Single instance / single AZ** (§2). ~3–5 min MTTR on instance failure
+- `telegram_bot_token` exists in SSM *and* is read by app code; Phase 4 should
   make SSM the only source
-- The anonymous-access probe reports "inconclusive" on empty tables — it cannot
-  prove RLS protects a table with no rows
+- The anonymous-access probe reports **"inconclusive"** on empty tables — it
+  cannot prove RLS protects a table with no rows. The migration-time
+  `SET ROLE anon` assertions are authoritative
+- Trivy config scanning covers only `infra/`; secret scanning covers the whole
+  repo. Accepted findings are in `.trivyignore` with written justifications
 
 ---
 
