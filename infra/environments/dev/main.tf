@@ -255,15 +255,15 @@ module "service_postgrest" {
     PGRST_JWT_SECRET = "/${local.name_prefix}/app/jwt_secret"
   }
 
-  health_check = {
-    # PostgREST is only useful once it has introspected the schema; until then
-    # it answers connections but not queries.
-    command      = ["CMD-SHELL", "wget -q -O- http://localhost:3000/ >/dev/null 2>&1 || exit 1"]
-    interval     = 30
-    timeout      = 5
-    retries      = 3
-    start_period = 30
-  }
+  # No container health check.
+  #
+  # It previously shelled out to wget, which this image may not ship. A health
+  # check whose binary is missing does not fail loudly -- the container reports
+  # UNKNOWN forever and the ECS deployment sits at IN_PROGRESS indefinitely,
+  # which reads like a slow rollout rather than a broken probe.
+  #
+  # Caddy will health-check the upstream once it fronts this service, which is
+  # the right layer for it: it tests the path traffic actually takes.
 }
 
 module "monitoring" {
