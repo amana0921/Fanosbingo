@@ -299,13 +299,12 @@ module "service_postgrest" {
 #   * The websocket path is /socket/websocket, NOT /realtime/v1/websocket.
 #     Supabase's own gateway strips that prefix; ours must too.
 #
-# SECURITY NOTE, stated plainly: Realtime v2.34.47 exposes no DB_SSL option and
-# its runtime configuration contains no ssl references, so this connection to
-# PostgreSQL is UNENCRYPTED. Two consequences: rds.force_ssl must not be
-# enabled or Realtime cannot connect at all, and the compensating control is
-# purely network -- RDS sits in isolated subnets with no internet route, and its
-# security group admits 5432 only from this instance's security group. Traffic
-# never leaves the VPC. Accepted, not overlooked.
+# SECURITY, corrected: an earlier revision pinned 2.34.47, which has NO TLS
+# support for its database connection, and concluded that rds.force_ssl would
+# have to be disabled. That was the wrong trade -- it would have weakened every
+# connection to the database for the sake of one client. 2.120.0 adds DB_SSL
+# and DB_SSL_CA_CERT, so enforcement stays on and this connection is VERIFIED
+# against Amazon's CA, matching postgrest and ticker.
 module "service_realtime" {
   source = "../../modules/ecs_service"
 
@@ -362,6 +361,16 @@ module "service_realtime" {
     SLOT_NAME_SUFFIX = var.environment
 
     DB_POOL_SIZE = "5"
+
+    # RDS PostgreSQL 15+ ships rds.force_ssl=1 as the ENGINE DEFAULT, so the
+    # database refuses an unencrypted connection outright:
+    #   FATAL 28000 no pg_hba.conf entry for host ... no encryption
+    #
+    # DB_SSL_CA_CERT is a FILE PATH (Erlang :cacertfile). Without it, DB_SSL
+    # alone falls back to verify: :verify_none -- encrypted but unverified --
+    # so supplying the path is what makes verification actually happen.
+    DB_SSL         = "true"
+    DB_SSL_CA_CERT = "/opt/rds-global-bundle.pem"
   }
 
   secrets = {
@@ -371,6 +380,9 @@ module "service_realtime" {
     # Must match the secret PostgREST verifies with, or a token accepted by the
     # data API is rejected by the realtime channel and vice versa.
     API_JWT_SECRET = "/${local.name_prefix}/app/jwt_secret"
+    # Newly REQUIRED in 2.120.0: without it the VM terminates during boot with
+    # a System.EnvError rather than a readable message.
+    METRICS_JWT_SECRET = "/${local.name_prefix}/realtime/metrics_jwt_secret"
   }
 
   # Realtime runs its Ecto migrations on boot, which takes a few seconds.

@@ -40,16 +40,17 @@ locals {
 
   # Secrets. Created empty; populated out-of-band.
   secret_parameters = [
-    "telegram/bot_token",       # Telegram Bot API token
-    "telegram/webhook_secret",  # X-Telegram-Bot-Api-Secret-Token, verified per request
-    "app/jwt_secret",           # signs player JWTs; PostgREST and Realtime verify with it
-    "app/admin_bootstrap_key",  # temporary, until Cognito lands in Phase 4
-    "db/postgrest_password",    # authenticator role password
-    "db/app_password",          # ticker + functions + realtime role password
-    "realtime/secret_key_base", # Phoenix session/cookie signing; 64 hex chars
-    "realtime/db_enc_key",      # encrypts tenant credentials at rest; EXACTLY 16 chars
-    "tls/origin_cert",          # Cloudflare Origin Certificate (PEM), 15-year validity
-    "tls/origin_key",           # its private key (PEM)
+    "telegram/bot_token",          # Telegram Bot API token
+    "telegram/webhook_secret",     # X-Telegram-Bot-Api-Secret-Token, verified per request
+    "app/jwt_secret",              # signs player JWTs; PostgREST and Realtime verify with it
+    "app/admin_bootstrap_key",     # temporary, until Cognito lands in Phase 4
+    "db/postgrest_password",       # authenticator role password
+    "db/app_password",             # ticker + functions + realtime role password
+    "realtime/secret_key_base",    # Phoenix session/cookie signing; 64 hex chars
+    "realtime/db_enc_key",         # encrypts tenant credentials at rest; EXACTLY 16 chars
+    "realtime/metrics_jwt_secret", # required from Realtime 2.120.0
+    "tls/origin_cert",             # Cloudflare Origin Certificate (PEM), 15-year validity
+    "tls/origin_key",              # its private key (PEM)
   ]
 }
 
