@@ -148,6 +148,7 @@ jobs:
           # creating a service whose tasks can never start.
           TF_VAR_ticker_image: ${{ vars.TICKER_IMAGE }}
           TF_VAR_postgrest_image: ${{ vars.POSTGREST_IMAGE }}
+          TF_VAR_realtime_image: ${{ vars.REALTIME_IMAGE }}
         run: |
           set +e
           terraform plan -detailed-exitcode -no-color -out=tfplan > plan.txt 2>&1
@@ -283,6 +284,7 @@ jobs:
           # creating a service whose tasks can never start.
           TF_VAR_ticker_image: ${{ vars.TICKER_IMAGE }}
           TF_VAR_postgrest_image: ${{ vars.POSTGREST_IMAGE }}
+          TF_VAR_realtime_image: ${{ vars.REALTIME_IMAGE }}
         run: terraform apply -auto-approve
 
       - name: Summarise outputs
@@ -358,4 +360,5 @@ jobs:
           # creating a service whose tasks can never start.
           TF_VAR_ticker_image: ${{ vars.TICKER_IMAGE }}
           TF_VAR_postgrest_image: ${{ vars.POSTGREST_IMAGE }}
+          TF_VAR_realtime_image: ${{ vars.REALTIME_IMAGE }}
         run: terraform destroy -auto-approve

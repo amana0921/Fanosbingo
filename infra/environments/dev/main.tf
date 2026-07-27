@@ -27,6 +27,7 @@ locals {
   # every service gate behaves the same way.
   ticker_image    = trimspace(coalesce(var.ticker_image, "")) == "" ? null : var.ticker_image
   postgrest_image = trimspace(coalesce(var.postgrest_image, "")) == "" ? null : var.postgrest_image
+  realtime_image  = trimspace(coalesce(var.realtime_image, "")) == "" ? null : var.realtime_image
 
   # S3 bucket names are globally unique across all AWS accounts, so the account
   # id is appended. Computed here rather than in the s3_cloudfront module so the
@@ -264,6 +265,109 @@ module "service_postgrest" {
   #
   # Caddy will health-check the upstream once it fronts this service, which is
   # the right layer for it: it tests the path traffic actually takes.
+}
+
+# Realtime: live game updates.
+#
+# Self-hosting the same component Supabase runs means all 10 postgres_changes
+# subscription sites in the SPA work unchanged. Rebuilding this on AppSync or
+# API Gateway WebSockets would mean reimplementing RLS-aware row-change fan-out,
+# which is the genuinely hard part.
+#
+# Everything below was established by running the real image against a local
+# PostgreSQL, because none of it is guessable:
+#
+#   * The _realtime schema must EXIST BEFORE the container starts, or it dies
+#     with "no schema has been selected to create in". It cannot create the
+#     schema itself -- the failing statement is the creation of its own
+#     migration-tracking table. Handled in db/00-bootstrap.
+#
+#   * ECTO_IPV6 and ERL_AFLAGS are baked into the image as IPv6. In an IPv4-only
+#     VPC that fails to connect, so both are overridden here.
+#
+#   * Tenant resolution is by HOST SUBDOMAIN. A request arriving as
+#     Host: <ip> gets 403; Host: realtime-dev.<anything> gets 101 Switching
+#     Protocols. Caddy must rewrite the Host header.
+#
+#   * The websocket path is /socket/websocket, NOT /realtime/v1/websocket.
+#     Supabase's own gateway strips that prefix; ours must too.
+#
+# SECURITY NOTE, stated plainly: Realtime v2.34.47 exposes no DB_SSL option and
+# its runtime configuration contains no ssl references, so this connection to
+# PostgreSQL is UNENCRYPTED. Two consequences: rds.force_ssl must not be
+# enabled or Realtime cannot connect at all, and the compensating control is
+# purely network -- RDS sits in isolated subnets with no internet route, and its
+# security group admits 5432 only from this instance's security group. Traffic
+# never leaves the VPC. Accepted, not overlooked.
+module "service_realtime" {
+  source = "../../modules/ecs_service"
+
+  count = local.realtime_image == null ? 0 : 1
+
+  name_prefix       = local.name_prefix
+  name              = "realtime"
+  cluster_arn       = module.ecs.cluster_arn
+  capacity_provider = module.ecs.capacity_provider_name
+  log_group_name    = module.ecs.log_group_name
+
+  image              = local.realtime_image
+  task_role_arn      = module.iam.task_data_role_arn
+  execution_role_arn = module.iam.task_execution_role_arn
+
+  network_mode = "bridge"
+  port_mappings = [{
+    container_port = 4000
+    host_port      = 4000
+  }]
+
+  # The BEAM VM is the memory-hungry container in this stack; the other four
+  # together use less.
+  cpu                = 256
+  memory_reservation = 420
+
+  environment_variables = {
+    PORT     = "4000"
+    APP_NAME = "realtime"
+
+    DB_HOST = module.rds.address
+    DB_PORT = tostring(module.rds.port)
+    DB_NAME = module.rds.database_name
+    DB_USER = "app_service"
+
+    # Points Ecto at Realtime's own schema. The schema must already exist.
+    DB_AFTER_CONNECT_QUERY = "SET search_path TO _realtime"
+
+    # The image defaults to IPv6 for both the database connection and Erlang
+    # distribution. Neither works in an IPv4-only VPC.
+    ECTO_IPV6     = "false"
+    DB_IP_VERSION = "ipv4"
+    ERL_AFLAGS    = "-proto_dist inet_tcp"
+    DNS_NODES     = "''"
+
+    # Creates the default tenant on first boot, which is what makes the
+    # websocket handshake resolvable at all.
+    SEED_SELF_HOST = "true"
+    RUN_JANITOR    = "true"
+    RLIMIT_NOFILE  = "10000"
+
+    # Keeps replication slot names distinct per environment, so dev and prod
+    # can never collide on a shared database during a migration or restore.
+    SLOT_NAME_SUFFIX = var.environment
+
+    DB_POOL_SIZE = "5"
+  }
+
+  secrets = {
+    DB_PASSWORD     = "/${local.name_prefix}/db/app_password"
+    SECRET_KEY_BASE = "/${local.name_prefix}/realtime/secret_key_base"
+    DB_ENC_KEY      = "/${local.name_prefix}/realtime/db_enc_key"
+    # Must match the secret PostgREST verifies with, or a token accepted by the
+    # data API is rejected by the realtime channel and vice versa.
+    API_JWT_SECRET = "/${local.name_prefix}/app/jwt_secret"
+  }
+
+  # Realtime runs its Ecto migrations on boot, which takes a few seconds.
+  stop_timeout = 30
 }
 
 module "monitoring" {

@@ -191,6 +191,36 @@ BEGIN
 END $$;
 
 -- ---------------------------------------------------------------------------
+-- 4b. Realtime's own schema
+--
+-- The supabase/realtime container runs its Ecto migrations against a schema set
+-- by DB_AFTER_CONNECT_QUERY (`SET search_path TO _realtime`). If that schema
+-- does not already exist the container dies on boot with:
+--
+--   (Postgrex.Error) ERROR 3F000 (invalid_schema_name)
+--   no schema has been selected to create in
+--
+-- It cannot create the schema itself, because the failing statement IS the
+-- creation of its migration-tracking table. Verified by running the real image
+-- against a local PostgreSQL.
+-- ---------------------------------------------------------------------------
+CREATE SCHEMA IF NOT EXISTS _realtime;
+
+-- Realtime consumes a logical replication slot, which requires the REPLICATION
+-- attribute. On RDS that is granted through the rds_replication role, which
+-- does not exist on stock PostgreSQL -- hence the guard, so this file still
+-- applies cleanly to a local container used for testing.
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'rds_replication') THEN
+    GRANT rds_replication TO app_service;
+    RAISE NOTICE 'Granted rds_replication to app_service';
+  ELSE
+    RAISE NOTICE 'rds_replication not present (not RDS); skipping replication grant';
+  END IF;
+END $$;
+
+-- ---------------------------------------------------------------------------
 -- 5. Schema privileges and default grants
 --
 -- RLS decides WHICH ROWS a role may touch, but only after table-level
