@@ -25,10 +25,16 @@ locals {
   # register a task definition with no image, failing with the distinctly
   # unhelpful "Container.image should not be null or empty". Normalise here so
   # every service gate behaves the same way.
-  ticker_image    = trimspace(coalesce(var.ticker_image, "")) == "" ? null : var.ticker_image
-  postgrest_image = trimspace(coalesce(var.postgrest_image, "")) == "" ? null : var.postgrest_image
-  realtime_image  = trimspace(coalesce(var.realtime_image, "")) == "" ? null : var.realtime_image
-  caddy_image     = trimspace(coalesce(var.caddy_image, "")) == "" ? null : var.caddy_image
+  #
+  # try() rather than coalesce(): coalesce SKIPS empty strings, so
+  # coalesce("", "") has no valid argument and raises "no non-null,
+  # non-empty-string arguments". try() covers both cases -- trimspace(null)
+  # raises and yields "", and trimspace("") is already "". Verified against
+  # all three inputs locally before pushing.
+  ticker_image    = try(trimspace(var.ticker_image), "") == "" ? null : var.ticker_image
+  postgrest_image = try(trimspace(var.postgrest_image), "") == "" ? null : var.postgrest_image
+  realtime_image  = try(trimspace(var.realtime_image), "") == "" ? null : var.realtime_image
+  caddy_image     = try(trimspace(var.caddy_image), "") == "" ? null : var.caddy_image
 
   # S3 bucket names are globally unique across all AWS accounts, so the account
   # id is appended. Computed here rather than in the s3_cloudfront module so the
