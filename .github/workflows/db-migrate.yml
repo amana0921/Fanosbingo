@@ -146,14 +146,30 @@ jobs:
           # First call should create a waiting game if none exists; the second
           # must NOT create a duplicate, which is the property that used to be
           # violated by two browsers racing to create one.
-          psql "$DATABASE_URL" --no-psqlrc -tAc "SELECT game_tick()" \
-            | sed 's/^/tick 1: /' | tee -a "$GITHUB_STEP_SUMMARY"
+          #
+          # Output is captured with 2>&1 and printed explicitly. Piping psql
+          # straight into sed under `set -e` loses the error text, which turns a
+          # one-line "function does not exist" into a silent exit code 1.
+          run_tick() {
+            local label="$1" out
+            if ! out="$(psql "$DATABASE_URL" --no-psqlrc -tAc 'SELECT game_tick()' 2>&1)"; then
+              echo "::error::${label} failed"
+              echo "$out"
+              return 1
+            fi
+            echo "${label}: ${out}" | tee -a "$GITHUB_STEP_SUMMARY"
+          }
 
-          psql "$DATABASE_URL" --no-psqlrc -tAc "SELECT game_tick()" \
-            | sed 's/^/tick 2: /' | tee -a "$GITHUB_STEP_SUMMARY"
+          run_tick "tick 1"
+          run_tick "tick 2"
 
-          waiting=$(psql "$DATABASE_URL" --no-psqlrc -tAc \
-            "SELECT count(*) FROM games WHERE status = 'waiting'")
+          if ! waiting="$(psql "$DATABASE_URL" --no-psqlrc -tAc \
+              "SELECT count(*) FROM games WHERE status = 'waiting'" 2>&1)"; then
+            echo "::error::Could not count waiting games"
+            echo "$waiting"
+            exit 1
+          fi
+
           echo "waiting games: $waiting" | tee -a "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
