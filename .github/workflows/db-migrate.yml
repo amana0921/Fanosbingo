@@ -135,6 +135,37 @@ jobs:
 
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Smoke-test the game loop
+        if: github.event_name != 'pull_request' && github.event.inputs.dry_run != 'true'
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC1091
+          source scripts/db-tunnel.sh "$ENVIRONMENT"
+          trap stop_db_tunnel EXIT
+
+          echo "### Game loop smoke test" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+          # Exercise game_tick for real rather than trusting that it compiles.
+          # First call should create a waiting game if none exists; the second
+          # must NOT create a duplicate, which is the property that used to be
+          # violated by two browsers racing to create one.
+          psql "$DATABASE_URL" --no-psqlrc -tAc "SELECT game_tick()" \
+            | sed 's/^/tick 1: /' | tee -a "$GITHUB_STEP_SUMMARY"
+
+          psql "$DATABASE_URL" --no-psqlrc -tAc "SELECT game_tick()" \
+            | sed 's/^/tick 2: /' | tee -a "$GITHUB_STEP_SUMMARY"
+
+          waiting=$(psql "$DATABASE_URL" --no-psqlrc -tAc \
+            "SELECT count(*) FROM games WHERE status = 'waiting'")
+          echo "waiting games: $waiting" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$waiting" != "1" ]; then
+            echo "::error::Expected exactly 1 waiting game after two ticks, found $waiting."
+            exit 1
+          fi
+
       - name: Comment dry run on PR
         if: github.event_name == 'pull_request'
         uses: actions/github-script@v7
