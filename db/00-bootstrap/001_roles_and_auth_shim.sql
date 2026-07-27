@@ -144,6 +144,13 @@ $$;
 CREATE EXTENSION IF NOT EXISTS pg_cron;
 CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
 
+-- pgcrypto, for gen_random_bytes() in 20251215115459_add_sms_forwarding_system.
+--
+-- Easy to miss when auditing: gen_random_UUID() is native to PostgreSQL 13+ and
+-- needs nothing, but gen_random_BYTES() is pgcrypto-only. Supabase enables
+-- pgcrypto by default, so the migration never had to ask for it.
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
 -- ---------------------------------------------------------------------------
 -- 4. Realtime publication
 --
