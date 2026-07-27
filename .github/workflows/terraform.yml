@@ -103,7 +103,9 @@ jobs:
           scan-ref: infra/
           severity: HIGH,CRITICAL
           exit-code: '1'
-          trivy-config: .trivy.yaml
+          # Accepted findings live in .trivyignore, each with its justification.
+          # Anything not listed there fails the build.
+          trivyignores: .trivyignore
 
   # ==========================================================================
   # Plan

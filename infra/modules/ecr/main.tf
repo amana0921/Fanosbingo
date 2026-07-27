@@ -19,8 +19,14 @@
 resource "aws_ecr_repository" "this" {
   for_each = toset(var.repository_names)
 
-  name                 = "${var.name_prefix}/${each.value}"
-  image_tag_mutability = "MUTABLE" # deploys retag :latest alongside the SHA tag
+  name = "${var.name_prefix}/${each.value}"
+
+  # IMMUTABLE: a tag, once pushed, can never be repointed at different bytes.
+  # This means deploys must tag by git SHA and task definitions must reference
+  # that exact tag — never a floating `:latest`. That is the better pattern
+  # regardless: what is running is always traceable to a commit, and a rollback
+  # is a task-definition revision rather than a rebuild.
+  image_tag_mutability = "IMMUTABLE"
 
   image_scanning_configuration {
     # Basic scanning is free. Findings appear in the console per image.
