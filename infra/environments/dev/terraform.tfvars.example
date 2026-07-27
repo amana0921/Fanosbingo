@@ -1,0 +1,24 @@
+# Copy to terraform.tfvars and fill in. terraform.tfvars is gitignored.
+#
+#   cp terraform.tfvars.example terraform.tfvars
+
+aws_region  = "us-east-1"
+environment = "dev"
+
+# Distinct from prod's 10.20.0.0/16 so the two could be peered later if needed.
+vpc_cidr = "10.30.0.0/16"
+
+# Apex domain. Used to build the CORS allowed origin the API will accept.
+domain_name = "yisakmesifin.org"
+
+# Repository permitted to assume the GitHub Actions deploy role via OIDC.
+# Anything else on GitHub is refused.
+github_repository = "amana0921/Fanosbingo"
+
+# Budget and alarm notifications. Each address must click the SNS confirmation
+# link before anything is delivered.
+alert_emails = ["amanaman091451@gmail.com"]
+
+# Leave false. scripts/bootstrap-aws.sh creates the OIDC provider, and Terraform
+# authenticates through it — so Terraform cannot be what creates it.
+create_github_oidc_provider = false

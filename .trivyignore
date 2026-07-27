@@ -1,0 +1,35 @@
+# Accepted Trivy findings.
+#
+# Each entry is a deliberate architectural decision documented in
+# infra/README.md and in the module that makes it — not an unreviewed
+# suppression. Anything NOT listed here fails the build.
+#
+# Both the short (AWS-nnnn) and canonical (AVD-AWS-nnnn) forms are listed
+# because Trivy reports the short form in table output.
+
+# ---------------------------------------------------------------------------
+# Unrestricted egress from the application security group
+#
+# There is no NAT Gateway — a deliberate ~$32/mo saving on a ~$30/mo budget.
+# The instance must reach the BSC RPC providers, the Telegram Bot API, ECR, SSM
+# and CloudWatch directly. Restricting egress would require the NAT we are
+# specifically avoiding.
+#
+# The compensating control is INGRESS: port 443 is admitted only from
+# Cloudflare's published ranges, so the origin cannot be reached directly and
+# Cloudflare's WAF cannot be bypassed.
+# ---------------------------------------------------------------------------
+AWS-0104
+AVD-AWS-0104
+
+# ---------------------------------------------------------------------------
+# Public subnet assigns public IP addresses
+#
+# Same root cause. The single application instance needs direct internet egress
+# and therefore a public IP. RDS lives in isolated subnets whose route table has
+# no internet route at all, in either direction, so the data layer is not
+# exposed. Revisit at Stage 2, when an ALB fronts the instances and they can
+# move to private subnets.
+# ---------------------------------------------------------------------------
+AWS-0164
+AVD-AWS-0164

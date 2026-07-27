@@ -1,0 +1,140 @@
+/**
+ * Fanos Bingo — prod environment.
+ *
+ * This one holds real player balances and a funded hot wallet. Every setting
+ * that differs from dev exists to make destruction hard and recovery possible:
+ *
+ *   - RDS deletion protection on, final snapshot required
+ *   - No apply_immediately: schema-level changes wait for the maintenance window
+ *   - 7-day PITR
+ *   - 30-day KMS deletion window (deleting the signing key strands funds)
+ *   - ECR force_delete off
+ *   - BSC mainnet
+ *
+ * Applied only via the Terraform workflow, gated by the `prod` GitHub
+ * Environment's required reviewers.
+ */
+
+data "aws_caller_identity" "current" {}
+
+locals {
+  name_prefix = "${var.project_name}-${var.environment}"
+
+  # S3 bucket names are globally unique across all AWS accounts.
+  spa_bucket_name = "${local.name_prefix}-spa-${data.aws_caller_identity.current.account_id}"
+}
+
+module "vpc" {
+  source = "../../modules/vpc"
+
+  name_prefix = local.name_prefix
+  vpc_cidr    = var.vpc_cidr
+}
+
+module "security_groups" {
+  source = "../../modules/security_groups"
+
+  name_prefix = local.name_prefix
+  vpc_id      = module.vpc.vpc_id
+}
+
+module "kms" {
+  source = "../../modules/kms"
+
+  name_prefix = local.name_prefix
+
+  # Full window. Deleting the wallet signing key means the funds only it can
+  # move become permanently unreachable.
+  deletion_window_in_days = 30
+}
+
+module "ssm" {
+  source = "../../modules/ssm"
+
+  name_prefix = local.name_prefix
+  kms_key_arn = module.kms.main_key_arn
+  domain_name = var.domain_name
+
+  bsc_chain_id = var.bsc_chain_id
+}
+
+module "ecr" {
+  source = "../../modules/ecr"
+
+  name_prefix = local.name_prefix
+
+  # Never silently discard prod images; keep enough history to roll back.
+  force_delete     = false
+  keep_last_images = 10
+}
+
+module "ecs" {
+  source = "../../modules/ecs"
+
+  name_prefix = local.name_prefix
+  environment = var.environment
+
+  subnet_ids            = [module.vpc.public_subnet_ids[0]]
+  security_group_id     = module.security_groups.app_security_group_id
+  instance_profile_name = module.iam.ec2_instance_profile_name
+  kms_key_arn           = module.kms.main_key_arn
+
+  # Stage 2 upgrade: set instance_count = 2 and add subnet index 1. The ticker's
+  # advisory lock already guarantees a single game-loop caller across instances.
+  instance_count = 1
+}
+
+module "rds" {
+  source = "../../modules/rds"
+
+  name_prefix       = local.name_prefix
+  subnet_ids        = module.vpc.isolated_subnet_ids
+  security_group_id = module.security_groups.rds_security_group_id
+  kms_key_arn       = module.kms.main_key_arn
+
+  # Make accidental destruction of the balance ledger as hard as possible.
+  deletion_protection = true
+  skip_final_snapshot = false
+
+  # Modifications wait for the maintenance window rather than interrupting play.
+  apply_immediately = false
+
+  backup_retention_period = 7
+
+  # Stage 2 upgrade: multi_az = true (roughly doubles the instance cost).
+  multi_az = false
+}
+
+module "iam" {
+  source = "../../modules/iam"
+
+  name_prefix = local.name_prefix
+  environment = var.environment
+
+  kms_key_arn            = module.kms.main_key_arn
+  wallet_signing_key_arn = module.kms.wallet_signing_key_arn
+  spa_bucket_name        = local.spa_bucket_name
+
+  github_repository           = var.github_repository
+  create_github_oidc_provider = var.create_github_oidc_provider
+}
+
+module "monitoring" {
+  source = "../../modules/monitoring"
+
+  name_prefix = local.name_prefix
+  environment = var.environment
+  kms_key_arn = module.kms.main_key_arn
+
+  alert_emails = var.alert_emails
+
+  # Ceiling of $32 with alerts at $20 and $27, plus a forecast alert. On a
+  # credit-based Free Tier plan, exhausting credits on a Free account plan
+  # SUSPENDS resources — these alerts are the warning to switch to Paid.
+  monthly_budget_usd   = 32
+  alert_thresholds_usd = [20, 27]
+
+  rds_instance_id          = module.rds.instance_id
+  rds_allocated_storage_gb = 20
+  autoscaling_group_name   = module.ecs.autoscaling_group_name
+}

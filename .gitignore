@@ -21,3 +21,27 @@ dist-ssr
 *.sln
 *.sw?
 
+# Secrets. VITE_* vars are compile-time, so a leaked .env leaks the build config.
+.env
+.env.*
+!.env.example
+
+# Terraform
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+# Real variable values stay local; commit terraform.tfvars.example instead.
+*.tfvars
+*.tfvars.json
+!*.tfvars.example
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+# Plan files can contain secret values in cleartext.
+*.tfplan
+
