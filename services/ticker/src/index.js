@@ -33,6 +33,7 @@
  *     where it belongs.
  */
 
+import fs from 'node:fs';
 import pg from 'pg';
 import { CloudWatchClient, PutMetricDataCommand } from '@aws-sdk/client-cloudwatch';
 
@@ -80,14 +81,56 @@ function log(level, message, fields = {}) {
 // Deliberately not a single DATABASE_URL: assembling one in Terraform would put
 // the password into Terraform state, which is plaintext JSON in S3. DATABASE_URL
 // remains supported as an override for local runs.
-const connectionConfig = DATABASE_URL
-  ? { connectionString: DATABASE_URL }
-  : {};
-
 if (!DATABASE_URL && !process.env.PGHOST) {
   log('error', 'No database connection configured: set PGHOST (and PGUSER/PGPASSWORD/PGDATABASE) or DATABASE_URL');
   process.exit(1);
 }
+
+/**
+ * TLS to RDS.
+ *
+ * RDS presents a certificate signed by an Amazon CA that is not in Node's
+ * default trust store, so an unconfigured connection fails with "self-signed
+ * certificate in certificate chain".
+ *
+ * The tempting fix is rejectUnauthorized:false, which encrypts the connection
+ * but verifies nothing — anything that can intercept the connection can then
+ * read and rewrite every balance update. We verify against Amazon's published
+ * CA bundle instead, baked into the image at build time.
+ *
+ * If the bundle is missing we FAIL rather than silently downgrading, because a
+ * silent downgrade to unverified TLS is exactly the kind of thing that survives
+ * unnoticed into production.
+ */
+function buildSslConfig() {
+  const caPath = process.env.PGSSLROOTCERT;
+  const mode = process.env.PGSSLMODE ?? 'require';
+
+  if (mode === 'disable') {
+    log('warn', 'TLS disabled for the database connection');
+    return false;
+  }
+
+  if (!caPath) {
+    log('error', 'PGSSLROOTCERT is not set. Refusing to connect without a CA to verify against.');
+    process.exit(1);
+  }
+
+  if (!fs.existsSync(caPath)) {
+    log('error', 'CA bundle not found; refusing to fall back to unverified TLS', { path: caPath });
+    process.exit(1);
+  }
+
+  return {
+    ca: fs.readFileSync(caPath, 'utf8'),
+    rejectUnauthorized: true,
+  };
+}
+
+const connectionConfig = {
+  ...(DATABASE_URL ? { connectionString: DATABASE_URL } : {}),
+  ssl: buildSslConfig(),
+};
 
 let shuttingDown = false;
 let lockClient = null;

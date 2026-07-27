@@ -25,7 +25,18 @@ FROM node:22-alpine
 # SIGTERM on ECS task replacement, never runs its shutdown handler, and never
 # releases the advisory lock -- so a standby waits for the TCP connection to be
 # reaped instead of taking over immediately.
-RUN apk add --no-cache dumb-init
+RUN apk add --no-cache dumb-init ca-certificates curl
+
+# Amazon's RDS CA bundle.
+#
+# RDS presents a certificate signed by an Amazon CA that is not in Node's
+# default trust store, so an unconfigured connection dies with "self-signed
+# certificate in certificate chain". Baking the published bundle in lets us
+# verify properly instead of reaching for rejectUnauthorized:false, which
+# encrypts the connection while verifying nothing.
+ADD --chmod=444 https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem \
+    /etc/ssl/certs/rds-global-bundle.pem
+ENV PGSSLROOTCERT=/etc/ssl/certs/rds-global-bundle.pem
 
 ENV NODE_ENV=production
 WORKDIR /app
