@@ -113,13 +113,19 @@ jobs:
           TASKDEF="$(aws ecs describe-task-definition --task-definition "$FAMILY" \
             --query 'taskDefinition' --output json)"
 
-          NEW="$(echo "$TASKDEF" | jq --arg IMAGE "$IMAGE" '
+          # Write to a real file rather than piping to file:///dev/stdin: inside
+          # a command substitution the CLI does not reliably see stdin, and the
+          # symptom is a bare "Invalid JSON received" that looks like a jq bug.
+          echo "$TASKDEF" | jq --arg IMAGE "$IMAGE" '
             .containerDefinitions[0].image = $IMAGE
             | del(.taskDefinitionArn, .revision, .status, .requiresAttributes,
-                  .compatibilities, .registeredAt, .registeredBy)')"
+                  .compatibilities, .registeredAt, .registeredBy, .deregisteredAt)
+          ' > /tmp/taskdef.json
 
-          REVISION="$(echo "$NEW" | aws ecs register-task-definition \
-            --cli-input-json file:///dev/stdin \
+          jq -e . /tmp/taskdef.json > /dev/null || { echo "::error::Generated task definition is not valid JSON"; exit 1; }
+
+          REVISION="$(aws ecs register-task-definition \
+            --cli-input-json file:///tmp/taskdef.json \
             --query 'taskDefinition.taskDefinitionArn' --output text)"
 
           echo "Registered $REVISION"
