@@ -1,0 +1,159 @@
+name: Database migrations
+
+# Applies schema changes to RDS through an SSM tunnel.
+#
+# RDS has no public endpoint, which is correct for a database holding player
+# balances, and means CI cannot reach it directly. Rather than weaken that by
+# making the instance publicly accessible or standing up a bastion, this tunnels
+# through the existing ECS container instance via SSM: no inbound port, no SSH
+# key, and every session attributable to an IAM principal in CloudTrail.
+#
+# A pull request touching migrations gets a DRY RUN showing exactly what would
+# be applied. Applying is deliberate: either merged to main, or dispatched.
+
+on:
+  pull_request:
+    paths:
+      - 'db/**'
+      - 'supabase/migrations/**'
+      - 'scripts/db-*.sh'
+      - '.github/workflows/db-migrate.yml'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to migrate'
+        required: true
+        type: choice
+        options: [dev, prod]
+        default: dev
+      dry_run:
+        description: 'List pending migrations without applying'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  id-token: write
+  pull-requests: write
+
+jobs:
+  migrate:
+    name: Migrate (${{ github.event.inputs.environment || 'dev' }})
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || 'dev' }}
+    concurrency:
+      # Two concurrent runners applying migrations to one database is a genuine
+      # corruption risk, not merely wasteful.
+      group: db-migrate-${{ github.event.inputs.environment || 'dev' }}
+      cancel-in-progress: false
+    env:
+      ENVIRONMENT: ${{ github.event.inputs.environment || 'dev' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assume AWS role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: db-migrate-${{ github.run_id }}
+
+      - name: Install session-manager-plugin
+        run: |
+          curl -fsSL -o /tmp/session-manager-plugin.deb \
+            "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_64bit/session-manager-plugin.deb"
+          sudo dpkg -i /tmp/session-manager-plugin.deb
+          session-manager-plugin --version
+
+      - name: Verify psql
+        run: psql --version
+
+      - name: Run migrations
+        env:
+          # PostgREST connects as `authenticator`. The bootstrap file sets this
+          # role's password, so the runner needs it. Read from SSM at run time
+          # rather than passed as a workflow input, so it never appears in logs
+          # or run metadata.
+          DRY_RUN_FLAG: ${{ github.event_name == 'pull_request' && '--dry-run' || (github.event.inputs.dry_run == 'true' && '--dry-run' || '') }}
+        run: |
+          set -euo pipefail
+
+          DB_AUTHENTICATOR_PASSWORD="$(aws ssm get-parameter \
+            --name "/fanosbingo-${ENVIRONMENT}/db/postgrest_password" \
+            --with-decryption --query 'Parameter.Value' --output text)"
+          export DB_AUTHENTICATOR_PASSWORD
+
+          if [ "$DB_AUTHENTICATOR_PASSWORD" = "PLACEHOLDER_SET_ME_OUT_OF_BAND" ]; then
+            echo "::error::db/postgrest_password is still a placeholder. Run the 'Sync secrets to SSM' workflow first."
+            exit 1
+          fi
+
+          # shellcheck disable=SC1091
+          source scripts/db-tunnel.sh "$ENVIRONMENT"
+          trap stop_db_tunnel EXIT
+
+          ./scripts/db-migrate.sh $DRY_RUN_FLAG | tee /tmp/migrate-output.txt
+
+      - name: Verify Realtime prerequisites
+        if: github.event_name != 'pull_request' && github.event.inputs.dry_run != 'true'
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC1091
+          source scripts/db-tunnel.sh "$ENVIRONMENT"
+          trap stop_db_tunnel EXIT
+
+          echo "### Database state" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+          # These four are the difference between Realtime working and Realtime
+          # connecting successfully while delivering nothing.
+          psql "$DATABASE_URL" --no-psqlrc -tAc "
+            SELECT 'wal_level              = ' || current_setting('wal_level')
+            UNION ALL SELECT 'shared_preload_libs    = ' || current_setting('shared_preload_libraries')
+            UNION ALL SELECT 'publication tables     = ' || coalesce((
+              SELECT string_agg(tablename, ', ' ORDER BY tablename)
+              FROM pg_publication_tables WHERE pubname = 'supabase_realtime'), '(none)')
+            UNION ALL SELECT 'cron jobs              = ' || coalesce((
+              SELECT string_agg(jobname || ' [' || schedule || ']', ', ' ORDER BY jobname)
+              FROM cron.job), '(none)')
+            UNION ALL SELECT 'tables in public       = ' || (
+              SELECT count(*)::text FROM information_schema.tables
+              WHERE table_schema = 'public' AND table_type = 'BASE TABLE')
+            UNION ALL SELECT 'migrations applied     = ' || (
+              SELECT count(*)::text FROM schema_migrations)
+          " | tee -a "$GITHUB_STEP_SUMMARY"
+
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Comment dry run on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const out = fs.readFileSync('/tmp/migrate-output.txt', 'utf8');
+            const body = [
+              '### Pending database migrations — `dev`',
+              '',
+              '```',
+              out.replace(/\[[0-9;]*m/g, '').slice(-60000),
+              '```',
+            ].join('\n');
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const mine = comments.find(c =>
+              c.user.type === 'Bot' && c.body.includes('### Pending database migrations'));
+            if (mine) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                comment_id: mine.id, body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: context.issue.number, body,
+              });
+            }
