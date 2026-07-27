@@ -211,6 +211,26 @@ whatever punctuation you like. Find offenders with:
 grep -rnP '^\s*(description|alarm_description)\s*=.*[^\x00-\x7F]' infra/modules --include=*.tf
 ```
 
+### `Client.InvalidKMSKey.InvalidState` on instance launch
+
+The ASG launches an instance, fails to attach its encrypted root volume,
+terminates it, and retries forever. The message is misleading: the key is
+enabled and healthy. **This is an authorisation failure, not a state failure.**
+
+Auto Scaling needs explicit key-policy permission to use the CMK — the
+`AllowAutoScalingUseOfKey` and `AllowAutoScalingToCreateGrants` statements in
+`modules/kms`. Note that attaching an `aws_kms_key_policy` **replaces** the
+default policy, so the usual "root has `kms:*`, therefore IAM delegation covers
+it" reasoning does not hold for service-linked roles.
+
+Diagnose with:
+
+```bash
+aws autoscaling describe-scaling-activities \
+  --auto-scaling-group-name <asg> --max-records 3 \
+  --query 'Activities[].StatusMessage' --output text
+```
+
 ### `Volume of size NGB is smaller than snapshot`
 
 The ECS-optimized AL2023 arm64 AMI ships a 30 GiB snapshot and EBS will not

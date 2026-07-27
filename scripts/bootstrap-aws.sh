@@ -137,7 +137,28 @@ aws s3api put-bucket-lifecycle-configuration --bucket "${BUCKET}" \
 info "  lifecycle policy set"
 
 # ---------------------------------------------------------------------------
-# 2. GitHub OIDC provider (account-wide, exactly one per account)
+# 2. Auto Scaling service-linked role
+#
+# The KMS key policy grants this role permission to encrypt instance root
+# volumes. KMS validates that principals named in a key policy actually exist,
+# so on a brand-new account the Terraform apply would fail with
+# MalformedPolicyDocumentException before it ever got as far as launching an
+# instance. AWS normally creates this role lazily on first ASG use, which is too
+# late for us.
+# ---------------------------------------------------------------------------
+info "Auto Scaling service-linked role"
+
+if aws iam get-role --role-name AWSServiceRoleForAutoScaling >/dev/null 2>&1; then
+  warn "  already exists — reusing"
+else
+  aws iam create-service-linked-role \
+    --aws-service-name autoscaling.amazonaws.com >/dev/null 2>&1 \
+    && info "  created" \
+    || warn "  could not create (it may already exist under a custom suffix)"
+fi
+
+# ---------------------------------------------------------------------------
+# 3. GitHub OIDC provider (account-wide, exactly one per account)
 # ---------------------------------------------------------------------------
 info "GitHub OIDC provider"
 
@@ -154,7 +175,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 3. Terraform executor role
+# 4. Terraform executor role
 # ---------------------------------------------------------------------------
 info "Terraform executor role"
 
