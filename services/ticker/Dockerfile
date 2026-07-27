@@ -6,7 +6,7 @@
 # shared across services rather than duplicated. Build with:
 #   docker build -f services/ticker/Dockerfile .
 
-FROM node:22-alpine AS deps
+FROM docker.io/library/node:22-alpine AS deps
 
 WORKDIR /app
 
@@ -20,7 +20,7 @@ RUN npm ci --omit=dev --no-audit --no-fund
 
 # ---------------------------------------------------------------------------
 
-FROM node:22-alpine
+FROM docker.io/library/node:22-alpine
 
 # dumb-init makes PID 1 forward signals properly. Without it Node receives no
 # SIGTERM on ECS task replacement, never runs its shutdown handler, and never

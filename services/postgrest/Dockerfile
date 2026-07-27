@@ -13,7 +13,7 @@
 # duplicated per service. Build with:
 #   docker build -f services/postgrest/Dockerfile .
 
-FROM postgrest/postgrest:v12.2.3
+FROM docker.io/postgrest/postgrest:v12.2.3
 
 # COPY from the repo, not ADD from a URL.
 #
