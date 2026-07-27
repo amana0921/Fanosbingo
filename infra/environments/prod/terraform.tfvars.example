@@ -9,7 +9,7 @@ environment = "prod"
 vpc_cidr = "10.20.0.0/16"
 
 # Apex domain. Used to build the CORS allowed origin the API will accept.
-domain_name = "fanosbingo.com"
+domain_name = "yisakmesifin.org"
 
 # Repository permitted to assume the GitHub Actions deploy role via OIDC.
 # Anything else on GitHub is refused.
