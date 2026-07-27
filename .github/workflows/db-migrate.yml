@@ -178,6 +178,27 @@ jobs:
             exit 1
           fi
 
+      # Probe the LIVE endpoint anonymously after any schema change.
+      #
+      # A permissive RLS policy is not visible in a migration diff -- the
+      # settings exposure that leaked a live bot token was found by curl, and
+      # the first fix for it reported success while changing nothing. This runs
+      # that probe automatically so the next one fails a build instead of
+      # waiting to be noticed.
+      #
+      # Tests the whole chain (Cloudflare -> Caddy -> PostgREST -> RLS), which
+      # the migration-time SET ROLE anon assertions deliberately do not.
+      - name: Probe public access
+        if: github.event_name != 'pull_request' && github.event.inputs.dry_run != 'true'
+        run: |
+          BASE="https://api.${{ vars.DOMAIN_NAME }}"
+          if ! curl -sf -m 15 -o /dev/null "$BASE/healthz"; then
+            echo "::warning::$BASE is not reachable; skipping the public-access probe."
+            echo "(The endpoint may be scaled to zero. The probe cannot conclude anything.)"
+            exit 0
+          fi
+          ./scripts/probe-public-access.sh "$BASE" | tee -a "$GITHUB_STEP_SUMMARY"
+
       - name: Comment dry run on PR
         if: github.event_name == 'pull_request'
         uses: actions/github-script@v7
