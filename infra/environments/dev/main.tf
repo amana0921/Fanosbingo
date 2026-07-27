@@ -20,6 +20,14 @@ data "aws_caller_identity" "current" {}
 locals {
   name_prefix = "${var.project_name}-${var.environment}"
 
+  # An unset GitHub variable arrives as TF_VAR_x="" -- an EMPTY STRING, not
+  # null. A bare `== null` check therefore passes, and Terraform goes on to
+  # register a task definition with no image, failing with the distinctly
+  # unhelpful "Container.image should not be null or empty". Normalise here so
+  # every service gate behaves the same way.
+  ticker_image    = trimspace(coalesce(var.ticker_image, "")) == "" ? null : var.ticker_image
+  postgrest_image = trimspace(coalesce(var.postgrest_image, "")) == "" ? null : var.postgrest_image
+
   # S3 bucket names are globally unique across all AWS accounts, so the account
   # id is appended. Computed here rather than in the s3_cloudfront module so the
   # iam module can scope the deploy role to it before that module exists.
@@ -137,7 +145,7 @@ module "service_ticker" {
   # No image, no service. Creating a service that references an image which does
   # not exist yet produces one that can never start a task and retries forever.
   # Build and push first (deploy-services workflow), then set TICKER_IMAGE.
-  count = var.ticker_image == null ? 0 : 1
+  count = local.ticker_image == null ? 0 : 1
 
   name_prefix       = local.name_prefix
   name              = "ticker"
@@ -145,7 +153,7 @@ module "service_ticker" {
   capacity_provider = module.ecs.capacity_provider_name
   log_group_name    = module.ecs.log_group_name
 
-  image              = var.ticker_image
+  image              = local.ticker_image
   task_role_arn      = module.iam.task_ticker_role_arn
   execution_role_arn = module.iam.task_execution_role_arn
 
@@ -189,7 +197,7 @@ module "service_ticker" {
 module "service_postgrest" {
   source = "../../modules/ecs_service"
 
-  count = var.postgrest_image == null ? 0 : 1
+  count = local.postgrest_image == null ? 0 : 1
 
   name_prefix       = local.name_prefix
   name              = "postgrest"
@@ -197,7 +205,7 @@ module "service_postgrest" {
   capacity_provider = module.ecs.capacity_provider_name
   log_group_name    = module.ecs.log_group_name
 
-  image              = var.postgrest_image
+  image              = local.postgrest_image
   task_role_arn      = module.iam.task_data_role_arn
   execution_role_arn = module.iam.task_execution_role_arn
 
