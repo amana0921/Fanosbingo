@@ -108,11 +108,33 @@ resource "aws_ecs_task_definition" "this" {
   tags = merge(var.tags, { Name = "${var.name_prefix}-${var.name}" })
 }
 
+# Resolves the newest ACTIVE revision of this family, whether Terraform or CI
+# registered it. depends_on so it is read AFTER any revision this apply creates.
+data "aws_ecs_task_definition" "latest" {
+  task_definition = aws_ecs_task_definition.this.family
+  depends_on      = [aws_ecs_task_definition.this]
+}
+
 resource "aws_ecs_service" "this" {
-  name            = var.name
-  cluster         = var.cluster_arn
-  task_definition = aws_ecs_task_definition.this.arn
-  desired_count   = var.desired_count
+  name    = var.name
+  cluster = var.cluster_arn
+
+  # Point at whichever revision is newer: the one this apply just registered, or
+  # the one CI registered on its last deploy.
+  #
+  # The naive alternatives both fail. Pinning to aws_ecs_task_definition.this.arn
+  # makes every terraform apply revert whatever CI deployed. Adding
+  # `ignore_changes = [task_definition]` fixes that but creates a worse problem:
+  # Terraform can then CHANGE configuration and never ROLL IT OUT. That bit us
+  # here -- a corrected TLS certificate path sat in an unused revision while the
+  # service kept crash-looping on the old one, looking for all the world like the
+  # fix had not worked.
+  task_definition = "${aws_ecs_task_definition.this.family}:${max(
+    aws_ecs_task_definition.this.revision,
+    data.aws_ecs_task_definition.latest.revision,
+  )}"
+
+  desired_count = var.desired_count
 
   capacity_provider_strategy {
     capacity_provider = var.capacity_provider
@@ -135,10 +157,13 @@ resource "aws_ecs_service" "this" {
   force_new_deployment = false
 
   lifecycle {
-    # CI deploys by registering a new task definition revision. Without this,
-    # the next terraform apply would roll the service back to the revision
-    # Terraform knows about, silently undoing the deploy.
-    ignore_changes = [task_definition, desired_count]
+    # task_definition is deliberately NOT ignored -- see the max() above, which
+    # is what lets Terraform and CI both register revisions without either
+    # overwriting the other.
+    #
+    # desired_count is ignored so a future autoscaling policy can move it
+    # without every apply fighting to put it back.
+    ignore_changes = [desired_count]
   }
 
   tags = merge(var.tags, { Name = "${var.name_prefix}-${var.name}" })
