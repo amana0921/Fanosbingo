@@ -13,10 +13,18 @@
 #                        cron job, schedule the orphaned cleanups, assert
 #                        wal_level.
 #
-# Applied files are tracked in schema_migrations with a SHA-256 checksum. If a
-# file changes after being applied the run FAILS rather than silently skipping
-# it — the usual way a database drifts from its migration history is someone
-# editing an old migration and everyone else's database never seeing the change.
+# Two kinds of file, borrowing Flyway's distinction:
+#
+#   VERSIONED   supabase/migrations/ — immutable history. Applied exactly once.
+#               If one changes after being applied the run FAILS: editing an old
+#               migration is how a database drifts from its own history, because
+#               every other database silently never sees the change.
+#
+#   REPEATABLE  db/00-bootstrap/ and db/20-post/ — declarative and idempotent.
+#               Re-applied whenever their content changes, so drift is corrected
+#               rather than reported as an error. These describe a desired end
+#               state (roles exist, cron jobs are scheduled), not a one-time
+#               transformation.
 #
 # Each file runs in a single transaction, so a failure leaves nothing partial.
 #
@@ -88,10 +96,11 @@ for file in "${FILES[@]}"; do
   rel="${file#"$REPO_ROOT"/}"
   version="$(basename "$file" .sql)"
   # Namespace bootstrap and post files so a Supabase migration can never collide
-  # with one of ours.
+  # with one of ours, and classify them as repeatable.
+  kind="versioned"
   case "$rel" in
-    db/00-bootstrap/*) version="00-bootstrap/${version}" ;;
-    db/20-post/*)      version="20-post/${version}" ;;
+    db/00-bootstrap/*) version="00-bootstrap/${version}"; kind="repeatable" ;;
+    db/20-post/*)      version="20-post/${version}";      kind="repeatable" ;;
   esac
 
   checksum="$(sha256sum "$file" | cut -d' ' -f1)"
@@ -103,7 +112,12 @@ for file in "${FILES[@]}"; do
   recorded="$(echo "$recorded" | tr -d '[:space:]')"
 
   if [ -n "$recorded" ]; then
-    if [ "$recorded" != "$checksum" ]; then
+    if [ "$recorded" = "$checksum" ]; then
+      skipped=$((skipped + 1))
+      continue
+    fi
+
+    if [ "$kind" = "versioned" ]; then
       echo "${RED}  CHANGED${NC} $rel"
       echo "          applied checksum: $recorded"
       echo "          current checksum: $checksum"
@@ -114,17 +128,29 @@ change. Write a NEW migration instead. If the edit is genuinely cosmetic,
 update the recorded checksum deliberately:
   UPDATE schema_migrations SET checksum = '$checksum' WHERE version = '$version';"
     fi
-    skipped=$((skipped + 1))
-    continue
+
+    # Repeatable: content changed, so re-apply. This is the intended path for
+    # the declarative bootstrap and post files.
+    reapply=true
+  else
+    reapply=false
   fi
 
   if [ "$DRY_RUN" = true ]; then
-    echo "  ${YELLOW}would apply${NC} $rel"
+    if [ "$reapply" = true ]; then
+      echo "  ${YELLOW}would re-apply${NC} $rel (repeatable, content changed)"
+    else
+      echo "  ${YELLOW}would apply${NC} $rel"
+    fi
     applied=$((applied + 1))
     continue
   fi
 
-  printf "  applying %-70s" "$rel"
+  if [ "$reapply" = true ]; then
+    printf "  re-applying %-67s" "$rel"
+  else
+    printf "  applying %-70s" "$rel"
+  fi
   start_ms=$(date +%s%3N)
 
   # --single-transaction so a failure rolls back cleanly. The bootstrap file
@@ -141,9 +167,16 @@ update the recorded checksum deliberately:
 
   duration=$(( $(date +%s%3N) - start_ms ))
 
+  # Upsert, so a re-applied repeatable file updates its recorded checksum and
+  # timestamp rather than colliding on the primary key.
   "${PSQL[@]}" -c \
     "INSERT INTO schema_migrations (version, source, checksum, duration_ms)
-     VALUES ('$version', '$rel', '$checksum', $duration)" >/dev/null
+     VALUES ('$version', '$rel', '$checksum', $duration)
+     ON CONFLICT (version) DO UPDATE
+       SET checksum = EXCLUDED.checksum,
+           source = EXCLUDED.source,
+           applied_at = now(),
+           duration_ms = EXCLUDED.duration_ms" >/dev/null
 
   echo "${GREEN}ok${NC} (${duration}ms)"
   # Surface RAISE NOTICE output; the post-migration file uses it to report what
