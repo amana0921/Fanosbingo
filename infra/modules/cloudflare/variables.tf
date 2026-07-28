@@ -44,3 +44,17 @@ variable "rate_limit_requests_per_minute" {
   type        = number
   default     = 10
 }
+
+variable "enable_cache_bypass" {
+  description = <<-EOT
+    Create a cache rule that never caches api.<domain> or rt.<domain>.
+
+    OFF by default. Cloudflare does not cache these responses today -- it caches
+    by file extension for static assets, and the API paths have no cacheable
+    extension and carry no Cache-Control from PostgREST. So this is defence in
+    depth rather than a fix for a live problem, and it is worth landing as its
+    own change with its own plan.
+  EOT
+  type        = bool
+  default     = false
+}
