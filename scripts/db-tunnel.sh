@@ -23,8 +23,16 @@
 #   psql "$DATABASE_URL" -c 'SELECT 1'
 #   stop_db_tunnel
 #
+#   # a different instance in the same environment (the restore drill):
+#   source scripts/db-tunnel.sh dev fanosbingo-dev-pg-restore-drill
+#
+#   # connect as an application role instead of the RDS master user:
+#   DB_USER_OVERRIDE=app_service DB_PASSWORD_OVERRIDE="$PW" \
+#     source scripts/db-tunnel.sh dev
+#
 # Requires: aws CLI, session-manager-plugin, and IAM permission for
-# ssm:StartSession plus secretsmanager:GetSecretValue on the RDS master secret.
+# ssm:StartSession. secretsmanager:GetSecretValue on the RDS master secret is
+# needed only when no credential override is supplied.
 
 set -euo pipefail
 
@@ -33,7 +41,23 @@ PROJECT="${PROJECT:-fanosbingo}"
 LOCAL_PORT="${LOCAL_PORT:-15432}"
 
 PREFIX="${PROJECT}-${ENVIRONMENT}"
-DB_IDENTIFIER="${PREFIX}-pg"
+
+# Which instance to tunnel to. Overridable so the restore drill can reach a
+# temporary copy without a second, near-identical script.
+DB_IDENTIFIER="${2:-${DB_IDENTIFIER:-${PREFIX}-pg}}"
+
+# Credentials, if the caller already has them.
+#
+# The default path reads the RDS-managed master password out of Secrets Manager.
+# That is right for migrations, which create roles, and wrong for anything that
+# only needs to read: a snapshot restored without --manage-master-user-password
+# has no managed secret at all, so there would be nothing to read.
+#
+# Suffixed with _OVERRIDE because DB_USER and DB_PASSWORD are OUTPUTS of this
+# script -- sourcing it twice in one shell would otherwise feed the previous
+# run's values back in as inputs.
+_DB_USER_OVERRIDE="${DB_USER_OVERRIDE:-}"
+_DB_PASSWORD_OVERRIDE="${DB_PASSWORD_OVERRIDE:-}"
 
 GREEN=$'\033[0;32m'; YELLOW=$'\033[0;33m'; RED=$'\033[0;31m'; NC=$'\033[0m'
 _info() { echo "${GREEN}==>${NC} $*" >&2; }
@@ -84,13 +108,23 @@ read -r DB_HOST DB_PORT DB_NAME DB_USER SECRET_ARN <<<"$(aws rds describe-db-ins
 
 [ -n "$DB_HOST" ] && [ "$DB_HOST" != "None" ] || _die "Could not resolve ${DB_IDENTIFIER}"
 
-# The master password is generated and rotated by RDS in Secrets Manager and has
-# never passed through Terraform state.
-DB_PASSWORD="$(aws secretsmanager get-secret-value \
-  --secret-id "$SECRET_ARN" \
-  --query SecretString --output text | python3 -c 'import json,sys; print(json.load(sys.stdin)["password"])')"
+if [ -n "$_DB_PASSWORD_OVERRIDE" ]; then
+  # Caller supplied credentials. Skip Secrets Manager entirely -- see the header.
+  DB_USER="${_DB_USER_OVERRIDE:-$DB_USER}"
+  DB_PASSWORD="$_DB_PASSWORD_OVERRIDE"
+  _info "  using supplied credentials for ${DB_USER}"
+else
+  [ -n "$SECRET_ARN" ] && [ "$SECRET_ARN" != "None" ] \
+    || _die "${DB_IDENTIFIER} has no RDS-managed master secret. Pass DB_USER_OVERRIDE and DB_PASSWORD_OVERRIDE, or restore it with --manage-master-user-password."
 
-[ -n "$DB_PASSWORD" ] || _die "Could not read the master password from Secrets Manager"
+  # The master password is generated and rotated by RDS in Secrets Manager and
+  # has never passed through Terraform state.
+  DB_PASSWORD="$(aws secretsmanager get-secret-value \
+    --secret-id "$SECRET_ARN" \
+    --query SecretString --output text | python3 -c 'import json,sys; print(json.load(sys.stdin)["password"])')"
+
+  [ -n "$DB_PASSWORD" ] || _die "Could not read the master password from Secrets Manager"
+fi
 
 _info "  ${DB_NAME} on ${DB_HOST}"
 

@@ -1,0 +1,193 @@
+name: Bump container-instance AMI
+
+# Opens a pull request when AWS publishes a newer ECS-optimized AL2023 arm64
+# image than the one each environment is pinned to.
+#
+# WHY A PULL REQUEST RATHER THAN JUST TRACKING THE LATEST
+#
+# Reading the "recommended" SSM pointer at plan time looks like free patching.
+# What it actually produces, on a single-instance deployment whose ASG has an
+# instance_refresh block, is this: the day AWS publishes a new AMI, the next
+# apply -- for any reason at all, including a tag change -- replaces the
+# instance and takes a multi-minute outage nobody scheduled.
+#
+# So the AMI is pinned in infra/environments/<env>/ami.tf and this workflow
+# proposes the update. Patching stays automatic; when the replacement happens
+# becomes a decision. The pull request body says plainly that merging it means
+# an instance replacement, because that is the part worth knowing before you
+# click merge.
+#
+# The pin is also the rollback path: a bad AMI is reverted by putting the
+# previous id back, and the previous id is in this workflow's PR history.
+#
+# Read-only against AWS -- it resolves one SSM parameter and nothing else.
+
+on:
+  schedule:
+    # Mondays, 06:00 UTC. Weekly is the right cadence for an OS image: often
+    # enough that the pin never drifts far, rare enough that the pull request
+    # is worth reading rather than noise to be dismissed.
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+
+concurrency:
+  group: ami-bump
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    name: Check for a newer AMI
+    runs-on: ubuntu-latest
+    # The planner role: this needs to read one public SSM parameter and nothing
+    # else. A scheduled job has no business holding a credential that can change
+    # anything.
+    environment: dev
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assume AWS role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/fanosbingo-dev-github-deploy
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: ami-bump-${{ github.run_id }}
+
+      - name: Resolve the recommended AMI
+        id: ami
+        run: |
+          set -euo pipefail
+
+          PARAM="/aws/service/ecs/optimized-ami/amazon-linux-2023/arm64/recommended"
+
+          RECOMMENDED="$(aws ssm get-parameter --name "${PARAM}/image_id" \
+            --query 'Parameter.Value' --output text)"
+
+          # Sanity-check the shape before writing it into Terraform. An SSM
+          # outage returning something unexpected should not produce a pull
+          # request that fails to plan.
+          if ! [[ "$RECOMMENDED" =~ ^ami-[0-9a-f]{8,17}$ ]]; then
+            echo "::error::SSM returned '${RECOMMENDED}', which is not an AMI id. Refusing to proceed."
+            exit 1
+          fi
+
+          # The full parameter carries the image name and version, which is what
+          # makes the pull request body readable rather than two opaque ids.
+          DETAIL="$(aws ssm get-parameter --name "$PARAM" \
+            --query 'Parameter.Value' --output text 2>/dev/null || echo '{}')"
+          NAME="$(echo "$DETAIL" | jq -r '.image_name // "unknown"')"
+          VERSION="$(echo "$DETAIL" | jq -r '.ecs_runtime_version // "unknown"')"
+
+          echo "ami=$RECOMMENDED"    >> "$GITHUB_OUTPUT"
+          echo "name=$NAME"          >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION"    >> "$GITHUB_OUTPUT"
+          echo "Recommended: $RECOMMENDED ($NAME)"
+
+      - name: Update the pins
+        id: pins
+        env:
+          NEW_AMI: ${{ steps.ami.outputs.ami }}
+        run: |
+          set -euo pipefail
+
+          changed=()
+          summary=""
+
+          for env_name in dev prod; do
+            file="infra/environments/${env_name}/ami.tf"
+            [ -f "$file" ] || continue
+
+            current="$(grep -oP 'ecs_ami_id\s*=\s*"\K[^"]*' "$file" || echo "")"
+
+            if [ "$current" = "$NEW_AMI" ]; then
+              echo "${env_name}: already pinned to ${NEW_AMI}"
+              continue
+            fi
+
+            # A deliberately narrow substitution. The file exists to hold this
+            # one assignment precisely so that rewriting it cannot touch
+            # anything else.
+            sed -i -E "s|(ecs_ami_id\s*=\s*)\"[^\"]*\"|\1\"${NEW_AMI}\"|" "$file"
+
+            # Prove the edit did what it claims rather than trusting the regex.
+            written="$(grep -oP 'ecs_ami_id\s*=\s*"\K[^"]*' "$file")"
+            if [ "$written" != "$NEW_AMI" ]; then
+              echo "::error::Failed to rewrite ${file}: it now reads '${written}'"
+              exit 1
+            fi
+
+            changed+=("$env_name")
+            summary+="- \`${env_name}\`: \`${current:-unpinned (was following AWS recommended)}\` → \`${NEW_AMI}\`"$'\n'
+            echo "${env_name}: ${current:-unpinned} -> ${NEW_AMI}"
+          done
+
+          if [ ${#changed[@]} -eq 0 ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "All environments are already on the recommended AMI." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          {
+            echo "summary<<EOF"
+            echo "$summary"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: hashicorp/setup-terraform@v3
+        if: steps.pins.outputs.changed == 'true'
+        with:
+          terraform_version: '1.15.8'
+
+      # Catch a malformed pin here rather than in the pull request's plan run.
+      # The ami_id variable has a format validation, so this is a real check.
+      - name: Validate the edited configuration
+        if: steps.pins.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          for env_dir in infra/environments/dev infra/environments/prod; do
+            terraform -chdir="$env_dir" init -backend=false -input=false > /dev/null
+            terraform -chdir="$env_dir" validate
+          done
+          terraform fmt -check -recursive infra/
+
+      - name: Open the pull request
+        if: steps.pins.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          branch: automation/ami-bump
+          # One branch, updated in place. A new branch per week would leave a
+          # trail of stale pull requests proposing superseded AMIs.
+          base: main
+          commit-message: "Pin the container-instance AMI to ${{ steps.ami.outputs.ami }}"
+          title: "Bump container-instance AMI to ${{ steps.ami.outputs.ami }}"
+          labels: automation
+          delete-branch: true
+          body: |
+            AWS has published a newer ECS-optimized AL2023 arm64 image.
+
+            ${{ steps.pins.outputs.summary }}
+
+            - image: `${{ steps.ami.outputs.name }}`
+            - ECS agent: `${{ steps.ami.outputs.version }}`
+
+            **Merging this replaces the container instance.**
+
+            The ASG's `instance_refresh` runs at `min_healthy_percentage = 0`,
+            because a single instance cannot roll without a gap. Expect roughly
+            3–5 minutes during which the game is down: the ticker stops calling
+            numbers and the API is unreachable.
+
+            So apply it deliberately:
+
+            - outside peak hours
+            - with the `fanosbingo-<env>-game-loop-stalled` alarm in mind — it
+              will fire, and that is the alarm working
+            - dev first, if you want to see the replacement before prod does
+
+            Rolling back is putting the previous id back in `ami.tf` and
+            applying. The previous id is in the diff above.

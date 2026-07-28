@@ -45,3 +45,6 @@ terraform.rc
 # Plan files can contain secret values in cleartext.
 *.tfplan
 
+
+# Bootstrap handoff. Contains the AWS account id; not secret, not repo content.
+.bootstrap-output.json

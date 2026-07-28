@@ -41,5 +41,10 @@ output "eip_allocation_id" {
 
 output "ecs_ami_id" {
   description = "ECS-optimized AL2023 arm64 AMI currently resolved."
+  value       = local.ecs_ami_id
+}
+
+output "recommended_ecs_ami_id" {
+  description = "The AMI AWS currently recommends. Differs from ecs_ami_id when the pin is behind; .github/workflows/ami-bump.yml watches for exactly that."
   value       = data.aws_ssm_parameter.ecs_ami.value
 }

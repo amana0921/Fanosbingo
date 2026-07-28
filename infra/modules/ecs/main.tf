@@ -18,11 +18,35 @@
 
 data "aws_region" "current" {}
 
-# Always launch the current ECS-optimized AL2023 image for arm64 (Graviton),
-# resolved at plan time rather than pinned, so instance replacement picks up
-# security patches without a Terraform change.
+# The ECS-optimized AL2023 image for arm64 (Graviton).
+#
+# PINNING, and why the obvious alternative is a trap.
+#
+# This used to read the SSM "recommended" pointer directly, so every plan picked
+# up whatever AWS had most recently published. That sounds like free patching.
+# What it actually means, given the instance_refresh block below, is:
+#
+#   the day AWS publishes a new AMI, the NEXT apply -- for any reason at all,
+#   including a one-line tag change -- replaces the instance and takes a
+#   multi-minute outage nobody scheduled.
+#
+# On a single-instance deployment with min_healthy_percentage = 0, that is a
+# real outage of a real-money game, triggered by an unrelated change. The AMI
+# update itself is desirable; having it ride along invisibly with something else
+# is not.
+#
+# So the id is pinned in the environment root, and .github/workflows/ami-bump.yml
+# opens a pull request when a newer one appears. Patching stays automatic; when
+# it lands stops being a surprise.
+#
+# ami_id = "" falls back to the recommended pointer, which is the right default
+# for a brand-new environment that has no pinned value yet.
 data "aws_ssm_parameter" "ecs_ami" {
   name = "/aws/service/ecs/optimized-ami/amazon-linux-2023/arm64/recommended/image_id"
+}
+
+locals {
+  ecs_ami_id = try(trimspace(var.ami_id), "") == "" ? data.aws_ssm_parameter.ecs_ami.value : var.ami_id
 }
 
 # ---------------------------------------------------------------------------
@@ -69,7 +93,7 @@ resource "aws_cloudwatch_log_group" "ecs" {
 # ---------------------------------------------------------------------------
 resource "aws_launch_template" "app" {
   name_prefix   = "${var.name_prefix}-app-"
-  image_id      = data.aws_ssm_parameter.ecs_ami.value
+  image_id      = local.ecs_ami_id
   instance_type = var.instance_type
 
   iam_instance_profile {

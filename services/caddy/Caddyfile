@@ -43,6 +43,21 @@ https://api.{$DOMAIN}:{$HTTPS_PORT:443} {
 	handle_path /rest/v1/* {
 		reverse_proxy 127.0.0.1:3000 {
 			header_up X-Forwarded-Proto https
+
+			# PASSIVE health checking. PostgREST deliberately ships no container
+			# health check -- an ECS health check whose binary is missing reports
+			# UNKNOWN forever and hangs the deployment, which cost real time
+			# here. Checking at this layer is better anyway: it tests the path
+			# traffic actually takes, and it costs no extra requests.
+			#
+			# Three failures inside 30s takes the upstream out of rotation for
+			# 10s. With one upstream that means fast 502s instead of requests
+			# piling up against a process that is not answering -- which is what
+			# turns a restarting container into a queue of stuck connections.
+			fail_duration 10s
+			max_fails 3
+			unhealthy_status 5xx
+			unhealthy_latency 10s
 		}
 	}
 
@@ -51,6 +66,11 @@ https://api.{$DOMAIN}:{$HTTPS_PORT:443} {
 	handle_path /functions/v1/* {
 		reverse_proxy 127.0.0.1:8080 {
 			header_up X-Forwarded-Proto https
+
+			fail_duration 10s
+			max_fails 3
+			unhealthy_status 5xx
+			unhealthy_latency 10s
 		}
 	}
 
@@ -102,6 +122,14 @@ https://rt.{$DOMAIN}:{$HTTPS_PORT:443} {
 				read_timeout 0
 				write_timeout 0
 			}
+
+			# Passive health checking, without a latency threshold. A websocket
+			# upgrade answers 101 immediately and then stays open for the whole
+			# session, so "slow response" is meaningless here -- only an outright
+			# failure to answer means anything.
+			fail_duration 10s
+			max_fails 3
+			unhealthy_status 5xx
 		}
 	}
 

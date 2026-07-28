@@ -55,7 +55,15 @@ jobs:
       - name: Assume AWS role
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          # The scoped per-environment deploy role, not the AdministratorAccess
+          # Terraform executor. This job runs on PULL REQUESTS for the dry run,
+          # which means it runs workflow code from the PR branch -- exactly the
+          # situation where an admin credential should not be present.
+          #
+          # A pull request can only ever reach the DEV role: obtaining the prod
+          # one requires declaring `environment: prod`, which puts the job behind
+          # prod's required reviewers.
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/fanosbingo-${{ github.event.inputs.environment || 'dev' }}-github-deploy
           aws-region: ${{ vars.AWS_REGION }}
           role-session-name: db-migrate-${{ github.run_id }}
 

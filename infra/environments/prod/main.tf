@@ -79,6 +79,9 @@ module "ecs" {
   instance_profile_name = module.iam.ec2_instance_profile_name
   kms_key_arn           = module.kms.main_key_arn
 
+  # Pinned in ami.tf, bumped by pull request. See that file.
+  ami_id = local.ecs_ami_id
+
   # Stage 2 upgrade: set instance_count = 2 and add subnet index 1. The ticker's
   # advisory lock already guarantees a single game-loop caller across instances.
   instance_count = 1
@@ -117,6 +120,73 @@ module "iam" {
 
   github_repository           = var.github_repository
   create_github_oidc_provider = var.create_github_oidc_provider
+
+  # The deploy workflows all declare `environment: prod`, so that is the context
+  # they present. Scoping the role to it -- rather than to a branch -- is what
+  # keeps prod's deploy role unreachable from anything that has not passed
+  # prod's required reviewers.
+  github_allowed_refs = ["environment:prod", "ref:refs/heads/main"]
+}
+
+# ---------------------------------------------------------------------------
+# The application
+#
+# Identical to dev, by construction. Until this module existed prod defined no
+# services at all: applying it produced a VPC, a database and an idle container
+# instance, and the gap would only have been discovered on cutover night.
+#
+# No image_overrides here. Prod has never run, so there is no legacy GitHub
+# variable to carry forward -- every service waits for the deploy workflow to
+# write /fanosbingo-prod/images/<service> and is created on the next apply.
+# ---------------------------------------------------------------------------
+module "app_stack" {
+  source = "../../modules/app_stack"
+
+  name_prefix = local.name_prefix
+  environment = var.environment
+  aws_region  = var.aws_region
+  domain_name = var.domain_name
+
+  cluster_arn       = module.ecs.cluster_arn
+  capacity_provider = module.ecs.capacity_provider_name
+  log_group_name    = module.ecs.log_group_name
+
+  db_host = module.rds.address
+  db_port = module.rds.port
+  db_name = module.rds.database_name
+
+  task_execution_role_arn = module.iam.task_execution_role_arn
+  task_ticker_role_arn    = module.iam.task_ticker_role_arn
+  task_data_role_arn      = module.iam.task_data_role_arn
+  task_functions_role_arn = module.iam.task_functions_role_arn
+  wallet_signing_key_id   = module.kms.wallet_signing_key_id
+  metric_namespace        = module.iam.metric_namespace
+}
+
+# ---------------------------------------------------------------------------
+# Cloudflare
+#
+# The other half of the origin lock. sg-app admits 443 only from Cloudflare's
+# ranges; this is what makes sure Cloudflare is actually in front, with strict
+# TLS and the settings that a Telegram Mini App needs.
+#
+# Count-gated on the zone id so a contributor without a Cloudflare token can
+# still plan and apply everything else. When it is off, those settings are
+# dashboard state and scripts/verify-cloudflare.sh is the only thing checking
+# them.
+# ---------------------------------------------------------------------------
+module "cloudflare" {
+  source = "../../modules/cloudflare"
+
+  count = try(trimspace(var.cloudflare_zone_id), "") == "" ? 0 : 1
+
+  zone_id     = var.cloudflare_zone_id
+  domain_name = var.domain_name
+
+  # Taken from the ecs module, not typed in: the records must point at the
+  # address the instance actually claims on boot, and a stale literal here would
+  # black-hole the whole site.
+  origin_ip = module.ecs.public_ip
 }
 
 module "monitoring" {
@@ -125,6 +195,10 @@ module "monitoring" {
   name_prefix = local.name_prefix
   environment = var.environment
   kms_key_arn = module.kms.main_key_arn
+
+  # Must match the namespace the containers publish to, or the game-loop alarm
+  # watches nothing. Sourced from iam rather than restated, so it cannot drift.
+  metric_namespace = module.iam.metric_namespace
 
   alert_emails = var.alert_emails
 

@@ -13,6 +13,11 @@ output "secret_parameter_names" {
   value       = [for p in aws_ssm_parameter.secret : p.name]
 }
 
+output "image_parameter_path" {
+  description = "Path holding one image pointer per service. Written by the deploy workflow, read by app_stack."
+  value       = "/${var.name_prefix}/images"
+}
+
 output "plain_parameter_names" {
   description = "Full names of the non-secret parameters."
   value       = [for p in aws_ssm_parameter.plain : p.name]
