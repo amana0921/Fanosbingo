@@ -117,6 +117,8 @@ jobs:
 
       - name: Open the pull request
         if: steps.gen.outputs.found == 'true'
+        id: pr
+        continue-on-error: true
         uses: peter-evans/create-pull-request@v7
         with:
           branch: automation/cloudflare-import-${{ github.event.inputs.environment }}
@@ -143,3 +145,32 @@ jobs:
             created. If it says `will be created`, do not apply — the record IDs
             are wrong and applying would produce the duplicates this exists to
             prevent.
+
+      # `create-pull-request` fails outright when the repository has not enabled
+      # "Allow GitHub Actions to create and approve pull requests", which is OFF
+      # by default. The branch is pushed BEFORE that step fails, so nothing is
+      # lost -- but the run goes red and the reason is a permissions message that
+      # looks like a bug in this workflow rather than a repository setting.
+      #
+      # continue-on-error above, plus this step, turns that into a link. The work
+      # is still done; opening the pull request becomes one click instead of a
+      # failed run somebody has to investigate.
+      - name: Report if the pull request could not be opened
+        if: steps.pr.outcome == 'failure'
+        run: |
+          BRANCH="automation/cloudflare-import-${{ github.event.inputs.environment }}"
+          URL="${{ github.server_url }}/${{ github.repository }}/compare/main...${BRANCH}?expand=1"
+          {
+            echo "### Branch pushed, pull request not opened"
+            echo
+            echo "GitHub Actions is not permitted to create pull requests in this"
+            echo "repository, so the final step could not run. **The branch was"
+            echo "pushed and the work is intact.**"
+            echo
+            echo "Open it here: ${URL}"
+            echo
+            echo "To let this workflow finish on its own in future: Settings >"
+            echo "Actions > General > Workflow permissions > *Allow GitHub Actions"
+            echo "to create and approve pull requests*."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::warning::Branch pushed but PR not opened -- see the run summary for the link."
