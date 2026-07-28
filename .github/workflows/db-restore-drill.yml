@@ -159,18 +159,30 @@ jobs:
           set -euo pipefail
           START="$(date -u +%s)"
 
-          # Deliberately minimal: the smallest instance class, no Multi-AZ, and
-          # the default parameter group. This drill measures whether the DATA
-          # comes back, not whether a full production replica can be stood up.
-          #
-          # Restored into the same isolated subnet group and security group as
-          # the source, so it is unreachable from the internet exactly like the
-          # real one.
+          # The security group is taken from the SOURCE rather than left to
+          # default, and that is not cosmetic. Omitting it puts the restored
+          # instance in the VPC's DEFAULT security group, which only admits
+          # traffic from itself -- so the instance comes up healthy, the restore
+          # reports success, and the verification step then fails to connect for
+          # reasons that look like a tunnel problem. Reusing the source's group
+          # means it is reachable from the ECS instance on 5432 exactly as the
+          # real database is, and no more.
+          SOURCE_SG="$(aws rds describe-db-instances \
+            --db-instance-identifier "${{ steps.source.outputs.source }}" \
+            --query 'DBInstances[0].VpcSecurityGroups[0].VpcSecurityGroupId' \
+            --output text)"
+
+          echo "Restoring into ${SOURCE_SG}"
+
+          # Otherwise deliberately minimal: smallest instance class, no Multi-AZ,
+          # default parameter group. This drill measures whether the DATA comes
+          # back, not whether a full production replica can be stood up.
           aws rds restore-db-instance-from-db-snapshot \
             --db-instance-identifier "${{ steps.source.outputs.drill }}" \
             --db-snapshot-identifier "${{ steps.source.outputs.snapshot }}" \
             --db-instance-class db.t4g.micro \
             --db-subnet-group-name "fanosbingo-${ENVIRONMENT}-db" \
+            --vpc-security-group-ids "$SOURCE_SG" \
             --no-multi-az \
             --no-publicly-accessible \
             --no-auto-minor-version-upgrade \

@@ -198,9 +198,11 @@ data "aws_iam_policy_document" "github_deploy" {
   # THIS ENVIRONMENT'S parameters, and that is stated rather than obscured.
   #
   # What it decisively cannot do is the reason the role exists: it cannot create
-  # an IAM role, modify a security group, touch RDS, or reach any environment
-  # other than its own. Compare against the AdministratorAccess executor these
-  # workflows used to run as.
+  # or modify an IAM role, change a security group, alter the real database, or
+  # reach any environment other than its own. Its only RDS write is creating and
+  # deleting an instance whose identifier ends in "-restore-drill" -- see the
+  # restore drill statements below. Compare against the AdministratorAccess
+  # executor these workflows used to run as.
   # ---------------------------------------------------------------------
   statement {
     sid    = "ManageEnvironmentParameters"
@@ -229,6 +231,30 @@ data "aws_iam_policy_document" "github_deploy" {
     effect    = "Allow"
     actions   = ["kms:Encrypt", "kms:Decrypt", "kms:GenerateDataKey", "kms:DescribeKey"]
     resources = [var.kms_key_arn]
+  }
+
+  # Restoring an ENCRYPTED snapshot needs more than Decrypt.
+  #
+  # RDS creates a grant on the CMK so the new instance can use it, and without
+  # kms:CreateGrant the restore fails with KMSKeyNotAccessibleFault -- a message
+  # that says the key "does not exist, is not enabled or you do not have
+  # permissions", none of which points at the missing action. Found by the first
+  # real run of the restore drill.
+  #
+  # The GrantIsForAWSResource condition is what keeps this narrow: it permits
+  # grants created by an AWS service on your behalf, and not grants this role
+  # might mint for an arbitrary principal.
+  statement {
+    sid       = "GrantKeyUseToRdsOnRestore"
+    effect    = "Allow"
+    actions   = ["kms:CreateGrant"]
+    resources = [var.kms_key_arn]
+
+    condition {
+      test     = "Bool"
+      variable = "kms:GrantIsForAWSResource"
+      values   = ["true"]
+    }
   }
 
   # ---------------------------------------------------------------------
