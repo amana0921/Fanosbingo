@@ -125,13 +125,26 @@ resource "cloudflare_zone_setting" "browser_check" {
   value      = "on"
 }
 
-# An API and a WebSocket endpoint. Caching either would serve one player another
-# player's game state.
-resource "cloudflare_zone_setting" "cache_level" {
-  zone_id    = var.zone_id
-  setting_id = "cache_level"
-  value      = "bypass"
-}
+# NO cache_level SETTING HERE, and the reason is worth recording.
+#
+# This module originally set cache_level = "bypass", reasoning that caching an
+# API or a WebSocket endpoint would serve one player another player's game
+# state. Cloudflare rejects it:
+#
+#   400 {"code":1007,"message":"Invalid value for zone setting cache_level"}
+#
+# The zone-level setting accepts only aggressive, basic and simplified -- and
+# none of them means "do not cache". "Bypass" is a CACHE RULE action, not a zone
+# setting. The two look interchangeable in the dashboard and are not in the API.
+#
+# terraform validate cannot catch this: the provider types the value as a
+# string, so an invalid enum value is only rejected by Cloudflare at apply time.
+#
+# What protects the API today is Cloudflare's default behaviour: it caches by
+# file extension for static assets, and /rest/v1/... responses have no cacheable
+# extension and carry no Cache-Control from PostgREST. So nothing is being
+# cached. The rule below is defence in depth for when that stops being true --
+# the day someone adds a Cache-Control header and does not think about the edge.
 
 # Realtime is WebSockets end to end. Without this the upgrade never completes.
 resource "cloudflare_zone_setting" "websockets" {
@@ -171,6 +184,33 @@ resource "cloudflare_ruleset" "rate_limit" {
       period              = 60
       requests_per_period = var.rate_limit_requests_per_minute
       mitigation_timeout  = 600
+    }
+  }]
+}
+
+# ---------------------------------------------------------------------------
+# Cache bypass
+#
+# The correct expression of "never cache this" -- a cache rule, not a zone
+# setting. Off by default so it arrives as its own change with its own plan,
+# rather than riding along with the zone adoption.
+# ---------------------------------------------------------------------------
+resource "cloudflare_ruleset" "cache_bypass" {
+  count = var.enable_cache_bypass ? 1 : 0
+
+  zone_id = var.zone_id
+  name    = "fanosbingo-no-cache"
+  kind    = "zone"
+  phase   = "http_request_cache_settings"
+
+  rules = [{
+    ref         = "never_cache_api_or_realtime"
+    description = "Never cache the data API or the websocket endpoint"
+    expression  = "(http.host eq \"api.${var.domain_name}\" or http.host eq \"rt.${var.domain_name}\")"
+    action      = "set_cache_settings"
+
+    action_parameters = {
+      cache = false
     }
   }]
 }
