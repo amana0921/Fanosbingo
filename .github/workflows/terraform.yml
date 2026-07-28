@@ -174,7 +174,25 @@ jobs:
     needs: [resolve, validate]
     if: github.event_name != 'workflow_dispatch' || github.event.inputs.action != 'destroy'
     runs-on: ubuntu-latest
-    environment: ${{ needs.resolve.outputs.environment }}
+
+    # NO `environment:` HERE, and it is load-bearing.
+    #
+    # A job that declares an environment gets `environment:<name>` as its OIDC
+    # subject -- the environment context REPLACES the event context. So a plan
+    # job on a pull request with `environment: dev` presents
+    # `repo:owner/name:environment:dev`, never `...:pull_request`, and the
+    # read-only planner role (which trusts `pull_request`) refuses it with a bare
+    # "Not authorized to perform sts:AssumeRoleWithWebIdentity".
+    #
+    # Dropping the environment is what makes the subject `pull_request` on a PR
+    # and `ref:refs/heads/main` otherwise, which is exactly the distinction the
+    # two roles are scoped on. It also closes the hole the split was for: `dev`
+    # carries a deployment branch policy restricting it to `main`, so a modified
+    # workflow on a PR branch cannot declare `environment: dev` to reach the
+    # admin executor.
+    #
+    # Consequence, accepted: `plan` dispatched from a branch other than main is
+    # refused. Applies already required main or a protected environment.
     env:
       TF_DIR: infra/environments/${{ needs.resolve.outputs.environment }}
     steps:
@@ -204,8 +222,13 @@ jobs:
           TF_VAR_domain_name: ${{ vars.DOMAIN_NAME }}
           TF_VAR_github_repository: ${{ github.repository }}
           TF_VAR_alert_emails: '["${{ vars.ALERT_EMAIL }}"]'
-          # Null until the first image is pushed, which keeps Terraform from
-          # creating a service whose tasks can never start.
+          TF_VAR_cloudflare_zone_id: ${{ vars.CLOUDFLARE_ZONE_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          # Legacy fallback only. Which build runs is read from SSM at
+          # /fanosbingo-<env>/images/<service>, written by the deploy workflow.
+          # These variables are environment-scoped, so they are EMPTY on the plan
+          # job (which declares no environment -- see the comment on the job) and
+          # that is fine: SSM is the source of truth.
           TF_VAR_ticker_image: ${{ vars.TICKER_IMAGE }}
           TF_VAR_postgrest_image: ${{ vars.POSTGREST_IMAGE }}
           TF_VAR_realtime_image: ${{ vars.REALTIME_IMAGE }}
@@ -341,8 +364,13 @@ jobs:
           TF_VAR_domain_name: ${{ vars.DOMAIN_NAME }}
           TF_VAR_github_repository: ${{ github.repository }}
           TF_VAR_alert_emails: '["${{ vars.ALERT_EMAIL }}"]'
-          # Null until the first image is pushed, which keeps Terraform from
-          # creating a service whose tasks can never start.
+          TF_VAR_cloudflare_zone_id: ${{ vars.CLOUDFLARE_ZONE_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          # Legacy fallback only. Which build runs is read from SSM at
+          # /fanosbingo-<env>/images/<service>, written by the deploy workflow.
+          # These variables are environment-scoped, so they are EMPTY on the plan
+          # job (which declares no environment -- see the comment on the job) and
+          # that is fine: SSM is the source of truth.
           TF_VAR_ticker_image: ${{ vars.TICKER_IMAGE }}
           TF_VAR_postgrest_image: ${{ vars.POSTGREST_IMAGE }}
           TF_VAR_realtime_image: ${{ vars.REALTIME_IMAGE }}
@@ -438,8 +466,13 @@ jobs:
           TF_VAR_domain_name: ${{ vars.DOMAIN_NAME }}
           TF_VAR_github_repository: ${{ github.repository }}
           TF_VAR_alert_emails: '["${{ vars.ALERT_EMAIL }}"]'
-          # Null until the first image is pushed, which keeps Terraform from
-          # creating a service whose tasks can never start.
+          TF_VAR_cloudflare_zone_id: ${{ vars.CLOUDFLARE_ZONE_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          # Legacy fallback only. Which build runs is read from SSM at
+          # /fanosbingo-<env>/images/<service>, written by the deploy workflow.
+          # These variables are environment-scoped, so they are EMPTY on the plan
+          # job (which declares no environment -- see the comment on the job) and
+          # that is fine: SSM is the source of truth.
           TF_VAR_ticker_image: ${{ vars.TICKER_IMAGE }}
           TF_VAR_postgrest_image: ${{ vars.POSTGREST_IMAGE }}
           TF_VAR_realtime_image: ${{ vars.REALTIME_IMAGE }}
