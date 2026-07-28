@@ -121,10 +121,12 @@ module "iam" {
   github_repository           = var.github_repository
   create_github_oidc_provider = var.create_github_oidc_provider
 
-  # The deploy workflows all declare `environment: prod`, so that is the context
-  # they present. Scoping the role to it -- rather than to a branch -- is what
-  # keeps prod's deploy role unreachable from anything that has not passed
-  # prod's required reviewers.
+  # NO `pull_request` here, unlike dev.
+  #
+  # Reaching this role requires declaring `environment: prod`, which puts the
+  # job behind prod's required reviewers. A pull request cannot obtain it, and
+  # that is the boundary between "a contributor can break testnet" and "a
+  # contributor can touch real balances".
   github_allowed_refs = ["environment:prod", "ref:refs/heads/main"]
 }
 

@@ -41,7 +41,26 @@ jobs:
   migrate:
     name: Migrate (${{ github.event.inputs.environment || 'dev' }})
     runs-on: ubuntu-latest
-    environment: ${{ github.event.inputs.environment || 'dev' }}
+
+    # NO `environment:` here, and it is a deliberate reversal.
+    #
+    # This job runs on PULL REQUESTS for the migration dry run. `dev` now
+    # carries a deployment branch policy restricting it to `main` -- the control
+    # that stops a modified workflow on a PR branch from declaring
+    # `environment: dev` and reaching the AdministratorAccess executor -- so
+    # declaring an environment here would make GitHub refuse the deployment
+    # outright, before any step runs.
+    #
+    # Dropping it makes the OIDC subject `pull_request` on a PR and
+    # `ref:refs/heads/main` on a dispatch, both of which the SCOPED per-
+    # environment deploy role trusts. It never yields the executor.
+    #
+    # THE TRADE, STATED: a pull request can reach dev's deploy role, and can
+    # therefore read and write dev's SSM tree and tunnel to the dev database
+    # from PR-branch code. That is the price of running a dry run against a real
+    # database at all -- the check is worth having, and dev holds BSC testnet
+    # credentials by construction. Prod's role stays unreachable: obtaining it
+    # requires `environment: prod`, which is behind required reviewers.
     concurrency:
       # Two concurrent runners applying migrations to one database is a genuine
       # corruption risk, not merely wasteful.
