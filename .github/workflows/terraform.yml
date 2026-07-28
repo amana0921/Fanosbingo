@@ -239,9 +239,23 @@ jobs:
           code=$?
           set -e
           # -detailed-exitcode: 0 = no changes, 1 = error, 2 = changes present.
+          # Say the verdict OUT LOUD, in the log.
+          #
+          # The plan output goes to plan.txt, and from there to the step summary
+          # and a PR comment. A workflow_dispatch run has neither, so "did this
+          # plan find anything?" was invisible in the one place you look first --
+          # the job log -- and the step's green tick means only that terraform
+          # exited cleanly, not that infrastructure matches the configuration.
           case $code in
-            0) echo "has_changes=false" >> "$GITHUB_OUTPUT" ;;
-            2) echo "has_changes=true"  >> "$GITHUB_OUTPUT" ;;
+            0)
+              echo "has_changes=false" >> "$GITHUB_OUTPUT"
+              echo "::notice::No changes. Infrastructure matches the configuration."
+              ;;
+            2)
+              echo "has_changes=true"  >> "$GITHUB_OUTPUT"
+              echo "::notice::Changes are pending. See the run summary for the plan."
+              grep -E "^Plan: " plan.txt || true
+              ;;
             *) cat plan.txt; exit 1 ;;
           esac
           # PR comments cap out around 65k characters.

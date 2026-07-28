@@ -45,8 +45,11 @@ order.
 
 ### Operational hardening that has landed since
 
-Code only — **none of it has been applied yet**. The first `terraform apply`
-after this will show a substantial plan; read it rather than skimming it.
+**Applied to `dev` and `account` on 2026-07-28.** Prod is written but still
+unapplied. Verified after the fact rather than assumed: four services `ACTIVE
+1/1` through the `moved` refactor with no outage, both game-loop alarms in `OK`
+reading the ticker's live metric, the trail logging, and all twelve detector
+assertions passing.
 
 | Change | Why |
 |---|---|
@@ -60,6 +63,27 @@ after this will show a substantial plan; read it rather than skimming it.
 | Deployment circuit breaker | A bad image left the service down instead of rolling back |
 | Cloudflare in Terraform | Half the origin lock was dashboard state |
 | Monthly restore drill | The `~25 min` MTTR had never been measured. It is now 8–11 min to a restored instance |
+
+Between them these changes surfaced **six defects that `terraform validate` could
+not catch**, every one found by running the thing rather than checking it:
+
+1. A job declaring `environment:` presents `environment:<name>` as its OIDC
+   subject, not `pull_request` — so the planner role could never be assumed.
+2. Terraform cannot adopt an SSM parameter that already exists, so it should
+   never have owned the image pointers.
+3. The `dev` branch policy blocked the migration dry run, which declared
+   `environment: dev` for no reason.
+4. Restoring an encrypted snapshot needs `kms:CreateGrant`; the error names three
+   causes and the real one is a fourth.
+5. A restore with no `--vpc-security-group-ids` lands in the VPC default group —
+   and reports success *with a plausible RTO* before failing at verification.
+6. `cache_level = "bypass"` is not a valid zone setting; bypass is a cache RULE.
+   The provider types the value as a string, so only Cloudflare rejects it.
+
+Four of the six were in code paths that had never executed before. Tightening
+permissions moves failures from "never happens" to "happens the first time you
+actually use it", which is why exercising each path once matters more than the
+configuration being valid.
 | `bootstrap-github.sh` | The prod gate depended on somebody having ticked a checkbox |
 
 ### What this session did NOT do
@@ -206,12 +230,23 @@ flapping. `manage_cloudflare` is `true` in dev (which serves `api.<domain>`
 today) and `false` in prod. **At cutover, flip prod on and dev off, in that
 order**, as its own change with its own plan.
 
-**The records already exist, so they must be imported, not created.** Cloudflare
-permits several A records on one name, so a plain apply would create a *second*
-`api.` record beside the live one — no error, and Terraform then manages a record
-nobody resolves while the real one stays editable in the dashboard. Run
-`cloudflare-import.yml`, merge the PR it opens, then delete the generated
-`cloudflare-imports.tf` after the apply.
+**Records that already exist must be imported, not created.** Cloudflare permits
+several A records on one name, so a plain apply creates a *second* `api.` record
+beside the live one — no error, and Terraform then manages a record nobody
+resolves while the real one stays editable in the dashboard.
+
+Dev's records were adopted this way on **2026-07-28**. If you destroy and rebuild
+dev, or stand up prod, do it again — the record ids are environment-specific and
+a stale one fails the apply with "record not found":
+
+```bash
+gh workflow run cloudflare-import.yml -f environment=dev
+```
+
+Merge the PR it opens, apply, then **delete** the generated
+`cloudflare-imports.tf`. An import block is a one-time instruction, not desired
+state; git holds the history, so there is nothing to preserve by keeping the
+file.
 
 This mattered more than it looked. The origin lock has two halves; half one
 (`sg-app` admitting Cloudflare ranges) was always Terraform, and half two was a
