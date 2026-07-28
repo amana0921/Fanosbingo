@@ -50,6 +50,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # An unset AWS_ACCOUNT_ID builds "arn:aws:iam:::role/...", which
+      # configure-aws-credentials retries against for ninety seconds before
+      # reporting "Request ARN is invalid" -- a message that points at the ARN
+      # rather than at the variable that is missing. Fail in two seconds instead,
+      # and say what to run.
+      - name: Check the repository is bootstrapped
+        env:
+          ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+        run: |
+          if [ -z "$ACCOUNT_ID" ]; then
+            echo "::error::AWS_ACCOUNT_ID is not set, so the deploy role ARN cannot be built. Run ./scripts/bootstrap-github.sh."
+            exit 1
+          fi
+
       - name: Assume AWS role
         uses: aws-actions/configure-aws-credentials@v4
         with:
