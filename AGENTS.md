@@ -199,6 +199,20 @@ Bot Fight Mode is the exception: it has no Terraform resource on the free plan.
 mode — read from Cloudflare's API rather than from Terraform state, because a
 dashboard edit does not update state.
 
+**Exactly one root may own the zone.** Dev and prod share a domain, so they share
+a zone, and two Terraform states managing one DNS record is a fight neither wins
+— each apply reverts the other, and the losing side presents as unexplained DNS
+flapping. `manage_cloudflare` is `true` in dev (which serves `api.<domain>`
+today) and `false` in prod. **At cutover, flip prod on and dev off, in that
+order**, as its own change with its own plan.
+
+**The records already exist, so they must be imported, not created.** Cloudflare
+permits several A records on one name, so a plain apply would create a *second*
+`api.` record beside the live one — no error, and Terraform then manages a record
+nobody resolves while the real one stays editable in the dashboard. Run
+`cloudflare-import.yml`, merge the PR it opens, then delete the generated
+`cloudflare-imports.tf` after the apply.
+
 This mattered more than it looked. The origin lock has two halves; half one
 (`sg-app` admitting Cloudflare ranges) was always Terraform, and half two was a
 list in this document ending in "set these in the dashboard".

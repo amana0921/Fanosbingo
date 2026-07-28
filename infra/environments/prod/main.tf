@@ -180,7 +180,7 @@ module "app_stack" {
 module "cloudflare" {
   source = "../../modules/cloudflare"
 
-  count = try(trimspace(var.cloudflare_zone_id), "") == "" ? 0 : 1
+  count = var.manage_cloudflare && try(trimspace(var.cloudflare_zone_id), "") != "" ? 1 : 0
 
   zone_id     = var.cloudflare_zone_id
   domain_name = var.domain_name

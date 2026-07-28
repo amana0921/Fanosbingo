@@ -78,3 +78,22 @@ variable "cloudflare_zone_id" {
   type        = string
   default     = ""
 }
+
+variable "manage_cloudflare" {
+  description = <<-EOT
+    Whether THIS root manages the Cloudflare zone.
+
+    Both environments share one domain and therefore one zone, so exactly one of
+    them may own the DNS records and zone settings.
+
+    FALSE until cutover. Dev currently serves api.<domain>, and two
+    Terraform states managing one DNS record is a fight neither wins: each
+    apply reverts the other, and the losing side looks like unexplained DNS
+    flapping.
+
+    At cutover this becomes true and dev's becomes false, in that order, as a
+    deliberate change with its own plan.
+  EOT
+  type        = bool
+  default     = false
+}

@@ -96,3 +96,17 @@ variable "cloudflare_zone_id" {
   type        = string
   default     = ""
 }
+
+variable "manage_cloudflare" {
+  description = <<-EOT
+    Whether THIS root manages the Cloudflare zone.
+
+    Both environments share one domain and therefore one zone, so exactly one of
+    them may own the DNS records and zone settings.
+
+    Dev owns the zone TODAY, because dev is what currently serves
+    api.<domain> and rt.<domain>.
+  EOT
+  type        = bool
+  default     = true
+}
