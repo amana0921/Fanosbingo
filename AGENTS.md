@@ -23,6 +23,7 @@ top to bottom once, then used as reference.
      --services ticker postgrest realtime caddy \
      --query 'services[].[serviceName,runningCount]' --output text
    ./scripts/probe-public-access.sh https://api.yisakmesifin.org
+   ./scripts/verify-detections.sh       # are the security alarms real?
    ```
 
 ### The next task, in one line
@@ -41,6 +42,25 @@ order.
   `docker/rds-global-bundle.pem`. Do not weaken this to accommodate a client.
 - **Secrets never enter Terraform state.** GitHub Secrets → SSM SecureString →
   injected at container start. The hot-wallet key is non-exportable in KMS.
+
+### Operational hardening that has landed since
+
+Code only — **none of it has been applied yet**. The first `terraform apply`
+after this will show a substantial plan; read it rather than skimming it.
+
+| Change | Why |
+|---|---|
+| `modules/app_stack`, called by dev **and prod** | Prod defined no services at all. Applying it would have produced infrastructure with no application |
+| Game-loop alarm, `treat_missing_data = "breaching"` | The ticker's own Dockerfile said liveness was asserted by an alarm that did not exist |
+| `infra/environments/account` — CloudTrail + `kms:Sign` alarm | The wallet design's preventive half was strong; its detective half was a comment |
+| Read-only planner role for pull requests | Every workflow ran as AdministratorAccess, including `plan` on a PR |
+| Scoped `-github-deploy` role actually used | It was written carefully and then never referenced |
+| Image pointers in SSM | Deploying used to end in "now go set a GitHub variable and re-dispatch" |
+| AMI pinned, bumped by PR | An unrelated apply could replace the instance |
+| Deployment circuit breaker | A bad image left the service down instead of rolling back |
+| Cloudflare in Terraform | Half the origin lock was dashboard state |
+| Monthly restore drill | The `~25 min` MTTR had never been measured |
+| `bootstrap-github.sh` | The prod gate depended on somebody having ticked a checkbox |
 
 ### What this session did NOT do
 
@@ -70,7 +90,7 @@ infrastructure, at a budget of **~$30/month**.
 | 3 | Containers | 🔶 4 of 5 running; **25 edge functions not yet ported** |
 | 4 | Auth hardening | ⬜ not started |
 | 5 | Frontend + CDN | ⬜ not started |
-| 6 | Observability + cutover | ⬜ not started |
+| 6 | Observability + cutover | 🔶 alarms, audit trail and DR drill landed; runbooks and load test outstanding |
 
 ### Live right now (dev environment)
 
@@ -90,6 +110,20 @@ AWS account 292123551166, us-east-1, Elastic IP 35.153.122.186
 
 **prod exists in Terraform but has never been applied.** `PROD_APPLY_ENABLED` is
 deliberately unset, so merging to main plans prod and stops.
+
+> Until recently that statement was more optimistic than the code. Prod defined
+> the platform — VPC, RDS, ECS cluster, IAM — and **no services at all**, so
+> applying it would have produced infrastructure with no application on it. The
+> service definitions now live in `modules/app_stack` and both roots call it, so
+> the two environments cannot diverge that way again.
+
+### Three roots, not two
+
+| Root | What it is | Applied |
+|---|---|---|
+| `infra/environments/account` | CloudTrail, the `kms:Sign` and root-usage alarms, account-wide guardrails | On demand. Singleton — a second trail would bill for duplicate events |
+| `infra/environments/dev` | Testnet environment. Disposable | On demand |
+| `infra/environments/prod` | Mainnet. Real balances | Never yet |
 
 ---
 
@@ -153,6 +187,21 @@ skip the ALB and WAF. Consequences:
 | Bot Fight Mode | **Off** | Challenges non-browser clients — Telegram's webhook caller and WebSocket upgrades look exactly like that. Telegram doesn't solve challenges; it retries then *disables your webhook* |
 | `api.` / `rt.` records | **Proxied** | Required by the origin lock |
 
+**All but one of these is now Terraform** (`infra/modules/cloudflare`), gated on
+`cloudflare_zone_id` being set. Set `CLOUDFLARE_API_TOKEN` as a repository secret
+and `CLOUDFLARE_ZONE_ID` as a variable, and the DNS records, SSL mode, minimum
+TLS version, WebSocket support, cache bypass and a rate limit on the
+money-moving endpoints all become reviewable code.
+
+Bot Fight Mode is the exception: it has no Terraform resource on the free plan.
+`scripts/verify-cloudflare.sh` asserts it is off, along with proxy status and SSL
+mode — read from Cloudflare's API rather than from Terraform state, because a
+dashboard edit does not update state.
+
+This mattered more than it looked. The origin lock has two halves; half one
+(`sg-app` admitting Cloudflare ranges) was always Terraform, and half two was a
+list in this document ending in "set these in the dashboard".
+
 ---
 
 ## 3. Available tooling
@@ -210,7 +259,49 @@ dispatch   → plan / apply / destroy any environment
 Prod apply requires **both** `PROD_APPLY_ENABLED == "true"` *and* the `prod`
 GitHub Environment's required reviewers. Two gates, because a missing GitHub
 Environment is created **implicitly and without protection rules** — the
-environment alone would be no gate at all.
+environment alone would be no gate at all. `scripts/bootstrap-github.sh` creates
+the environment *with* the reviewer attached and then verifies it, so the gate
+does not depend on somebody having clicked the right checkbox.
+
+### Which role a workflow runs as, and why it matters
+
+There are three, and using the wrong one is how a pull request ends up holding
+admin over the account.
+
+| Context | Role | Scope |
+|---|---|---|
+| `plan` on a pull request | `fanosbingo-terraform-planner` | ReadOnlyAccess + state lock. Can decrypt **dev** parameters only, by resource tag |
+| `apply` / `destroy` | `fanosbingo-terraform-executor` | AdministratorAccess, trusted only from `main` and the environments |
+| deploy · secrets · migrate · drill | `fanosbingo-<env>-github-deploy` | ECR, ECS, this environment's SSM tree, the SSM tunnel, and a restore drill scoped to `*-restore-drill` |
+
+A pull request runs workflow code **taken from the PR branch**. That is the
+whole reason for the split: previously every workflow used the executor, so a
+modified workflow file in a PR was an admin credential. GitHub withholds
+`id-token: write` from fork PRs, which bounded it — but that bound is a GitHub
+default, not something this account controls.
+
+Prod's deploy role is unreachable from a pull request: obtaining it requires
+declaring `environment: prod`, and declaring it puts the job behind prod's
+required reviewers.
+
+### Deploying a service no longer has manual steps
+
+The old flow ended with a warning telling you to run `gh variable set
+<SVC>_IMAGE` and then re-dispatch Terraform. It now ends with the service
+running:
+
+```
+build → push to ECR by git SHA
+      → write /fanosbingo-<env>/images/<service> in SSM
+      → roll the ECS service, or dispatch terraform.yml if it does not exist yet
+```
+
+Terraform *reads* those pointers and never writes them. A service whose pointer
+still says `none` has never been built, and is not created — an ECS service
+referencing a non-existent image retries forever without saying why.
+
+The legacy `TICKER_IMAGE`/`POSTGREST_IMAGE`/… repository variables still work as
+a fallback and can be deleted once each service has deployed once.
 
 ### Common operations
 
@@ -218,7 +309,14 @@ environment alone would be no gate at all.
 # Infrastructure
 gh workflow run terraform.yml -f environment=dev -f action=plan
 gh workflow run terraform.yml -f environment=dev -f action=apply
-gh workflow run terraform.yml -f environment=dev -f action=destroy   # refuses prod
+gh workflow run terraform.yml -f environment=dev -f action=destroy   # refuses prod and account
+
+# Account-wide security baseline (CloudTrail, guardrails). Rarely.
+gh workflow run terraform.yml -f environment=account -f action=apply
+
+# Disaster recovery: restore from a snapshot, time it, verify it, delete it.
+# Runs monthly on its own; this is how you force one.
+gh workflow run db-restore-drill.yml -f environment=dev
 
 # Database (SSM tunnel, no public endpoint)
 gh workflow run db-migrate.yml -f environment=dev -f dry_run=true
@@ -321,6 +419,28 @@ the same path an HTTP request takes.
 malicious bait before being trusted. A detector that has never seen a positive is
 not a detector.
 
+`scripts/verify-detections.sh` applies the same rule to the CloudTrail alarms. It
+tests the **deployed** filter patterns — read back from CloudWatch, not restated
+in the script — against synthetic events, and asserts both directions:
+
+- bait matches (`kms:Sign` by an arbitrary role fires the alarm)
+- benign traffic does **not** match (signing by `*-task-functions`, `kms:Decrypt`
+  during secret injection, an unrelated service)
+
+The second assertion is the one people skip. A filter matching everything looks
+identical to a working one until it pages you about a legitimate withdrawal.
+
+It deliberately never calls `kms:Sign`. The hot-wallet key signs 32-byte digests,
+and a digest you did not construct carefully is potentially a valid transaction
+hash — "just testing" is not a safe reason to sign attacker-chosen bytes with a
+key that controls funds.
+
+**A claim you have never measured is not a number.** The `~25 min` database MTTR
+was an estimate nobody had tested. `db-restore-drill.yml` now restores from a
+real snapshot monthly, times it, checks the schema and migration ledger came
+back, and deletes the copy. Its cleanup runs `if: always()`, so a cancelled run
+does not leave an instance billing.
+
 ---
 
 ## 6. Gotchas — read before writing code
@@ -347,6 +467,10 @@ Every one of these cost real time.
 | `Volume of size 20GB is smaller than snapshot` | The ECS-optimized AL2023 arm64 AMI ships a 30 GiB snapshot |
 | `Container.image should not be null or empty` | An unset GitHub variable arrives as `TF_VAR_x=""` — an **empty string, not null**. Use `try(trimspace(x), "") == ""`, not `coalesce` (which errors on all-empty args) |
 | Terraform changes config but never rolls it out | Do **not** put `ignore_changes = [task_definition]` on a service. Point it at `max(terraform_revision, latest_revision)` instead |
+| An unrelated apply replaced the instance | The ECS AMI used to resolve from the SSM `recommended` pointer at plan time. Combined with `instance_refresh`, the day AWS publishes an image, the *next* apply — for any reason — takes an unscheduled outage. It is pinned in `ami.tf` now; `ami-bump.yml` proposes the update by PR |
+| `aws_ssm_parameter` data source fails a fresh plan | The singular data source errors on a missing parameter; `aws_ssm_parameters_by_path` returns an empty result. A new environment must be able to plan before anything has been deployed into it |
+| A deployment left the service down | Enable `deployment_circuit_breaker` with `rollback`. On one instance with static host ports ECS must stop the old task first, so a bad image *ends* the service rather than degrading it |
+| `wait services-stable` succeeded but the old code is running | The circuit breaker rolled back. Stable ≠ deployed. Compare the running task definition against the one you registered |
 | `no pg_hba.conf entry ... no encryption` | RDS PostgreSQL 15+ ships `rds.force_ssl = 1` as the **engine default** |
 
 ### Containers
@@ -484,8 +608,21 @@ in production builds. Consider an error boundary before go-live.
 
 #### Phase 6 — observability and cutover
 
-- Alarms on `SecondsSinceLastNumberCalled` (**the ticker already publishes it;
-  nothing alarms on it yet**), stuck games, payout failure, hot-wallet balance
+Done:
+
+- `fanosbingo-<env>-game-loop-stalled` on `SecondsSinceLastNumberCalled`, with
+  `treat_missing_data = "breaching"` — one alarm covering both "the loop is
+  stalled" and "the ticker is gone". The default of `missing` would have sat at
+  INSUFFICIENT_DATA in exactly the case it exists to catch.
+- `fanosbingo-<env>-tick-duration-high`, the leading indicator.
+- CloudTrail with `kms:Sign`-by-an-unexpected-principal and root-usage alarms,
+  plus `scripts/verify-detections.sh` proving both fire and both stay quiet.
+- Monthly restore drill producing a measured RTO.
+
+Still outstanding:
+
+- Alarms on stuck games, payout failure and hot-wallet balance — all three need
+  metrics the ticker does not publish yet
 - Runbooks: game loop stalled, RDS restore, RPC failover, instance replacement
 - Run `stress-test/k6-spike-test.js` at its 400-concurrent target
 - Confirm instance memory stays under ~1.6 GB — this is what validates `t4g.small`
@@ -497,17 +634,28 @@ in production builds. Consider an error boundary before go-live.
 #### Then: prod
 
 **Prod has never been applied.** Before it can be:
-- Create the `prod` GitHub Environment **with required reviewers**
+- Run `./scripts/bootstrap-github.sh` — creates the `prod` environment with
+  required reviewers and verifies the rule is actually present
 - Set `PROD_APPLY_ENABLED=true` (deliberately unset — it is the second gate)
-- Set `prod`-scoped image variables
+- Build each service against prod: `gh workflow run deploy-services.yml
+  -f service=<name> -f environment=prod`. The image pointer and the follow-up
+  apply are automatic; there are no `prod`-scoped image variables to set.
 - Mainnet: `bsc_chain_id = 56`, real RPC endpoints, real contract addresses
 - Consider `multi_az = true` and `instance_count = 2` — see the Stage 2 upgrade
   ladder in the plan file
+- Run the restore drill against prod once, so the RTO number is prod's own
 
 ---
 
 ### Known-deliberate weaknesses, accepted at this tier
 
+- **A pull request can read dev SecureStrings.** Terraform refreshes
+  `aws_ssm_parameter` with `WithDecryption=true`, so a planner that cannot
+  decrypt cannot plan — "read-only *and* unable to read any secret" is not a
+  combination the data model allows. The grant is scoped by resource tag to keys
+  tagged `Environment=dev`, and PRs only ever plan dev, so prod secrets are
+  unreachable. Dev holds BSC **testnet** credentials by construction; nothing
+  there should ever touch mainnet funds.
 - **Single instance / single AZ** (§2). ~3–5 min MTTR on instance failure
 - `telegram_bot_token` exists in SSM *and* is read by app code; Phase 4 should
   make SSM the only source
@@ -523,9 +671,15 @@ in production builds. Consider an error boundary before go-live.
 
 ```
 infra/
-  environments/{dev,prod}/    Terraform roots. prod is written but NEVER applied
+  environments/account/       CloudTrail + account guardrails. Singleton
+  environments/{dev,prod}/    Terraform roots. prod is complete but NEVER applied
+    ami.tf                    One-line pinned AMI. Bumped by pull request
   modules/                    vpc · security_groups · kms · ssm · iam · rds
                               ecr · ecs · ecs_service · s3_cloudfront · monitoring
+                              app_stack · cloudtrail · cloudflare
+    app_stack/                ALL five services, called by both roots
+    cloudtrail/               The trail, and the detections that justify it
+    cloudflare/               DNS + zone settings: the origin lock's other half
 db/
   00-bootstrap/               Repeatable. Runs FIRST. Supabase compat layer
     001_roles_and_auth_shim   roles, auth.uid(), extensions, publication, _realtime
@@ -539,11 +693,16 @@ services/
   postgrest/ realtime/ caddy/ Thin images over upstream (CA bundle, config)
   functions/                  EMPTY — Phase 3's remaining work
 scripts/
-  bootstrap-aws.sh            One-time. Idempotent. State bucket, OIDC, executor role
-  db-tunnel.sh                SSM port-forward to RDS
+  bootstrap-aws.sh            One-time. Idempotent. State bucket, OIDC, both roles
+  bootstrap-github.sh         One-time. Idempotent. Variables, environments,
+                              prod's required reviewers -- then verifies them
+  db-tunnel.sh                SSM port-forward to RDS. Takes an instance
+                              identifier and optional credential overrides
   db-migrate.sh               Versioned + repeatable runner with checksums
   post-apply.sh               RDS reboot when pending, publishes wallet address
   probe-public-access.sh      Anonymous exposure probe (verified against bait)
+  verify-detections.sh        Proves the CloudTrail alarms fire AND stay quiet
+  verify-cloudflare.sh        Asserts what Terraform cannot enforce (Bot Fight Mode)
   derive-wallet-address.mjs   Address from the KMS public key
 docker/rds-global-bundle.pem  Amazon RDS CA, 108 certs. COPYed into images
 supabase/

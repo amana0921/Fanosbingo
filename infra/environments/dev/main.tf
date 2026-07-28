@@ -20,21 +20,24 @@ data "aws_caller_identity" "current" {}
 locals {
   name_prefix = "${var.project_name}-${var.environment}"
 
-  # An unset GitHub variable arrives as TF_VAR_x="" -- an EMPTY STRING, not
-  # null. A bare `== null` check therefore passes, and Terraform goes on to
-  # register a task definition with no image, failing with the distinctly
-  # unhelpful "Container.image should not be null or empty". Normalise here so
-  # every service gate behaves the same way.
+  # Fallback image pins, used only where SSM has no pointer yet.
   #
-  # try() rather than coalesce(): coalesce SKIPS empty strings, so
-  # coalesce("", "") has no valid argument and raises "no non-null,
-  # non-empty-string arguments". try() covers both cases -- trimspace(null)
-  # raises and yields "", and trimspace("") is already "". Verified against
-  # all three inputs locally before pushing.
-  ticker_image    = try(trimspace(var.ticker_image), "") == "" ? null : var.ticker_image
-  postgrest_image = try(trimspace(var.postgrest_image), "") == "" ? null : var.postgrest_image
-  realtime_image  = try(trimspace(var.realtime_image), "") == "" ? null : var.realtime_image
-  caddy_image     = try(trimspace(var.caddy_image), "") == "" ? null : var.caddy_image
+  # These are the legacy TICKER_IMAGE/POSTGREST_IMAGE/... GitHub variables. They
+  # exist so this environment keeps running across the switch to SSM-held image
+  # pointers; once every service has deployed once, they can be deleted from the
+  # repository settings and this map can go with them.
+  #
+  # An unset GitHub variable arrives as TF_VAR_x="" -- an EMPTY STRING, not null
+  # -- so a bare `== null` check passes and Terraform goes on to register a task
+  # definition with no image, failing with the distinctly unhelpful
+  # "Container.image should not be null or empty". app_stack normalises empties,
+  # so passing them straight through is safe.
+  image_overrides = {
+    ticker    = var.ticker_image
+    postgrest = var.postgrest_image
+    realtime  = var.realtime_image
+    caddy     = var.caddy_image
+  }
 
   # S3 bucket names are globally unique across all AWS accounts, so the account
   # id is appended. Computed here rather than in the s3_cloudfront module so the
@@ -100,6 +103,9 @@ module "ecs" {
   security_group_id     = module.security_groups.app_security_group_id
   instance_profile_name = module.iam.ec2_instance_profile_name
   kms_key_arn           = module.kms.main_key_arn
+
+  # Pinned in ami.tf, bumped by pull request. See that file.
+  ami_id = local.ecs_ami_id
 }
 
 module "rds" {
@@ -134,310 +140,99 @@ module "iam" {
   # The GitHub OIDC provider is account-wide. Dev creates it; prod reuses it by
   # setting create_github_oidc_provider = false and passing the ARN.
   create_github_oidc_provider = var.create_github_oidc_provider
+
+  # The deploy workflows all declare `environment: dev`, so that is the context
+  # they present. Scoping the role to it -- rather than to a branch -- is what
+  # keeps prod's deploy role unreachable from anything that has not passed
+  # prod's required reviewers.
+  github_allowed_refs = ["environment:dev", "ref:refs/heads/main"]
 }
 
 # ---------------------------------------------------------------------------
-# Services
+# The application
 #
-# The ticker is the game's heartbeat. It is intentionally the first service
-# deployed: it has no ingress, no TLS and no dependency on Caddy, so it proves
-# the container path (image pull, secret injection, logging, IAM) with the
-# fewest moving parts.
+# Every container is defined once, in modules/app_stack, and called identically
+# by dev and prod. These blocks used to be inline here and simply absent from
+# prod, which meant applying prod would have produced infrastructure with no
+# application running on it.
 #
-# image is var-driven so CI can deploy a new git-SHA tag without a terraform
-# apply. The service ignores task_definition changes for the same reason.
+# Which build runs is read from SSM (/fanosbingo-dev/images/<service>), written
+# by the deploy workflow. The variables below only apply while an environment
+# still predates that mechanism -- see modules/app_stack.
 # ---------------------------------------------------------------------------
-module "service_ticker" {
-  source = "../../modules/ecs_service"
+module "app_stack" {
+  source = "../../modules/app_stack"
 
-  # No image, no service. Creating a service that references an image which does
-  # not exist yet produces one that can never start a task and retries forever.
-  # Build and push first (deploy-services workflow), then set TICKER_IMAGE.
-  count = local.ticker_image == null ? 0 : 1
+  name_prefix = local.name_prefix
+  environment = var.environment
+  aws_region  = var.aws_region
+  domain_name = var.domain_name
 
-  name_prefix       = local.name_prefix
-  name              = "ticker"
   cluster_arn       = module.ecs.cluster_arn
   capacity_provider = module.ecs.capacity_provider_name
   log_group_name    = module.ecs.log_group_name
 
-  image              = local.ticker_image
-  task_role_arn      = module.iam.task_ticker_role_arn
-  execution_role_arn = module.iam.task_execution_role_arn
+  db_host = module.rds.address
+  db_port = module.rds.port
+  db_name = module.rds.database_name
 
-  # No ports: the ticker talks only to the database.
-  network_mode       = "bridge"
-  cpu                = 128
-  memory_reservation = 160
+  task_execution_role_arn = module.iam.task_execution_role_arn
+  task_ticker_role_arn    = module.iam.task_ticker_role_arn
+  task_data_role_arn      = module.iam.task_data_role_arn
+  task_functions_role_arn = module.iam.task_functions_role_arn
+  wallet_signing_key_id   = module.kms.wallet_signing_key_id
+  metric_namespace        = module.iam.metric_namespace
 
-  environment_variables = {
-    ENVIRONMENT      = var.environment
-    AWS_REGION       = var.aws_region
-    METRIC_NAMESPACE = module.iam.metric_namespace
-    PGHOST           = module.rds.address
-    PGPORT           = tostring(module.rds.port)
-    PGDATABASE       = module.rds.database_name
-    PGUSER           = "app_service"
-    PGSSLMODE        = "require"
-    TICK_INTERVAL_MS = "1000"
-    CALL_INTERVAL_MS = "3500"
-  }
-
-  # Fetched by the ECS agent at container start. Never in the task definition,
-  # never in Terraform state.
-  secrets = {
-    PGPASSWORD = "/${local.name_prefix}/db/app_password"
-  }
-
-  # Long enough for the shutdown handler to release the advisory lock, so a
-  # standby takes over in milliseconds rather than waiting for the connection
-  # to be reaped.
-  stop_timeout = 30
+  image_overrides = local.image_overrides
 }
 
-# PostgREST: the data API.
-#
-# This is what makes the migration tractable. The SPA's ~200 supabase.from()
-# call sites and all 47 RLS policies work against it unchanged, because it IS
-# the same component Supabase runs. Rewriting those call sites against API
-# Gateway + Lambda would have been weeks of work and would have thrown away RLS
-# as the authorization layer.
-module "service_postgrest" {
-  source = "../../modules/ecs_service"
-
-  count = local.postgrest_image == null ? 0 : 1
-
-  name_prefix       = local.name_prefix
-  name              = "postgrest"
-  cluster_arn       = module.ecs.cluster_arn
-  capacity_provider = module.ecs.capacity_provider_name
-  log_group_name    = module.ecs.log_group_name
-
-  image              = local.postgrest_image
-  task_role_arn      = module.iam.task_data_role_arn
-  execution_role_arn = module.iam.task_execution_role_arn
-
-  # Static host port so Caddy can proxy to a fixed 127.0.0.1:3000.
-  network_mode = "bridge"
-  port_mappings = [{
-    container_port = 3000
-    host_port      = 3000
-  }]
-
-  cpu                = 128
-  memory_reservation = 96
-
-  environment_variables = {
-    # libpq keyword form rather than a URI, so the password can come from
-    # PGPASSWORD instead of being embedded in a connection string that would
-    # then have to live in SSM as one blob.
-    PGRST_DB_URI = join(" ", [
-      "host=${module.rds.address}",
-      "port=${module.rds.port}",
-      "dbname=${module.rds.database_name}",
-      "user=authenticator",
-      "sslmode=verify-full",
-      "sslrootcert=/opt/rds-global-bundle.pem",
-    ])
-
-    PGRST_DB_SCHEMAS = "public"
-
-    # Requests with no JWT act as `anon`; RLS policies decide what that can see.
-    PGRST_DB_ANON_ROLE = "anon"
-
-    PGRST_SERVER_PORT = "3000"
-    PGRST_DB_POOL     = "10"
-
-    # Puts the verified JWT payload into the request.jwt.claims GUC, which is
-    # exactly what the auth.uid() shim in db/00-bootstrap reads. Without it the
-    # 9 RLS policies referencing auth.uid() silently match nothing.
-    PGRST_DB_USE_LEGACY_GUCS = "false"
-
-    PGRST_LOG_LEVEL = "info"
-  }
-
-  secrets = {
-    # authenticator's password. libpq reads PGPASSWORD.
-    PGPASSWORD = "/${local.name_prefix}/db/postgrest_password"
-    # Must match whatever mints player JWTs, or every authenticated request 401s.
-    PGRST_JWT_SECRET = "/${local.name_prefix}/app/jwt_secret"
-  }
-
-  # No container health check.
-  #
-  # It previously shelled out to wget, which this image may not ship. A health
-  # check whose binary is missing does not fail loudly -- the container reports
-  # UNKNOWN forever and the ECS deployment sits at IN_PROGRESS indefinitely,
-  # which reads like a slow rollout rather than a broken probe.
-  #
-  # Caddy will health-check the upstream once it fronts this service, which is
-  # the right layer for it: it tests the path traffic actually takes.
+# Address changes only. Without these, moving the service definitions into
+# modules/app_stack would destroy and recreate all four running services --
+# a real outage in exchange for a refactor nobody asked to be disruptive.
+moved {
+  from = module.service_ticker
+  to   = module.app_stack.module.ticker
 }
 
-# Realtime: live game updates.
-#
-# Self-hosting the same component Supabase runs means all 10 postgres_changes
-# subscription sites in the SPA work unchanged. Rebuilding this on AppSync or
-# API Gateway WebSockets would mean reimplementing RLS-aware row-change fan-out,
-# which is the genuinely hard part.
-#
-# Everything below was established by running the real image against a local
-# PostgreSQL, because none of it is guessable:
-#
-#   * The _realtime schema must EXIST BEFORE the container starts, or it dies
-#     with "no schema has been selected to create in". It cannot create the
-#     schema itself -- the failing statement is the creation of its own
-#     migration-tracking table. Handled in db/00-bootstrap.
-#
-#   * ECTO_IPV6 and ERL_AFLAGS are baked into the image as IPv6. In an IPv4-only
-#     VPC that fails to connect, so both are overridden here.
-#
-#   * Tenant resolution is by HOST SUBDOMAIN. A request arriving as
-#     Host: <ip> gets 403; Host: realtime-dev.<anything> gets 101 Switching
-#     Protocols. Caddy must rewrite the Host header.
-#
-#   * The websocket path is /socket/websocket, NOT /realtime/v1/websocket.
-#     Supabase's own gateway strips that prefix; ours must too.
-#
-# SECURITY, corrected: an earlier revision pinned 2.34.47, which has NO TLS
-# support for its database connection, and concluded that rds.force_ssl would
-# have to be disabled. That was the wrong trade -- it would have weakened every
-# connection to the database for the sake of one client. 2.120.0 adds DB_SSL
-# and DB_SSL_CA_CERT, so enforcement stays on and this connection is VERIFIED
-# against Amazon's CA, matching postgrest and ticker.
-module "service_realtime" {
-  source = "../../modules/ecs_service"
-
-  count = local.realtime_image == null ? 0 : 1
-
-  name_prefix       = local.name_prefix
-  name              = "realtime"
-  cluster_arn       = module.ecs.cluster_arn
-  capacity_provider = module.ecs.capacity_provider_name
-  log_group_name    = module.ecs.log_group_name
-
-  image              = local.realtime_image
-  task_role_arn      = module.iam.task_data_role_arn
-  execution_role_arn = module.iam.task_execution_role_arn
-
-  network_mode = "bridge"
-  port_mappings = [{
-    container_port = 4000
-    host_port      = 4000
-  }]
-
-  # The BEAM VM is the memory-hungry container in this stack; the other four
-  # together use less.
-  cpu                = 256
-  memory_reservation = 420
-
-  environment_variables = {
-    PORT     = "4000"
-    APP_NAME = "realtime"
-
-    DB_HOST = module.rds.address
-    DB_PORT = tostring(module.rds.port)
-    DB_NAME = module.rds.database_name
-    DB_USER = "app_service"
-
-    # Points Ecto at Realtime's own schema. The schema must already exist.
-    DB_AFTER_CONNECT_QUERY = "SET search_path TO _realtime"
-
-    # The image defaults to IPv6 for both the database connection and Erlang
-    # distribution. Neither works in an IPv4-only VPC.
-    ECTO_IPV6     = "false"
-    DB_IP_VERSION = "ipv4"
-    ERL_AFLAGS    = "-proto_dist inet_tcp"
-    DNS_NODES     = "''"
-
-    # Creates the default tenant on first boot, which is what makes the
-    # websocket handshake resolvable at all.
-    SEED_SELF_HOST = "true"
-    RUN_JANITOR    = "true"
-    RLIMIT_NOFILE  = "10000"
-
-    # Keeps replication slot names distinct per environment, so dev and prod
-    # can never collide on a shared database during a migration or restore.
-    SLOT_NAME_SUFFIX = var.environment
-
-    DB_POOL_SIZE = "5"
-
-    # RDS PostgreSQL 15+ ships rds.force_ssl=1 as the ENGINE DEFAULT, so the
-    # database refuses an unencrypted connection outright:
-    #   FATAL 28000 no pg_hba.conf entry for host ... no encryption
-    #
-    # DB_SSL_CA_CERT is a FILE PATH (Erlang :cacertfile). Without it, DB_SSL
-    # alone falls back to verify: :verify_none -- encrypted but unverified --
-    # so supplying the path is what makes verification actually happen.
-    DB_SSL         = "true"
-    DB_SSL_CA_CERT = "/opt/rds-global-bundle.pem"
-  }
-
-  secrets = {
-    DB_PASSWORD     = "/${local.name_prefix}/db/app_password"
-    SECRET_KEY_BASE = "/${local.name_prefix}/realtime/secret_key_base"
-    DB_ENC_KEY      = "/${local.name_prefix}/realtime/db_enc_key"
-    # Must match the secret PostgREST verifies with, or a token accepted by the
-    # data API is rejected by the realtime channel and vice versa.
-    API_JWT_SECRET = "/${local.name_prefix}/app/jwt_secret"
-    # Newly REQUIRED in 2.120.0: without it the VM terminates during boot with
-    # a System.EnvError rather than a readable message.
-    METRICS_JWT_SECRET = "/${local.name_prefix}/realtime/metrics_jwt_secret"
-  }
-
-  # Realtime runs its Ecto migrations on boot, which takes a few seconds.
-  stop_timeout = 30
+moved {
+  from = module.service_postgrest
+  to   = module.app_stack.module.postgrest
 }
 
-# Caddy: TLS termination and routing. The only container reachable from outside.
+moved {
+  from = module.service_realtime
+  to   = module.app_stack.module.realtime
+}
+
+moved {
+  from = module.service_caddy
+  to   = module.app_stack.module.caddy
+}
+
+# ---------------------------------------------------------------------------
+# Cloudflare
 #
-# HOST network mode, unlike the others, because it must own :443 on the instance
-# itself. The rest use bridge networking with static host ports, which Caddy
-# reaches at 127.0.0.1.
+# The other half of the origin lock. sg-app admits 443 only from Cloudflare's
+# ranges; this is what makes sure Cloudflare is actually in front, with strict
+# TLS and the settings that a Telegram Mini App needs.
 #
-# The two Realtime rewrites below are mandatory and were verified end to end
-# locally before this was ever deployed:
-#
-#   /rest/v1/games?select=id     -> /games?select=id            (postgrest:3000)
-#   /realtime/v1/websocket?vsn=1 -> /socket/websocket?vsn=1     (realtime:4000)
-#                                   with Host: realtime-dev.<domain>
-#
-# Without the path rewrite Realtime answers 404; without the Host rewrite it
-# answers 403, because it resolves the tenant from the host subdomain.
-module "service_caddy" {
-  source = "../../modules/ecs_service"
+# Count-gated on the zone id so a contributor without a Cloudflare token can
+# still plan and apply everything else. When it is off, those settings are
+# dashboard state and scripts/verify-cloudflare.sh is the only thing checking
+# them.
+# ---------------------------------------------------------------------------
+module "cloudflare" {
+  source = "../../modules/cloudflare"
 
-  count = local.caddy_image == null ? 0 : 1
+  count = try(trimspace(var.cloudflare_zone_id), "") == "" ? 0 : 1
 
-  name_prefix       = local.name_prefix
-  name              = "caddy"
-  cluster_arn       = module.ecs.cluster_arn
-  capacity_provider = module.ecs.capacity_provider_name
-  log_group_name    = module.ecs.log_group_name
+  zone_id     = var.cloudflare_zone_id
+  domain_name = var.domain_name
 
-  image              = local.caddy_image
-  task_role_arn      = module.iam.task_data_role_arn
-  execution_role_arn = module.iam.task_execution_role_arn
-
-  # host, not bridge: Caddy binds :443 on the instance directly.
-  network_mode = "host"
-
-  cpu                = 128
-  memory_reservation = 64
-
-  environment_variables = {
-    DOMAIN = var.domain_name
-    # Tenant id created by Realtime's SEED_SELF_HOST. It is `realtime-dev`
-    # regardless of environment, so this is not a copy-paste error in prod.
-    REALTIME_TENANT_HOST = "realtime-dev.${var.domain_name}"
-  }
-
-  secrets = {
-    # Cloudflare Origin Certificate. The entrypoint writes these to disk with
-    # 0600 before starting Caddy, so the key never enters the image.
-    ORIGIN_CERT = "/${local.name_prefix}/tls/origin_cert"
-    ORIGIN_KEY  = "/${local.name_prefix}/tls/origin_key"
-  }
+  # Taken from the ecs module, not typed in: the records must point at the
+  # address the instance actually claims on boot, and a stale literal here would
+  # black-hole the whole site.
+  origin_ip = module.ecs.public_ip
 }
 
 module "monitoring" {
@@ -446,6 +241,10 @@ module "monitoring" {
   name_prefix = local.name_prefix
   environment = var.environment
   kms_key_arn = module.kms.main_key_arn
+
+  # Must match the namespace the containers publish to, or the game-loop alarm
+  # watches nothing. Sourced from iam rather than restated, so it cannot drift.
+  metric_namespace = module.iam.metric_namespace
 
   alert_emails = var.alert_emails
 

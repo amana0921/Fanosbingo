@@ -11,7 +11,20 @@ name: Terraform
 # up to test something and destroyed afterwards. Leaving it running would roughly
 # double the monthly bill.
 #
-# Authentication is OIDC. There is no AWS access key stored in this repository.
+# `account` is the third root: CloudTrail and the account-wide guardrails. It is
+# a singleton, applied on demand, and never targeted by a merge.
+#
+# AUTHENTICATION is OIDC, and it uses TWO roles rather than one.
+#
+#   plan on a pull request -> AWS_PLANNER_ROLE_ARN, read-only
+#   everything else        -> AWS_ROLE_ARN, AdministratorAccess
+#
+# A pull request runs workflow code taken from the PR branch. Handing that an
+# admin role means a modified workflow file is an admin credential; the planner
+# role removes the reliance on GitHub's fork defaults being the only thing in
+# the way. See scripts/bootstrap-aws.sh for the trust policies.
+#
+# There is no AWS access key stored in this repository.
 
 on:
   pull_request:
@@ -29,7 +42,7 @@ on:
         description: 'Environment to act on'
         required: true
         type: choice
-        options: [dev, prod]
+        options: [dev, prod, account]
         default: dev
       action:
         description: 'What to do'
@@ -58,16 +71,40 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       environment: ${{ steps.target.outputs.environment }}
+      plan_role: ${{ steps.target.outputs.plan_role }}
     steps:
       - id: target
+        env:
+          EXECUTOR_ROLE: ${{ vars.AWS_ROLE_ARN }}
+          PLANNER_ROLE: ${{ vars.AWS_PLANNER_ROLE_ARN }}
         run: |
+          set -euo pipefail
           case "${{ github.event_name }}" in
             workflow_dispatch) target="${{ github.event.inputs.environment }}" ;;
             push)              target="prod" ;;   # merge to main targets prod
             *)                 target="dev"  ;;   # PRs plan against dev
           esac
-          echo "environment=$target" >> "$GITHUB_OUTPUT"
+
+          # Pull requests plan with the read-only role. Anything else is either a
+          # merge to main or an explicit dispatch, both of which are trusted
+          # paths, and both of which may need to apply afterwards.
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            plan_role="$PLANNER_ROLE"
+            # An unset variable arrives as an empty string, and
+            # configure-aws-credentials would then fail with an unhelpful
+            # message about a missing role. Say what is actually wrong.
+            if [ -z "$plan_role" ]; then
+              echo "::error::AWS_PLANNER_ROLE_ARN is not set. Run scripts/bootstrap-github.sh, or re-run scripts/bootstrap-aws.sh to create the planner role."
+              exit 1
+            fi
+          else
+            plan_role="$EXECUTOR_ROLE"
+          fi
+
+          echo "environment=$target"  >> "$GITHUB_OUTPUT"
+          echo "plan_role=$plan_role" >> "$GITHUB_OUTPUT"
           echo "Target environment: $target"
+          echo "Plan role: $plan_role"
 
   # ==========================================================================
   # Static checks. Fast, and they need no AWS credentials at all.
@@ -148,10 +185,11 @@ jobs:
           terraform_version: ${{ env.TF_VERSION }}
           terraform_wrapper: false
 
+      # Read-only on pull requests, admin on trusted paths. See the header.
       - name: Assume AWS role
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          role-to-assume: ${{ needs.resolve.outputs.plan_role }}
           aws-region: ${{ vars.AWS_REGION }}
           role-session-name: tf-plan-${{ github.run_id }}
 
@@ -327,10 +365,20 @@ jobs:
       # hot-wallet address derived from the KMS public key. Idempotent, so this
       # is a no-op on a steady-state apply.
       - name: Install dependencies for wallet derivation
+        if: needs.resolve.outputs.environment != 'account'
         run: npm ci --omit=dev --ignore-scripts
 
       - name: Post-apply operations
+        if: needs.resolve.outputs.environment != 'account'
         run: ./scripts/post-apply.sh ${{ needs.resolve.outputs.environment }}
+
+      # A detector that has never seen a positive is not a detector. This tests
+      # the DEPLOYED filter patterns against synthetic CloudTrail events, both
+      # for firing on bait and for staying quiet on legitimate traffic. It never
+      # calls kms:Sign -- see the script's header for why that matters.
+      - name: Verify the security detections detect
+        if: needs.resolve.outputs.environment == 'account'
+        run: ./scripts/verify-detections.sh
 
   # ==========================================================================
   # Destroy. Manual only, and refuses prod outright.
@@ -354,6 +402,16 @@ jobs:
           echo "Prod holds player balances and a funded hot wallet. If you genuinely"
           echo "mean to tear it down, do it deliberately from a workstation after"
           echo "taking a final snapshot and sweeping the wallet."
+          exit 1
+
+      - name: Refuse to destroy the account baseline
+        if: needs.resolve.outputs.environment == 'account'
+        run: |
+          echo "::error::Refusing to destroy the account root from CI."
+          echo "This root owns CloudTrail. Destroying it deletes the audit record of"
+          echo "whatever destroyed it, which is the one outcome worth designing against."
+          echo "The executor role is additionally denied cloudtrail:DeleteTrail, so this"
+          echo "would fail partway through and leave the baseline half-applied."
           exit 1
 
       - uses: actions/checkout@v4

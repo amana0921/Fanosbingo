@@ -8,6 +8,17 @@ variable "environment" {
   type        = string
 }
 
+variable "metric_namespace" {
+  description = <<-EOT
+    CloudWatch namespace the ticker publishes SecondsSinceLastNumberCalled,
+    ActiveGames and TickDuration to. Must match what the containers are given.
+    Get it wrong and the game-loop alarm watches a namespace nothing writes to
+    -- which, because it treats missing data as breaching, pages continuously
+    rather than failing quiet. modules/iam is the source of truth for the value.
+  EOT
+  type        = string
+}
+
 variable "kms_key_arn" {
   description = "CMK encrypting the SNS alert topic."
   type        = string

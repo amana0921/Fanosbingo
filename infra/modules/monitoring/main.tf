@@ -7,9 +7,17 @@
  * signal that you need to switch to a Paid account plan, or that something is
  * running that should not be.
  *
- * Alarms here cover infrastructure only. The alarms that matter most for
- * gameplay — SecondsSinceLastNumberCalled, stuck games, payout failures — need
- * the ticker to be publishing its custom metric first, so they land in Phase 3.
+ * Coverage is in two layers, and the second matters more.
+ *
+ * INFRASTRUCTURE alarms (RDS, EC2) tell you a component is unhealthy. They are
+ * necessary and insufficient: every one of them can sit at OK while the game is
+ * frozen, because a process can be running happily and still not be calling
+ * numbers.
+ *
+ * The GAME LOOP alarm is the one that corresponds to what a player experiences.
+ * The ticker's Dockerfile deliberately ships no HEALTHCHECK and says so: its
+ * liveness is asserted here instead, from the outside, on the thing that
+ * actually matters.
  *
  * Everything here fits in the CloudWatch free tier (10 alarms, 1M API requests).
  */
@@ -180,6 +188,78 @@ resource "aws_cloudwatch_metric_alarm" "ec2_status_check" {
 
   dimensions         = { AutoScalingGroupName = var.autoscaling_group_name }
   alarm_actions      = [aws_sns_topic.alerts.arn]
+  treat_missing_data = "notBreaching"
+
+  tags = var.tags
+}
+
+# ---------------------------------------------------------------------------
+# Game loop
+#
+# THE alarm. Everything else in this file describes the health of a component;
+# this one describes whether the game is running.
+# ---------------------------------------------------------------------------
+
+# treat_missing_data = "breaching" is the entire point of this alarm, not a
+# detail. It makes one alarm cover both failure modes:
+#
+#   * the loop is stalled  -> the metric climbs past the threshold
+#   * the ticker is dead   -> no data points arrive at all
+#
+# With the CloudWatch default of "missing", a ticker that crashes stops
+# publishing and the alarm sits at INSUFFICIENT_DATA forever -- silent, in
+# exactly the situation it exists to catch. That is the same class of failure as
+# the sub-minute pg_cron schedule this service was built to replace: a heartbeat
+# that stops without complaining.
+#
+# Threshold: numbers are called every CALL_INTERVAL_MS (3.5s). 30 seconds is
+# roughly eight missed calls -- unambiguous to a player, and far enough above
+# normal jitter that a slow tick does not page anybody.
+resource "aws_cloudwatch_metric_alarm" "game_loop_stalled" {
+  alarm_name        = "${var.name_prefix}-game-loop-stalled"
+  alarm_description = "No bingo number called for 30s, or the ticker has stopped publishing entirely. Players are watching a frozen board."
+
+  namespace   = var.metric_namespace
+  metric_name = "SecondsSinceLastNumberCalled"
+  statistic   = "Maximum"
+
+  # 60s periods over two of them: fast enough to matter, slow enough that a
+  # single delayed publish does not page anyone.
+  period              = 60
+  evaluation_periods  = 2
+  datapoints_to_alarm = 2
+  comparison_operator = "GreaterThanThreshold"
+  threshold           = 30
+
+  dimensions         = { Environment = var.environment }
+  alarm_actions      = [aws_sns_topic.alerts.arn]
+  ok_actions         = [aws_sns_topic.alerts.arn]
+  treat_missing_data = "breaching"
+
+  tags = var.tags
+}
+
+# A tick that takes longer than its own interval means the loop cannot keep
+# cadence: number calls drift and players notice before any component looks
+# unhealthy. Warning-level -- it precedes the stall rather than being one.
+resource "aws_cloudwatch_metric_alarm" "tick_duration" {
+  alarm_name        = "${var.name_prefix}-tick-duration-high"
+  alarm_description = "game_tick() is taking longer than its 1s interval. The loop is falling behind."
+
+  namespace           = var.metric_namespace
+  metric_name         = "TickDuration"
+  statistic           = "Average"
+  period              = 300
+  evaluation_periods  = 2
+  comparison_operator = "GreaterThanThreshold"
+  threshold           = 800
+
+  dimensions    = { Environment = var.environment }
+  alarm_actions = [aws_sns_topic.alerts.arn]
+
+  # Unlike the stall alarm, absent data here is not a failure -- the stall alarm
+  # already owns "the ticker is gone", and duplicating that would page twice for
+  # one incident.
   treat_missing_data = "notBreaching"
 
   tags = var.tags

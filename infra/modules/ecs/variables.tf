@@ -43,6 +43,25 @@ variable "instance_type" {
   default     = "t4g.small"
 }
 
+variable "ami_id" {
+  description = <<-EOT
+    Pinned ECS-optimized AL2023 arm64 AMI. Empty means "use whatever AWS
+    currently recommends", which is correct for a new environment and wrong for
+    one that is serving traffic — see the header comment in main.tf.
+
+    Bumped by .github/workflows/ami-bump.yml, which opens a pull request when a
+    newer image is published, so the replacement lands as a reviewed change
+    rather than riding along with an unrelated apply.
+  EOT
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.ami_id == "" || can(regex("^ami-[0-9a-f]{8,17}$", var.ami_id))
+    error_message = "ami_id must be empty or a valid AMI id (ami-xxxxxxxx)."
+  }
+}
+
 variable "instance_count" {
   description = <<-EOT
     Instances in the ASG. 1 at launch. Setting this to 2 is most of Stage 2 —

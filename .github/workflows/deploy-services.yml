@@ -1,7 +1,7 @@
 name: Deploy services
 
-# Builds a container image, pushes it to ECR tagged by git SHA, and rolls the
-# ECS service onto it.
+# Builds a container image, pushes it to ECR tagged by git SHA, records it as the
+# service's image pointer in SSM, and rolls the ECS service onto it.
 #
 # Images are tagged by COMMIT SHA, never :latest. The ECR repositories are
 # IMMUTABLE, so a tag can never be repointed at different bytes: whatever is
@@ -11,6 +11,26 @@ name: Deploy services
 # Build is arm64 to match the Graviton (t4g.small) instance. An x86 image will
 # push happily and then fail at runtime with "exec format error", which is a
 # confusing way to learn about architecture.
+#
+# TWO THINGS THIS USED TO LEAVE TO A HUMAN, AND NO LONGER DOES
+#
+# 1. The image pointer. Deploying a service that Terraform had not created
+#    printed a warning telling you to run `gh variable set <SVC>_IMAGE` and then
+#    re-dispatch the Terraform workflow. That is two manual steps in the middle
+#    of an otherwise automated pipeline, and the failure mode when you forget is
+#    a service quietly running last week's build. The pointer now goes to SSM at
+#    /fanosbingo-<env>/images/<service>, which Terraform reads.
+#
+# 2. The follow-up apply. When the service does not exist yet, this workflow now
+#    dispatches the Terraform workflow itself rather than telling you to.
+#
+# CREDENTIALS
+#
+# This assumes fanosbingo-<env>-github-deploy, NOT the AdministratorAccess
+# Terraform executor. That role exists precisely for this: ECR push scoped to
+# this project's repositories, ECS deploy, PassRole restricted to the task roles,
+# and SSM write scoped to the image pointers. Building an image is not a reason
+# to hold admin over the account.
 
 on:
   workflow_dispatch:
@@ -36,6 +56,9 @@ on:
 permissions:
   contents: read
   id-token: write
+  # Lets this workflow dispatch terraform.yml when the service does not exist
+  # yet, instead of printing instructions for a human to follow.
+  actions: write
 
 jobs:
   build:
@@ -51,10 +74,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The scoped deploy role, derived from the account id rather than stored
+      # per environment: the name is deterministic, so there is no variable to
+      # set and nothing to keep in sync when an environment is rebuilt.
       - name: Assume AWS role
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/fanosbingo-${{ github.event.inputs.environment }}-github-deploy
           aws-region: ${{ vars.AWS_REGION }}
           role-session-name: deploy-${{ github.run_id }}
 
@@ -93,22 +119,45 @@ jobs:
           cache-to: type=gha,mode=max
           provenance: false
 
+      # Recorded BEFORE the rollout, deliberately. If the rollout fails, the
+      # pointer still reflects the build that was meant to be running, and a
+      # subsequent `terraform apply` converges to it rather than to whatever was
+      # there before. The pointer is intent; the running task is state.
+      - name: Record the image pointer
+        if: github.event.inputs.deploy == 'true'
+        id: pointer
+        run: |
+          set -euo pipefail
+          IMAGE="${{ steps.ecr.outputs.repository }}:${{ github.sha }}"
+
+          aws ssm put-parameter \
+            --name "/fanosbingo-${ENVIRONMENT}/images/${SERVICE}" \
+            --type String \
+            --value "$IMAGE" \
+            --overwrite \
+            --no-cli-pager > /dev/null
+
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+          echo "Recorded /fanosbingo-${ENVIRONMENT}/images/${SERVICE} = $IMAGE"
+
       - name: Deploy
         if: github.event.inputs.deploy == 'true'
+        id: deploy
         run: |
           set -euo pipefail
           CLUSTER="fanosbingo-${ENVIRONMENT}"
           FAMILY="fanosbingo-${ENVIRONMENT}-${SERVICE}"
-          IMAGE="${{ steps.ecr.outputs.repository }}:${{ github.sha }}"
+          IMAGE="${{ steps.pointer.outputs.image }}"
 
           if ! aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" \
                --query 'services[0].status' --output text 2>/dev/null | grep -q ACTIVE; then
-            echo "::warning::Service '$SERVICE' does not exist yet in $CLUSTER."
-            echo "Image pushed: $IMAGE"
-            echo "Set the ${SERVICE^^}_IMAGE repository variable to this value and run the Terraform workflow to create the service."
-            echo "IMAGE=$IMAGE" >> "$GITHUB_STEP_SUMMARY"
+            echo "Service '$SERVICE' does not exist in $CLUSTER yet."
+            echo "The image pointer is recorded, so Terraform can now create it."
+            echo "needs_terraform=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+
+          echo "needs_terraform=false" >> "$GITHUB_OUTPUT"
 
           # Take the live task definition and swap only the image, so any change
           # Terraform has made to environment, secrets or logging is preserved.
@@ -136,7 +185,24 @@ jobs:
             --task-definition "$REVISION" --query 'service.serviceName' --output text
 
           echo "Waiting for the service to stabilise"
+          # The deployment circuit breaker rolls back a crash-looping image on
+          # its own, so this either stabilises on the new revision or on the
+          # previous good one. Either way it terminates rather than sitting at
+          # IN_PROGRESS until the waiter's own timeout.
           aws ecs wait services-stable --cluster "$CLUSTER" --services "$SERVICE"
+
+          # `wait services-stable` succeeds for a rolled-back deployment too --
+          # the service is stable, just not on what we shipped. Check what is
+          # actually running rather than trusting the waiter's silence.
+          RUNNING="$(aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" \
+            --query 'services[0].taskDefinition' --output text)"
+
+          if [ "$RUNNING" != "$REVISION" ]; then
+            echo "::error::Deployment did not take. Expected $REVISION, service is running $RUNNING."
+            echo "The circuit breaker most likely rolled back a failing image. Check the task logs:"
+            echo "  aws logs tail /ecs/fanosbingo-${ENVIRONMENT} --since 15m --filter-pattern ${SERVICE}"
+            exit 1
+          fi
 
           {
             echo "### Deployed"
@@ -144,4 +210,44 @@ jobs:
             echo "- service: \`$SERVICE\`"
             echo "- image: \`$IMAGE\`"
             echo "- revision: \`$REVISION\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # The service did not exist. Rather than printing instructions, run the
+      # thing the instructions would have said to run.
+      #
+      # Terraform reads the pointer written above and creates the service. This
+      # is a dispatch rather than an inline apply because applies belong to one
+      # workflow and one role -- keeping the admin credential in exactly one
+      # place is the entire reason the deploy role is scoped.
+      - name: Create the service via Terraform
+        if: steps.deploy.outputs.needs_terraform == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh workflow run terraform.yml \
+            --repo "${{ github.repository }}" \
+            -f environment="${ENVIRONMENT}" \
+            -f action=apply
+
+          {
+            echo "### Service created on the next apply"
+            echo
+            echo "\`${SERVICE}\` did not exist in \`fanosbingo-${ENVIRONMENT}\` yet."
+            echo
+            echo "- image pointer: \`${{ steps.pointer.outputs.image }}\`"
+            echo "- dispatched \`terraform.yml\` (environment: \`${ENVIRONMENT}\`, action: \`apply\`)"
+            echo
+            echo "Watch it with \`gh run list --workflow=terraform.yml\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Report a build-only run
+        if: github.event.inputs.deploy != 'true'
+        run: |
+          {
+            echo "### Built, not deployed"
+            echo
+            echo "- image: \`${{ steps.ecr.outputs.repository }}:${{ github.sha }}\`"
+            echo
+            echo "The image pointer was NOT updated, so nothing will roll onto this build."
           } >> "$GITHUB_STEP_SUMMARY"

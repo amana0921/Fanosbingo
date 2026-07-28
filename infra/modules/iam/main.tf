@@ -25,6 +25,18 @@ locals {
   partition      = data.aws_partition.current.partition
   ssm_param_arn  = "arn:${local.partition}:ssm:*:${local.account_id}:parameter/${var.name_prefix}/*"
   metric_namespc = "FanosBingo/${var.name_prefix}"
+
+  github_owner = split("/", var.github_repository)[0]
+  github_name  = split("/", var.github_repository)[1]
+
+  # Every permitted context, in both the documented and the immutable subject
+  # prefix forms. See the condition in the trust policy below for why.
+  github_allowed_subjects = flatten([
+    for ref in var.github_allowed_refs : [
+      "repo:${var.github_repository}:${ref}",
+      "repo:${local.github_owner}@*/${local.github_name}@*:${ref}",
+    ]
+  ])
 }
 
 # ===========================================================================
@@ -71,10 +83,21 @@ data "aws_iam_policy_document" "github_assume" {
 
     # Without this condition ANY repository on GitHub could assume this role.
     # It is the single most important line in this file.
+    #
+    # BOTH subject prefix forms are listed, and this is not redundancy. GitHub
+    # emits an IMMUTABLE subject containing numeric owner and repository IDs --
+    # repo:owner@123/name@456:... -- so that renaming an account does not
+    # silently break trust policies. A policy written only the documented way
+    # matches nothing and STS answers with a flatly unhelpful "Not authorized to
+    # perform sts:AssumeRoleWithWebIdentity". scripts/bootstrap-aws.sh learned
+    # this expensively; the same lesson applies here.
+    #
+    # The wildcard covers only the numeric IDs. Account names cannot contain
+    # "@", so "owner@*" still pins the owner exactly.
     condition {
       test     = "StringLike"
       variable = "token.actions.githubusercontent.com:sub"
-      values   = [for ref in var.github_allowed_refs : "repo:${var.github_repository}:${ref}"]
+      values   = local.github_allowed_subjects
     }
   }
 }
@@ -158,6 +181,126 @@ data "aws_iam_policy_document" "github_deploy" {
     effect    = "Allow"
     actions   = ["cloudfront:CreateInvalidation", "cloudfront:GetInvalidation"]
     resources = ["*"]
+  }
+
+  # ---------------------------------------------------------------------
+  # Parameter Store
+  #
+  # Three workflows need this tree, and they need different things from it:
+  # deploy-services writes image pointers, sync-secrets writes secret values,
+  # db-migrate reads the two database passwords.
+  #
+  # HONEST SCOPING NOTE. It would read better to grant write-only here and claim
+  # a compromised run cannot exfiltrate anything. That would be false: the
+  # migration runner genuinely needs to read db/app_password, and sync-secrets
+  # verifies afterwards that no parameter still holds the placeholder, which
+  # requires decryption to compare against. So this role can read and write
+  # THIS ENVIRONMENT'S parameters, and that is stated rather than obscured.
+  #
+  # What it decisively cannot do is the reason the role exists: it cannot create
+  # an IAM role, modify a security group, touch RDS, or reach any environment
+  # other than its own. Compare against the AdministratorAccess executor these
+  # workflows used to run as.
+  # ---------------------------------------------------------------------
+  statement {
+    sid    = "ManageEnvironmentParameters"
+    effect = "Allow"
+    actions = [
+      "ssm:PutParameter",
+      "ssm:GetParameter",
+      "ssm:GetParameters",
+      "ssm:GetParametersByPath",
+    ]
+    resources = [local.ssm_param_arn]
+  }
+
+  statement {
+    sid       = "ListParameters"
+    effect    = "Allow"
+    actions   = ["ssm:DescribeParameters"]
+    resources = ["*"] # DescribeParameters does not support resource scoping.
+  }
+
+  # SecureString writes need Encrypt; reads need Decrypt. Scoped to this
+  # environment's CMK, so the dev deploy role cannot read a prod secret even if
+  # it somehow learned the parameter name.
+  statement {
+    sid       = "UseEnvironmentKey"
+    effect    = "Allow"
+    actions   = ["kms:Encrypt", "kms:Decrypt", "kms:GenerateDataKey", "kms:DescribeKey"]
+    resources = [var.kms_key_arn]
+  }
+
+  # ---------------------------------------------------------------------
+  # Database tunnel
+  #
+  # RDS has no public endpoint. Migrations reach it by port-forwarding through
+  # the ECS container instance over Session Manager: no inbound port, no SSH
+  # key, and every session attributable to a principal in CloudTrail.
+  # ---------------------------------------------------------------------
+  statement {
+    sid     = "OpenDatabaseTunnel"
+    effect  = "Allow"
+    actions = ["ssm:StartSession"]
+    resources = [
+      "arn:${local.partition}:ec2:*:${local.account_id}:instance/*",
+      "arn:${local.partition}:ssm:*::document/AWS-StartPortForwardingSessionToRemoteHost",
+    ]
+  }
+
+  statement {
+    sid       = "CloseDatabaseTunnel"
+    effect    = "Allow"
+    actions   = ["ssm:TerminateSession", "ssm:ResumeSession"]
+    resources = ["arn:${local.partition}:ssm:*:*:session/*"]
+  }
+
+  # Finding the instance to tunnel through and the endpoint to tunnel to.
+  statement {
+    sid    = "DiscoverTunnelEndpoints"
+    effect = "Allow"
+    actions = [
+      "ec2:DescribeInstances",
+      "rds:DescribeDBInstances",
+      "rds:DescribeDBSnapshots",
+      "ecs:ListContainerInstances",
+      "ecs:DescribeContainerInstances",
+    ]
+    resources = ["*"] # Describe* actions do not support resource-level scoping.
+  }
+
+  # The migration runner connects as the RDS master user, whose password is
+  # generated and rotated by RDS itself. Scoped to the "rds!db-" prefix that
+  # RDS-managed secrets use, so this grants no access to any other secret.
+  statement {
+    sid       = "ReadRdsManagedMasterSecret"
+    effect    = "Allow"
+    actions   = ["secretsmanager:GetSecretValue"]
+    resources = ["arn:${local.partition}:secretsmanager:*:${local.account_id}:secret:rds!db-*"]
+  }
+
+  # ---------------------------------------------------------------------
+  # Restore drill
+  #
+  # Scoped by identifier to instances ending in "-restore-drill", so this role
+  # can create and destroy a throwaway copy and CANNOT touch the real database.
+  # The workflow re-checks the suffix before deleting; this is the control that
+  # holds even if the workflow is wrong.
+  # ---------------------------------------------------------------------
+  statement {
+    sid    = "RunRestoreDrill"
+    effect = "Allow"
+    actions = [
+      "rds:RestoreDBInstanceFromDBSnapshot",
+      "rds:DeleteDBInstance",
+      "rds:AddTagsToResource",
+    ]
+    resources = [
+      "arn:${local.partition}:rds:*:${local.account_id}:db:${var.name_prefix}-pg-restore-drill",
+      "arn:${local.partition}:rds:*:${local.account_id}:snapshot:*",
+      "arn:${local.partition}:rds:*:${local.account_id}:subgrp:${var.name_prefix}-db",
+      "arn:${local.partition}:rds:*:${local.account_id}:pg:*",
+    ]
   }
 }
 

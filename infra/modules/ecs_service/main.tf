@@ -148,6 +148,24 @@ resource "aws_ecs_service" "this" {
   deployment_minimum_healthy_percent = var.deployment_minimum_healthy_percent
   deployment_maximum_percent         = var.deployment_maximum_percent
 
+  # Automatic rollback on a deployment that never becomes healthy.
+  #
+  # This matters more here than it would on a larger fleet. On one instance with
+  # static host ports, ECS must stop the old task before it can start the new
+  # one -- so a bad image does not degrade the service, it ENDS it, and the
+  # service stays down until a human notices. The deploy workflow's
+  # `wait services-stable` would meanwhile block for its full timeout without
+  # saying why.
+  #
+  # With the breaker, ECS gives up after a few failed task starts and puts the
+  # last known-good revision back on its own. The deploy workflow then checks
+  # which revision is actually running and fails loudly, rather than reporting
+  # success because the service is "stable" on the old code.
+  deployment_circuit_breaker {
+    enable   = true
+    rollback = true
+  }
+
   # `aws ecs execute-command` into a running container for debugging, without
   # SSH and without opening a port.
   enable_execute_command = true

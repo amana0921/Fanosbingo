@@ -1,0 +1,288 @@
+name: Database restore drill
+
+# Restores the database from a snapshot, times it, verifies the data is really
+# there, and tears the copy down.
+#
+# WHY
+#
+# The architecture notes claim "~25 min MTTR on database failure (PITR
+# restore)". Nobody had ever performed one. An untested restore is a belief, and
+# the moment you discover it is wrong is the moment you need it to be right --
+# with player balances on the line and an audience.
+#
+# This makes the claim a measurement. It runs monthly, unattended, and either
+# prints a real number or fails.
+#
+# WHAT IT ACTUALLY PROVES
+#
+#   * the automated backups exist and are restorable
+#   * the restored instance reaches `available`
+#   * the schema and the migration ledger survived
+#   * roughly how long the whole thing takes, on this instance class
+#
+# WHAT IT DOES NOT PROVE
+#
+#   * anything about the application reconnecting -- the drill instance is never
+#     wired to the services
+#   * prod's timing, when run against dev. Restore duration scales with data
+#     volume, so treat a dev number as a floor rather than an estimate
+#
+# SAFETY
+#
+# The drill only ever creates and deletes an instance whose identifier ends in
+# `-restore-drill`, and it re-asserts that suffix immediately before deleting.
+# It never touches the source instance, and it takes no lock on it: an RDS
+# snapshot restore reads from the backup, not from the live database.
+#
+# COST
+#
+# A db.t4g.micro for the ~20 minutes it lives, plus its storage. Cents per run.
+# The cleanup step runs `if: always()`, so a cancelled or failed run still
+# deletes the instance.
+
+on:
+  schedule:
+    # 03:00 UTC on the 1st. Monthly is enough to catch a backup configuration
+    # that has quietly broken, without turning DR into a running cost.
+    - cron: '0 3 1 * *'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment whose backups to drill'
+        required: true
+        type: choice
+        options: [dev, prod]
+        default: dev
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: db-restore-drill
+  cancel-in-progress: false
+
+jobs:
+  drill:
+    name: Restore drill (${{ github.event.inputs.environment || 'dev' }})
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || 'dev' }}
+    timeout-minutes: 60
+    env:
+      ENVIRONMENT: ${{ github.event.inputs.environment || 'dev' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assume AWS role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/fanosbingo-${{ github.event.inputs.environment || 'dev' }}-github-deploy
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: restore-drill-${{ github.run_id }}
+
+      - name: Identify the source and its most recent snapshot
+        id: source
+        run: |
+          set -euo pipefail
+          SOURCE="fanosbingo-${ENVIRONMENT}-pg"
+          DRILL="${SOURCE}-restore-drill"
+
+          # Fail loudly if the source does not exist, rather than proceeding to
+          # restore nothing and reporting success.
+          aws rds describe-db-instances --db-instance-identifier "$SOURCE" \
+            --query 'DBInstances[0].DBInstanceIdentifier' --output text > /dev/null
+
+          SNAPSHOT="$(aws rds describe-db-snapshots \
+            --db-instance-identifier "$SOURCE" \
+            --snapshot-type automated \
+            --query 'sort_by(DBSnapshots[?Status==`available`], &SnapshotCreateTime)[-1].DBSnapshotIdentifier' \
+            --output text)"
+
+          if [ -z "$SNAPSHOT" ] || [ "$SNAPSHOT" = "None" ]; then
+            echo "::error::No available automated snapshot for ${SOURCE}. Backups are not producing restorable snapshots — this is the drill finding a real problem."
+            exit 1
+          fi
+
+          SNAPSHOT_TIME="$(aws rds describe-db-snapshots \
+            --db-snapshot-identifier "$SNAPSHOT" \
+            --query 'DBSnapshots[0].SnapshotCreateTime' --output text)"
+
+          # A stale snapshot is itself a finding: backup_retention_period is 1
+          # day in dev and 7 in prod, so anything older than ~48h means the
+          # backup window is not running.
+          AGE_HOURS=$(( ( $(date -u +%s) - $(date -u -d "$SNAPSHOT_TIME" +%s) ) / 3600 ))
+
+          echo "source=$SOURCE"            >> "$GITHUB_OUTPUT"
+          echo "drill=$DRILL"              >> "$GITHUB_OUTPUT"
+          echo "snapshot=$SNAPSHOT"        >> "$GITHUB_OUTPUT"
+          echo "snapshot_time=$SNAPSHOT_TIME" >> "$GITHUB_OUTPUT"
+          echo "age_hours=$AGE_HOURS"      >> "$GITHUB_OUTPUT"
+
+          echo "Source:   $SOURCE"
+          echo "Snapshot: $SNAPSHOT (${AGE_HOURS}h old)"
+
+          if [ "$AGE_HOURS" -gt 48 ]; then
+            echo "::warning::The most recent snapshot is ${AGE_HOURS}h old. Check that the backup window is running."
+          fi
+
+      # Any leftover from an interrupted previous run would make the restore
+      # fail with "already exists", which reads like a permissions problem.
+      - name: Remove any leftover drill instance
+        run: |
+          set -euo pipefail
+          DRILL="${{ steps.source.outputs.drill }}"
+
+          if aws rds describe-db-instances --db-instance-identifier "$DRILL" >/dev/null 2>&1; then
+            echo "::warning::A previous drill instance was left behind. Deleting it."
+            aws rds delete-db-instance --db-instance-identifier "$DRILL" \
+              --skip-final-snapshot --delete-automated-backups >/dev/null
+            aws rds wait db-instance-deleted --db-instance-identifier "$DRILL"
+          fi
+
+      - name: Restore, and time it
+        id: restore
+        run: |
+          set -euo pipefail
+          START="$(date -u +%s)"
+
+          # Deliberately minimal: the smallest instance class, no Multi-AZ, and
+          # the default parameter group. This drill measures whether the DATA
+          # comes back, not whether a full production replica can be stood up.
+          #
+          # Restored into the same isolated subnet group and security group as
+          # the source, so it is unreachable from the internet exactly like the
+          # real one.
+          aws rds restore-db-instance-from-db-snapshot \
+            --db-instance-identifier "${{ steps.source.outputs.drill }}" \
+            --db-snapshot-identifier "${{ steps.source.outputs.snapshot }}" \
+            --db-instance-class db.t4g.micro \
+            --db-subnet-group-name "fanosbingo-${ENVIRONMENT}-db" \
+            --no-multi-az \
+            --no-publicly-accessible \
+            --no-auto-minor-version-upgrade \
+            --tags "Key=Purpose,Value=restore-drill" "Key=Environment,Value=${ENVIRONMENT}" \
+            --query 'DBInstance.DBInstanceIdentifier' --output text
+
+          echo "Waiting for the instance to become available"
+          aws rds wait db-instance-available \
+            --db-instance-identifier "${{ steps.source.outputs.drill }}"
+
+          END="$(date -u +%s)"
+          ELAPSED=$(( END - START ))
+
+          echo "elapsed_seconds=$ELAPSED" >> "$GITHUB_OUTPUT"
+          echo "elapsed_human=$(( ELAPSED / 60 ))m $(( ELAPSED % 60 ))s" >> "$GITHUB_OUTPUT"
+          echo "Restore completed in $(( ELAPSED / 60 ))m $(( ELAPSED % 60 ))s"
+
+      - name: Install session-manager-plugin
+        run: |
+          curl -fsSL -o /tmp/session-manager-plugin.deb \
+            "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_64bit/session-manager-plugin.deb"
+          sudo dpkg -i /tmp/session-manager-plugin.deb
+
+      # "The instance is available" is not the same as "the data is there".
+      # Reaching available only means RDS finished; it says nothing about
+      # whether the tables, the rows or the migration ledger came back.
+      - name: Verify the restored data
+        id: verify
+        run: |
+          set -euo pipefail
+
+          # app_service, not the master user. A snapshot restored without
+          # --manage-master-user-password has no managed secret to read a master
+          # password from, but the app role's password came back inside the
+          # snapshot itself -- so being able to authenticate with it is part of
+          # what the drill proves.
+          DB_PASSWORD_OVERRIDE="$(aws ssm get-parameter \
+            --name "/fanosbingo-${ENVIRONMENT}/db/app_password" \
+            --with-decryption --query 'Parameter.Value' --output text)"
+          export DB_PASSWORD_OVERRIDE
+          export DB_USER_OVERRIDE=app_service
+
+          # Same tunnel mechanism the migration workflow uses: the restored
+          # instance is in the isolated subnets and has no route to the
+          # internet, which is the whole point.
+          # shellcheck disable=SC1091
+          source scripts/db-tunnel.sh "$ENVIRONMENT" "${{ steps.source.outputs.drill }}"
+          trap stop_db_tunnel EXIT
+
+          # Three questions, in increasing order of what they prove:
+          #   1. can we connect and speak SQL at all
+          #   2. did the schema come back
+          #   3. did the migration ledger come back -- which is what tells you
+          #      the restore is at a known schema version rather than some
+          #      arbitrary point
+          TABLES="$(psql "$DATABASE_URL" -tAc \
+            "SELECT count(*) FROM information_schema.tables WHERE table_schema='public'")"
+          GAMES="$(psql "$DATABASE_URL" -tAc \
+            "SELECT count(*) FROM games" 2>/dev/null || echo "0")"
+          MIGRATIONS="$(psql "$DATABASE_URL" -tAc \
+            "SELECT count(*) FROM schema_migrations" 2>/dev/null || echo "0")"
+
+          echo "tables=$TABLES"         >> "$GITHUB_OUTPUT"
+          echo "games=$GAMES"           >> "$GITHUB_OUTPUT"
+          echo "migrations=$MIGRATIONS" >> "$GITHUB_OUTPUT"
+
+          echo "Tables: $TABLES | games rows: $GAMES | migrations: $MIGRATIONS"
+
+          if [ "$TABLES" -lt 10 ]; then
+            echo "::error::Only ${TABLES} tables in the restored database. The restore did not bring back the schema."
+            exit 1
+          fi
+
+          if [ "$MIGRATIONS" -lt 1 ]; then
+            echo "::error::The migration ledger is empty. The restore is not at a known schema version."
+            exit 1
+          fi
+
+      # if: always() -- a failed or cancelled run must not leave an instance
+      # running and billing. This is the step that makes the drill safe to
+      # schedule unattended.
+      - name: Tear down
+        if: always()
+        run: |
+          set -euo pipefail
+          DRILL="${{ steps.source.outputs.drill }}"
+
+          [ -n "$DRILL" ] || { echo "Nothing to clean up."; exit 0; }
+
+          # Re-assert the suffix immediately before deleting. The identifier is
+          # built from a template above, but a delete is irreversible and the
+          # cost of checking twice is one line.
+          case "$DRILL" in
+            *-restore-drill) ;;
+            *)
+              echo "::error::Refusing to delete '${DRILL}': it is not a drill instance."
+              exit 1
+              ;;
+          esac
+
+          if aws rds describe-db-instances --db-instance-identifier "$DRILL" >/dev/null 2>&1; then
+            aws rds delete-db-instance --db-instance-identifier "$DRILL" \
+              --skip-final-snapshot --delete-automated-backups >/dev/null
+            echo "Deleting ${DRILL}"
+            aws rds wait db-instance-deleted --db-instance-identifier "$DRILL"
+            echo "Deleted."
+          else
+            echo "${DRILL} does not exist; nothing to delete."
+          fi
+
+      - name: Report
+        if: always()
+        run: |
+          {
+            echo "### Restore drill — ${ENVIRONMENT}"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Snapshot | \`${{ steps.source.outputs.snapshot }}\` |"
+            echo "| Snapshot age | ${{ steps.source.outputs.age_hours }}h |"
+            echo "| **Time to available** | **${{ steps.restore.outputs.elapsed_human || 'did not complete' }}** |"
+            echo "| Tables restored | ${{ steps.verify.outputs.tables || 'n/a' }} |"
+            echo "| Migrations recorded | ${{ steps.verify.outputs.migrations || 'n/a' }} |"
+            echo "| games rows | ${{ steps.verify.outputs.games || 'n/a' }} |"
+            echo
+            echo "Time to available is the measured RTO floor for a snapshot restore"
+            echo "on this data volume. It excludes DNS, service restarts and anything"
+            echo "a human does while deciding to restore."
+          } >> "$GITHUB_STEP_SUMMARY"

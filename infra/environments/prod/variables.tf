@@ -64,3 +64,17 @@ variable "bsc_chain_id" {
     error_message = "bsc_chain_id must be 56 (mainnet) or 97 (testnet)."
   }
 }
+
+variable "cloudflare_zone_id" {
+  description = <<-EOT
+    Cloudflare zone id for domain_name. Empty disables Terraform management of
+    DNS and zone settings, leaving them as dashboard state.
+
+    The API token is NOT a variable: the provider reads CLOUDFLARE_API_TOKEN
+    from the environment, so it never enters Terraform state or a plan file.
+    The token needs Zone:Read, DNS:Edit, Zone Settings:Edit and, if rate
+    limiting is enabled, Zone WAF:Edit -- on this zone only.
+  EOT
+  type        = string
+  default     = ""
+}
