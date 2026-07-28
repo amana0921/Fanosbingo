@@ -19,11 +19,18 @@ variable "origin_ip" {
 
 variable "enable_rate_limiting" {
   description = <<-EOT
-    Create the rate-limiting ruleset. The free plan allows exactly one rule per
-    zone, so if the zone already has one defined elsewhere, this will conflict.
+    Create the rate-limiting ruleset.
+
+    OFF by default, deliberately. The free plan allows exactly ONE rate-limiting
+    rule per zone, so if the zone already has one -- created in the dashboard,
+    perhaps years ago and forgotten -- the first apply conflicts, and it does so
+    partway through a change that is also adopting DNS records.
+
+    Bring the zone under Terraform first, confirm DNS and the settings converge,
+    then turn this on as its own change with its own plan to read.
   EOT
   type        = bool
-  default     = true
+  default     = false
 }
 
 variable "rate_limit_requests_per_minute" {

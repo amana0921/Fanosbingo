@@ -59,7 +59,7 @@ after this will show a substantial plan; read it rather than skimming it.
 | AMI pinned, bumped by PR | An unrelated apply could replace the instance |
 | Deployment circuit breaker | A bad image left the service down instead of rolling back |
 | Cloudflare in Terraform | Half the origin lock was dashboard state |
-| Monthly restore drill | The `~25 min` MTTR had never been measured |
+| Monthly restore drill | The `~25 min` MTTR had never been measured. It is now 8–11 min to a restored instance |
 | `bootstrap-github.sh` | The prod gate depended on somebody having ticked a checkbox |
 
 ### What this session did NOT do
@@ -156,7 +156,8 @@ Target ≤$30/mo. Four choices get there:
 | **No NAT Gateway / VPC endpoints** | ~$61/mo | Instance in a public subnet, ingress locked to Cloudflare |
 
 Net: **single instance, single AZ.** ~3–5 min MTTR on instance failure (ASG
-replaces), ~25 min on database failure (PITR restore). Deliberate at this budget.
+replaces); on database failure, **8–11 minutes to a restored instance**, measured
+(see below). Deliberate at this budget.
 
 > **Correction to earlier claims:** EC2 → Fargate is *not* "a one-line capacity
 > provider change". `awsvpc` allocates one ENI per task and a `t4g.small`
@@ -440,6 +441,39 @@ was an estimate nobody had tested. `db-restore-drill.yml` now restores from a
 real snapshot monthly, times it, checks the schema and migration ledger came
 back, and deletes the copy. Its cleanup runs `if: always()`, so a cancelled run
 does not leave an instance billing.
+
+**Measured, 2026-07-28, dev:**
+
+| Run | Restore to `available` | Verified |
+|---|---|---|
+| 1 | 7m 39s | — (failed later, see below) |
+| 2 | 11m 9s | 22 tables, 109 migrations, `games` readable |
+
+So: **8–11 minutes**, and quote the range rather than the better number — the two
+runs differ by 45%.
+
+Three things that number is NOT:
+
+- **It is a floor.** It excludes DNS, service restarts, and the human minutes
+  spent deciding to restore. The end-to-end figure is still unmeasured.
+- **It is dev's data volume.** Restore time scales with data. Run the drill
+  against prod once prod exists; a dev number is not a prod estimate.
+- **It is not evidence the application recovers.** The drill never wires the
+  restored instance to anything. It proves the DATA comes back.
+
+Worth knowing what it cost to get there. The drill found three defects before it
+passed, none of them reachable by `terraform validate`, and two in code paths
+that had never executed under the scoped roles:
+
+1. Missing `kms:CreateGrant` — restoring an *encrypted* snapshot makes RDS create
+   a grant on the CMK. Presents as `KMSKeyNotAccessibleFault`, which names three
+   possible causes, none of which is the real one.
+2. No `--vpc-security-group-ids`, so the copy landed in the VPC **default**
+   security group. This one is the dangerous shape: the instance comes up
+   healthy and the restore reports success *and a plausible RTO*, and only the
+   verification fails — looking exactly like a broken tunnel.
+3. Missing `ssm:DescribeInstanceInformation`, masked by `2>/dev/null` in
+   `db-tunnel.sh` swallowing the AccessDenied message entirely.
 
 ---
 
