@@ -38,20 +38,6 @@ locals {
     var.extra_plain_parameters
   )
 
-  # Image pointers: which build of each service should be running.
-  #
-  # These live in SSM rather than in a GitHub variable because the deploy
-  # workflow can write them with the credentials it already has, so shipping a
-  # service stops requiring a human to copy an image URI into a repository
-  # setting and then remember to re-run Terraform.
-  #
-  # Created as "none" and then ignored, exactly like the secrets below: the
-  # deploy pipeline owns the value, Terraform only reads it. A service whose
-  # pointer still says "none" has never been built, and modules/app_stack
-  # declines to create it -- an ECS service referencing an image that does not
-  # exist retries forever without explaining itself.
-  image_parameters = ["ticker", "postgrest", "realtime", "caddy", "functions"]
-
   # Secrets. Created empty; populated out-of-band.
   secret_parameters = [
     "telegram/bot_token",          # Telegram Bot API token
@@ -80,23 +66,26 @@ resource "aws_ssm_parameter" "plain" {
   tags = var.tags
 }
 
-resource "aws_ssm_parameter" "image" {
-  for_each = toset(local.image_parameters)
-
-  name        = "/${var.name_prefix}/images/${each.value}"
-  description = "Image URI the deploy workflow last shipped. Terraform reads this, never writes it."
-  type        = "String"
-  value       = "none"
-  tier        = "Standard"
-
-  lifecycle {
-    # Without this, every apply would drag the running image back to "none" and
-    # delete the service on the next plan.
-    ignore_changes = [value]
-  }
-
-  tags = var.tags
-}
+# ---------------------------------------------------------------------------
+# NOT DEFINED HERE: /<prefix>/images/<service>
+#
+# The image pointers are created and updated by the deploy workflow, and only
+# READ by Terraform (modules/app_stack). Terraform does not own them at all, and
+# that is deliberate rather than an omission.
+#
+# Declaring them here with a "none" placeholder was the obvious first design,
+# and it is wrong in a way that only shows up once: an environment that already
+# has services running has pointers that must be seeded from what is actually
+# deployed, and a Terraform-managed resource cannot adopt a parameter that
+# already exists without an import. Leaving ownership entirely with the pipeline
+# removes the conflict -- `put-parameter --overwrite` creates or updates
+# indifferently, and `aws_ssm_parameters_by_path` reads whatever is there,
+# returning empty for an environment where nothing has been built yet.
+#
+# The dividing line is worth stating plainly: Terraform owns infrastructure,
+# the pipeline owns which build is running. They are different lifecycles and
+# they change at different rates.
+# ---------------------------------------------------------------------------
 
 resource "aws_ssm_parameter" "secret" {
   for_each = toset(local.secret_parameters)

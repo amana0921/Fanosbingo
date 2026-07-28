@@ -165,6 +165,32 @@ require_reviewer() {
 require_reviewer prod
 require_reviewer account
 
+# dev gets a BRANCH POLICY rather than a reviewer.
+#
+# Routine dev applies should not need an approval, but `environment: dev` must
+# not be declarable from a pull-request branch -- a job that declares an
+# environment presents `environment:dev` as its OIDC subject, and the admin
+# executor trusts that subject. Without this, a modified workflow file in a pull
+# request could declare `environment: dev` and obtain AdministratorAccess,
+# which is precisely what the planner/executor split exists to prevent.
+#
+# Restricting the environment to `main` makes GitHub refuse the deployment
+# before any token is issued.
+info "Dev branch policy"
+
+jq -nc '{
+  wait_timer: 0,
+  reviewers: [],
+  deployment_branch_policy: {protected_branches: false, custom_branch_policies: true}
+}' | gh api -X PUT "repos/${REPO}/environments/dev" --input - >/dev/null
+
+# Idempotent: adding a branch policy that already exists returns 422, which is
+# not an error condition here.
+gh api -X POST "repos/${REPO}/environments/dev/deployment-branch-policies" \
+  -f "name=main" -f "type=branch" >/dev/null 2>&1 \
+  && echo "  dev: restricted to main" \
+  || echo "  dev: already restricted to main"
+
 # ---------------------------------------------------------------------------
 # 3. Verify, rather than assume
 #
@@ -195,6 +221,13 @@ for env_name in account prod; do
     --jq '[.protection_rules[]? | select(.type=="required_reviewers")] | length' 2>/dev/null || echo 0)"
   check "${env_name} has a required-reviewer rule" "$reviewers" "1"
 done
+
+# The control that stops a pull request from reaching the admin executor. Worth
+# asserting rather than assuming, because the API call that sets it succeeds
+# even when the branch policy list ends up empty.
+dev_branches="$(gh api "repos/${REPO}/environments/dev/deployment-branch-policies" \
+  --jq '[.branch_policies[]?.name] | join(",")' 2>/dev/null || echo "")"
+check "dev is restricted to main" "$dev_branches" "main"
 
 # Unset is the correct state at bootstrap. Reported so it is a decision rather
 # than an oversight.
