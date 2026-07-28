@@ -282,11 +282,19 @@ data "aws_iam_policy_document" "github_deploy" {
   }
 
   # Finding the instance to tunnel through and the endpoint to tunnel to.
+  #
+  # ssm:DescribeInstanceInformation is not optional and is easy to leave out.
+  # db-tunnel.sh checks the SSM agent's PingStatus before opening a session,
+  # because an instance can be `running` while its agent has not yet registered
+  # -- and StartSession against an unregistered agent fails with a far less
+  # obvious message than "the agent is not online yet". Granting StartSession
+  # without this makes the tunnel fail at the readiness check it exists to pass.
   statement {
     sid    = "DiscoverTunnelEndpoints"
     effect = "Allow"
     actions = [
       "ec2:DescribeInstances",
+      "ssm:DescribeInstanceInformation",
       "rds:DescribeDBInstances",
       "rds:DescribeDBSnapshots",
       "ecs:ListContainerInstances",

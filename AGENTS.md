@@ -495,6 +495,7 @@ Every one of these cost real time.
 
 - A **21-minute hang on "Assume AWS role"** has been observed once. Cancel and re-dispatch; do not wait it out.
 - Piping `psql` into `sed` under `set -e -o pipefail` **discards the error text**. Capture with `2>&1` and print explicitly.
+- Same shape, different command: `VAR="$(aws ... 2>/dev/null)"` turns an authorisation failure into a bare `exit code 254` with no message anywhere. `set -e` aborts on the assignment before the script's own error handling runs, and the CLI's explanation is already gone. `scripts/db-tunnel.sh` uses an `_aws` wrapper that captures stderr and prints it.
 - A literal ESC byte (`0x1b`) in a workflow file makes YAML unparseable. Check with `grep -P '\x1b'`.
 
 ---

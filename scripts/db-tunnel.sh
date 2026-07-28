@@ -64,6 +64,29 @@ _info() { echo "${GREEN}==>${NC} $*" >&2; }
 _warn() { echo "${YELLOW}==>${NC} $*" >&2; }
 _die()  { echo "${RED}ERROR:${NC} $*" >&2; return 1; }
 
+# Runs an AWS command and, on failure, PRINTS WHY.
+#
+# `cmd 2>/dev/null` inside a command substitution is how an authorisation
+# failure becomes a bare "exit code 254" with no message anywhere -- set -e
+# aborts on the assignment before the script's own error handling runs, and the
+# CLI's explanation has already gone to /dev/null.
+#
+# This is the same failure shape AGENTS.md records for piping psql into sed
+# under `set -e -o pipefail`. The rule generalises: capture stderr and print it,
+# never discard it.
+_aws() {
+  local out status
+  out="$("$@" 2>&1)"
+  status=$?
+  if [ $status -ne 0 ]; then
+    echo "${RED}ERROR:${NC} AWS call failed (exit ${status}):" >&2
+    echo "  $*" >&2
+    echo "$out" | sed 's/^/  /' >&2
+    return $status
+  fi
+  printf '%s' "$out"
+}
+
 command -v aws >/dev/null 2>&1 || _die "AWS CLI not found"
 command -v session-manager-plugin >/dev/null 2>&1 \
   || _die "session-manager-plugin not found. Install: https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html"
@@ -76,20 +99,20 @@ command -v session-manager-plugin >/dev/null 2>&1 \
 # ---------------------------------------------------------------------------
 _info "Locating tunnel host"
 
-INSTANCE_ID="$(aws ec2 describe-instances \
+INSTANCE_ID="$(_aws aws ec2 describe-instances \
   --filters "Name=tag:Name,Values=${PREFIX}-app" \
             "Name=instance-state-name,Values=running" \
   --query 'Reservations[0].Instances[0].InstanceId' \
-  --output text 2>/dev/null)"
+  --output text)"
 
 [ -n "$INSTANCE_ID" ] && [ "$INSTANCE_ID" != "None" ] \
   || _die "No running instance tagged ${PREFIX}-app. Has terraform apply run?"
 
 # An instance can be running while its SSM agent is not yet registered, which
 # fails the session with a far less obvious message.
-PING="$(aws ssm describe-instance-information \
+PING="$(_aws aws ssm describe-instance-information \
   --filters "Key=InstanceIds,Values=${INSTANCE_ID}" \
-  --query 'InstanceInformationList[0].PingStatus' --output text 2>/dev/null)"
+  --query 'InstanceInformationList[0].PingStatus' --output text)"
 
 [ "$PING" = "Online" ] \
   || _die "Instance ${INSTANCE_ID} SSM agent is '${PING}', not Online. Wait ~60s after launch and retry."
