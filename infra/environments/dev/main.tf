@@ -141,11 +141,20 @@ module "iam" {
   # setting create_github_oidc_provider = false and passing the ARN.
   create_github_oidc_provider = var.create_github_oidc_provider
 
-  # The deploy workflows all declare `environment: dev`, so that is the context
-  # they present. Scoping the role to it -- rather than to a branch -- is what
-  # keeps prod's deploy role unreachable from anything that has not passed
-  # prod's required reviewers.
-  github_allowed_refs = ["environment:dev", "ref:refs/heads/main"]
+  # Three contexts, and the third is a deliberate, bounded decision.
+  #
+  #   environment:dev       deploy-services, sync-secrets, the drill, ami-bump
+  #   ref:refs/heads/main   anything dispatched from the default branch
+  #   pull_request          the db-migrate DRY RUN on a pull request
+  #
+  # `pull_request` means PR-branch code can reach this role: it can read and
+  # write dev's parameter tree and tunnel to the dev database. That is the cost
+  # of dry-running a migration against a real database, the check is worth
+  # having, and dev holds BSC testnet credentials by construction.
+  #
+  # It is emphatically NOT granted in prod, which is why this list is set per
+  # environment rather than defaulted in the module.
+  github_allowed_refs = ["environment:dev", "ref:refs/heads/main", "pull_request"]
 }
 
 # ---------------------------------------------------------------------------
