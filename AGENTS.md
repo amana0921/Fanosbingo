@@ -5,6 +5,26 @@ top to bottom once, then used as reference.
 
 **Read §6 (Gotchas) before writing any code.** Most of it was learned expensively.
 
+> ## This repository is a FORK, and the distinction matters
+>
+> Original: `djibril611` / `Fanos-Web-3`. The AWS infrastructure, the CI/CD, the
+> containers and the security work are this fork's own.
+>
+> **Claims in this document therefore come from two different places**, and
+> conflating them has already caused real confusion — the Supabase functions
+> were read as a live deployment and their flaws reported as an active breach.
+> They are source code. There is no Supabase project here: no `config.toml`, no
+> `.env`, no project ref, only `your-project.supabase.co` placeholders.
+>
+> | Mark | Meaning |
+> |---|---|
+> | ✅ | Verified against this account's live infrastructure, with the date |
+> | 📥 | Inherited from upstream. Describes THEIR deployment or credentials |
+> | ❓ | Asserted somewhere, never checked. Treat as a hypothesis |
+>
+> If you are about to act on something consequential and it carries no mark,
+> verify it first. That is cheaper than the alternative every single time.
+
 ---
 
 ## 0. Start here
@@ -105,8 +125,15 @@ Fanos Bingo is a real-money multiplayer bingo game delivered as a Telegram Mini
 App, with BNB (BSC) deposits/withdrawals and Ethiopian bank-SMS deposits.
 
 It **was** a Vite/React SPA with no backend of its own — the entire server side
-was a hosted Supabase project. It is being migrated to self-hosted AWS
-infrastructure, at a budget of **~$30/month**.
+was a hosted Supabase project (📥 upstream's; this fork never had one). It is
+being rebuilt on self-hosted AWS infrastructure, at a budget of
+**~$30/month**.
+
+The practical consequence: `supabase/functions/` and `supabase/migrations/` are
+**inherited source**, not a running system. The migrations have been applied to
+this fork's RDS (✅ 109 recorded, confirmed by the restore drill). The 25 edge
+functions have never run here, and porting them is a decision rather than an
+obligation — see §7.
 
 ### Migration status
 
@@ -120,7 +147,7 @@ infrastructure, at a budget of **~$30/month**.
 | 5 | Frontend + CDN | ⬜ not started |
 | 6 | Observability + cutover | 🔶 alarms, audit trail and DR drill landed; runbooks and load test outstanding |
 
-### Live right now (dev environment)
+### Live right now (dev environment) — ✅ verified 2026-07-29
 
 ```
 https://api.yisakmesifin.org     Caddy -> PostgREST / (functions, not yet built)
@@ -603,15 +630,33 @@ Every one of these cost real time.
 
 ## 7. Outstanding work and known risks
 
-### Operator actions — nobody has done these
+### Operator actions
 
-| Item | Severity | Action |
+> **Read the provenance column before acting on any of these.** This repository
+> is a FORK. The original is by `djibril611` / `Fanos-Web-3`; the AWS
+> infrastructure is this fork's own work. Several items below were written for
+> the upstream operator and describe **their** credentials, not yours — you
+> cannot sweep another person's wallet or rotate another person's bot token, and
+> none of it is your exposure.
+>
+> Establishing this took an embarrassing detour: the Supabase functions were
+> treated as a live deployment and their flaws reported as an active breach
+> risk. There is no Supabase project here — no `config.toml`, no `.env`, no
+> project ref, only `your-project.supabase.co` placeholders. Nothing in
+> `supabase/functions/` has ever run under this account.
+
+| Item | Provenance | Action for THIS fork |
 |---|---|---|
-| **Old BSC wallet unswept** | **HIGH** | Private key was public on GitHub (`get-wallet-address.mjs`). Sweep any funds to a new wallet |
-| `Habeshabingo91bot` token still live | MEDIUM | `@BotFather` → `/deletebot`. The app moved to `BingoNovaaBot`, so identity-forgery risk is gone; bot impersonation/phishing remains |
-| `sms_api_key` was published | MEDIUM | Rotate it |
-| Stale AWS secrets in GitHub | LOW | Delete `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEPLOY_ROLE_ARN` — leftovers from pre-OIDC. IAM user `nati` has no access keys, so they are inert, but they invite confusion |
-| Bot token in 2 git commits | LOW | Rotation makes it inert. History rewrite is optional cleanup |
+| Old BSC wallet unswept | 📥 upstream | **None.** That key was in `djibril611`'s history and controls their wallet. This fork's hot wallet is a non-exportable KMS `ECC_SECG_P256K1` key created by its own Terraform, with no plaintext copy that has ever existed |
+| `Habeshabingo91bot` token live | 📥 upstream | **None.** Not your bot, not yours to delete |
+| `sms_api_key` published | 📥 upstream | **None**, unless you reuse that provider account — in which case get your own key |
+| Stale AWS secrets in GitHub | ✅ verified yours | Check and delete `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEPLOY_ROLE_ARN` if present. Everything now uses OIDC |
+| Bot token in 2 git commits | 📥 upstream | Inert for you. Rewriting inherited history is optional cleanup |
+
+**What IS yours, and worth doing:** create your own Telegram bot via `@BotFather`
+and set `TELEGRAM_BOT_TOKEN`; generate `TELEGRAM_WEBHOOK_SECRET`; obtain your own
+SMS provider credentials. None of the upstream credentials should be reused even
+if they still work.
 
 ### Engineering roadmap
 
@@ -625,7 +670,18 @@ Every one of these cost real time.
 
 ---
 
-#### Phase 3 (remaining) — port 25 edge functions, ~4,516 lines
+#### Phase 3 (remaining) — port the edge functions
+
+> **First decide whether to port them at all.** They are inherited source that
+> has never run under this account, so "port all 25" is a choice, not a
+> migration. Three were already deleted for having no callers at all
+> (`transfer-balance`, `mark-cell`, `manual-sms-verification`), and
+> `bingo-auto-caller` and `force-finish-game` were already marked for deletion
+> below. That is five of 25 gone before writing a line.
+>
+> Every one that IS ported carries its current security posture with it unless
+> it is fixed on the way — see the survey in Phase 4. Porting is the cheapest
+> moment to fix them, because nothing depends on the old behaviour yet.
 
 Target: `services/functions`, one Node/Express container on host port 8080.
 Caddy **already routes** `/functions/v1/*` there, so no proxy work is needed.
