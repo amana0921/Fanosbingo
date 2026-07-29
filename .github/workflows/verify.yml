@@ -99,6 +99,36 @@ jobs:
           fi
           ./scripts/verify-cloudflare.sh
 
+      # The app and the API are on different origins, so every call the Mini App
+      # makes is cross-origin and depends on this header matching exactly.
+      #
+      # A mismatch fails in the quietest possible way: the OPTIONS preflight
+      # answers 204, the access log fills with apparently successful requests,
+      # and the POST that matters is never sent by the browser at all. It looked
+      # like 41 successful auth calls and zero logins.
+      - name: The API allows the app's origin
+        id: cors
+        continue-on-error: true
+        env:
+          DOMAIN_NAME: ${{ vars.DOMAIN_NAME }}
+        run: |
+          set -uo pipefail
+          APP_ORIGIN="https://app.${DOMAIN_NAME}"
+
+          ALLOWED="$(curl -sSI -X OPTIONS "https://api.${DOMAIN_NAME}/functions/v1/auth/telegram" \
+            -H "Origin: ${APP_ORIGIN}" \
+            -H "Access-Control-Request-Method: POST" 2>/dev/null \
+            | grep -i '^access-control-allow-origin:' | tr -d '\r' | awk '{print $2}')"
+
+          if [ "$ALLOWED" = "$APP_ORIGIN" ]; then
+            echo "  PASS  the API allows ${APP_ORIGIN}"
+            exit 0
+          fi
+
+          echo "::error::CORS mismatch. The app is served from ${APP_ORIGIN}, but the API allows '${ALLOWED:-nothing}'."
+          echo "::error::Browsers will complete the preflight and then refuse to send the request. Check ALLOWED_ORIGIN on the functions service."
+          exit 1
+
       - name: Nothing is exposed anonymously
         id: probe
         continue-on-error: true
@@ -117,6 +147,7 @@ jobs:
 
           detections="${{ steps.detections.outcome }}"
           cloudflare="${{ steps.cloudflare.outcome }}"
+          cors="${{ steps.cors.outcome }}"
           probe="${{ steps.probe.outcome }}"
 
           icon() { [ "$1" = "success" ] && echo "pass" || echo "**FAIL**"; }
@@ -128,11 +159,12 @@ jobs:
             echo "|---|---|"
             echo "| Security detections (kms:Sign, root usage) | $(icon "$detections") |"
             echo "| Cloudflare settings (Bot Fight Mode, SSL, proxy) | $(icon "$cloudflare") |"
+            echo "| API allows the app's origin | $(icon "$cors") |"
             echo "| Anonymous access probe | $(icon "$probe") |"
           } >> "$GITHUB_STEP_SUMMARY"
 
           failed=0
-          for r in "$detections" "$cloudflare" "$probe"; do
+          for r in "$detections" "$cloudflare" "$cors" "$probe"; do
             [ "$r" = "success" ] || failed=$((failed + 1))
           done
 

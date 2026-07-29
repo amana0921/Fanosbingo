@@ -32,7 +32,10 @@ locals {
 
       # CORS. Every ported function must reject anything else — today all 25
       # send `Access-Control-Allow-Origin: *`, including the ones that move money.
-      "app/allowed_origin" = "https://${var.domain_name}"
+      # app.<domain>, where the Mini App is served -- not the apex. A mismatch
+      # here means browsers block every cross-origin POST after a preflight that
+      # looked fine.
+      "app/allowed_origin" = "https://app.${var.domain_name}"
       "app/api_base_url"   = "https://api.${var.domain_name}"
     },
     var.extra_plain_parameters

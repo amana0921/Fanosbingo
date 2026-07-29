@@ -379,9 +379,17 @@ module "functions" {
     # key leaked -- there is no plaintext copy to steal.
     WALLET_SIGNING_KEY_ID = var.wallet_signing_key_id
 
-    # Lock CORS to the app's own origin. Today all 25 Deno handlers send
-    # Access-Control-Allow-Origin: *, including the ones that move money.
-    ALLOWED_ORIGIN = "https://${var.domain_name}"
+    # The APP's origin -- app.<domain> -- not the apex.
+    #
+    # This was the apex, set before the Mini App had anywhere to live. Once the
+    # app was served from app.<domain> the preflight started answering with an
+    # origin that did not match, so browsers refused to send the actual POST.
+    #
+    # The failure is quiet in exactly the wrong way: the OPTIONS preflight
+    # returns 204 and the access log fills with apparently successful requests,
+    # while the request that matters never happens at all. 41 preflights and
+    # zero posts is what it looked like.
+    ALLOWED_ORIGIN = "https://app.${var.domain_name}"
     API_BASE_URL   = "https://api.${var.domain_name}"
     POSTGREST_URL  = "http://127.0.0.1:3000"
 
