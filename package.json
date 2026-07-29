@@ -17,7 +17,10 @@
     "stress:sustained": "cd stress-test && ./run-test.sh sustained",
     "stress:gradual": "cd stress-test && ./run-test.sh gradual",
     "stress:all": "cd stress-test && ./run-test.sh all",
-    "stress:full-suite": "cd stress-test && ./full-test-suite.sh"
+    "stress:full-suite": "cd stress-test && ./full-test-suite.sh",
+    "test:auth": "node services/functions/src/telegram-auth.test.mjs",
+    "test:signer": "node services/functions/src/kms-signer.test.mjs",
+    "test:functions": "npm run test:auth && npm run test:signer"
   },
   "dependencies": {
     "@reown/appkit": "^1.8.17",
