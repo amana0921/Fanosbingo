@@ -22,6 +22,32 @@
  *   - minting a token (the client cannot sign one)
  *   - signing a withdrawal with KMS (the key is reachable by exactly one role)
  *   - talking to Telegram or a chain RPC (secrets that must not reach a browser)
+ *
+ * WHAT STILL NEEDS BUILDING, and the auth each one requires. Recorded here
+ * because the inherited Deno versions are not being ported, and the
+ * requirements they taught us should not be lost with them.
+ *
+ *   POST /telegram/webhook
+ *     Telegram calls this, not a browser, so initData does not apply. It must
+ *     verify X-Telegram-Bot-Api-Secret-Token with verifyWebhookSecret() --
+ *     STRICTLY, rejecting a missing header, because a forger simply omits it.
+ *     The inherited version registered the webhook with no secret_token at all
+ *     and checked nothing, so anyone who knew the URL could forge an update and
+ *     impersonate any player to the bot. When registering, call setWebhook WITH
+ *     secret_token, and re-register BEFORE deploying the check or the bot goes
+ *     silent.
+ *
+ *   POST /withdrawals
+ *     requireAuth, then sign with KMS. Never a private key from the database --
+ *     that is how the original hot wallet leaked. task_functions is the only
+ *     role permitted kms:Sign, which is what makes the CloudTrail alarm on
+ *     signing by anything else a real signal rather than noise.
+ *
+ *   POST /deposits/confirm
+ *     requireAuth. Credit only req.auth.uid, never an id from the body.
+ *
+ * Card selection, cell marking and game state are deliberately absent: those
+ * are plain data access and belong in PostgREST under RLS.
  */
 
 import express from 'express';
