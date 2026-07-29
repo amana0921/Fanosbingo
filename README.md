@@ -46,6 +46,12 @@ countdown ticks — driven by a server-side game loop, not by a browser tab.
 Engineering detail, decisions and their reasons live in **[AGENTS.md](AGENTS.md)**.
 Read it before changing anything; most of it was learned expensively.
 
+> **The other markdown files in this directory are inherited from the upstream
+> project** and describe its Supabase deployment, which does not exist here. Each
+> carries a banner saying so. Their design reasoning is often still worth
+> reading; their setup steps are not. Do not follow an instruction from one
+> without checking it against the three documents above.
+
 ### Security posture, in one paragraph
 
 Authorization is enforced by the **database**, not by application code
