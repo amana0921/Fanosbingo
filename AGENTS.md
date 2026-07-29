@@ -26,6 +26,10 @@ top to bottom once, then used as reference.
    ./scripts/verify-detections.sh       # are the security alarms real?
    ```
 
+   All three run weekly on their own — `.github/workflows/verify.yml`, Mondays
+   07:00 UTC. Check its last run before trusting anything below; a red one means
+   a control that is supposed to be protecting real money has drifted.
+
 ### The next task, in one line
 
 **Phase 4 (auth) — then finish the functions port.** Reasoning in §7. The short
