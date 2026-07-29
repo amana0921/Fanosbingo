@@ -140,10 +140,39 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Check the SHAPE, not just emptiness.
+          #
+          # "is it set" passes for a value like "<the token it printed>", which
+          # is what happens when someone copies an instruction rather than its
+          # result. The build then succeeds, ships, and every request to
+          # PostgREST 401s -- a broken deployment that looks like a green run.
+          #
+          # A JWT is three base64url segments separated by dots, and this one
+          # must carry role=anon or PostgREST will not treat it as the anon key.
           if [ -z "${VITE_SUPABASE_ANON_KEY}" ]; then
-            echo "::error::SPA_ANON_KEY is not set. Generate it with 'node scripts/mint-anon-key.mjs ${ENVIRONMENT}' and set it with 'gh variable set SPA_ANON_KEY'. Without it the app cannot reach PostgREST at all."
+            echo "::error::SPA_ANON_KEY is not set. Set it with:"
+            echo "::error::  gh variable set SPA_ANON_KEY --body \"\$(node scripts/mint-anon-key.mjs ${ENVIRONMENT} | grep -E '^eyJ')\""
             exit 1
           fi
+
+          if ! printf '%s' "${VITE_SUPABASE_ANON_KEY}" | grep -qE '^eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$'; then
+            echo "::error::SPA_ANON_KEY is not a JWT. It currently starts with: $(printf '%s' "${VITE_SUPABASE_ANON_KEY}" | head -c 20)..."
+            echo "::error::Set it to the SCRIPT OUTPUT, not to a description of it:"
+            echo "::error::  gh variable set SPA_ANON_KEY --body \"\$(node scripts/mint-anon-key.mjs ${ENVIRONMENT} | grep -E '^eyJ')\""
+            exit 1
+          fi
+
+          # Decode the payload and confirm the role. A JWT signed for a
+          # different role would be structurally valid and functionally useless.
+          ROLE="$(printf '%s' "${VITE_SUPABASE_ANON_KEY}" | cut -d. -f2 \
+            | tr '_-' '/+' | base64 -d 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("role",""))' 2>/dev/null || echo "")"
+
+          if [ "$ROLE" != "anon" ]; then
+            echo "::error::SPA_ANON_KEY carries role='${ROLE}', expected 'anon'. PostgREST decides permissions from this claim."
+            exit 1
+          fi
+
+          echo "SPA_ANON_KEY validated: a JWT with role=anon"
 
           npm ci --no-audit --no-fund
           npx vite build --outDir services/caddy/public --emptyOutDir
