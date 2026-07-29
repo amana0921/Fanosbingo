@@ -54,6 +54,7 @@ import express from 'express';
 import pg from 'pg';
 import fs from 'node:fs';
 import { authenticateTelegram, requireAuth } from './auth.js';
+import { verifyChainId, chainName } from './chain.js';
 
 const {
   PORT = '8080',
@@ -63,6 +64,8 @@ const {
   TELEGRAM_BOT_TOKEN,
   PGSSLROOTCERT,
   PGSSLMODE = 'verify-full',
+  BSC_CHAIN_ID,
+  BSC_RPC_PRIMARY,
 } = process.env;
 
 /** Structured JSON, so CloudWatch Logs Insights can query the fields. */
@@ -224,6 +227,64 @@ app.use((err, _req, res, _next) => {
   log('error', 'unhandled', { error: err.message, stack: err.stack });
   res.status(500).json({ error: 'internal error' });
 });
+
+/**
+ * Confirm the RPC serves the chain this environment signs for.
+ *
+ * Not decoration. A signed EVM transaction commits to a chain id, so a
+ * signature produced with 56 is a valid BSC MAINNET transaction wherever it was
+ * made. Dev currently has three sources disagreeing -- the RPC and SSM say 97,
+ * while settings.deposit_contract_chain_id says 56 -- and the day something
+ * signs from the wrong one, the mistake is silent on testnet and expensive on
+ * mainnet.
+ *
+ * Chain id comes from SSM, which Terraform sets per environment. The settings
+ * table is application data and must never decide what a signature commits to.
+ *
+ * Checked at startup rather than per request: it is configuration, it does not
+ * change while the process runs, and a service that cannot sign safely should
+ * not be accepting traffic.
+ */
+async function checkChain() {
+  if (!BSC_CHAIN_ID || !BSC_RPC_PRIMARY) {
+    log('warn', 'chain verification skipped; signing routes must not be enabled', {
+      bsc_chain_id: BSC_CHAIN_ID ?? null,
+      rpc_configured: Boolean(BSC_RPC_PRIMARY),
+    });
+    return;
+  }
+
+  const expected = Number(BSC_CHAIN_ID);
+  const result = await verifyChainId(BSC_RPC_PRIMARY, expected);
+
+  if (result.ok) {
+    log('info', 'chain verified', {
+      chain_id: result.chainId,
+      chain: chainName(result.chainId),
+    });
+    return;
+  }
+
+  if (result.unreachable) {
+    // An outage is not a misconfiguration. Start, and say loudly that signing
+    // is unverified -- rather than refusing to serve auth because an RPC blipped.
+    log('error', 'RPC unreachable; chain is UNVERIFIED', { reason: result.reason });
+    return;
+  }
+
+  // A genuine mismatch. Refuse to run: every signature this process produced
+  // would commit to a chain nobody intended.
+  log('error', 'CHAIN MISMATCH; refusing to start', {
+    configured: expected,
+    configured_name: chainName(expected),
+    actual: result.actual,
+    actual_name: chainName(result.actual),
+    reason: result.reason,
+  });
+  process.exit(1);
+}
+
+await checkChain();
 
 const server = app.listen(Number(PORT), () => {
   log('info', 'listening', {

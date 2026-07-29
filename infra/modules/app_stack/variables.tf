@@ -105,3 +105,24 @@ variable "tags" {
   type        = map(string)
   default     = {}
 }
+
+variable "bsc_chain_id" {
+  description = <<-EOT
+    Chain the functions service signs for. THE authoritative source.
+
+    Not the settings table: that is application data, writable by application
+    code, and a signature commits to whatever chain id it was given. Dev
+    currently has settings.deposit_contract_chain_id = 56 (mainnet) while the
+    environment is testnet, which is exactly the contradiction this variable
+    exists to end.
+
+    The service verifies this against the RPC at startup and refuses to run on a
+    mismatch.
+  EOT
+  type        = number
+}
+
+variable "bsc_rpc_primary" {
+  description = "RPC endpoint. Checked at startup to confirm it serves bsc_chain_id."
+  type        = string
+}

@@ -384,6 +384,14 @@ module "functions" {
     ALLOWED_ORIGIN = "https://${var.domain_name}"
     API_BASE_URL   = "https://api.${var.domain_name}"
     POSTGREST_URL  = "http://127.0.0.1:3000"
+
+    # Chain identity comes from HERE -- infrastructure config Terraform owns per
+    # environment -- and never from the settings table, which application code
+    # can write. A signature commits to a chain id, so a value of 56 produces a
+    # valid BSC mainnet transaction wherever it was made. The service verifies
+    # this against the RPC at startup and refuses to run on a mismatch.
+    BSC_CHAIN_ID    = tostring(var.bsc_chain_id)
+    BSC_RPC_PRIMARY = var.bsc_rpc_primary
   }
 
   secrets = {

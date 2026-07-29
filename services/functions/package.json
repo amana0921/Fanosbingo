@@ -7,7 +7,7 @@
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
-    "test": "node src/telegram-auth.test.mjs && node src/kms-signer.test.mjs"
+    "test": "node src/telegram-auth.test.mjs && node src/kms-signer.test.mjs && node src/chain.test.mjs"
   },
   "dependencies": {
     "express": "^4.21.2",
