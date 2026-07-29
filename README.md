@@ -6,6 +6,9 @@ A real-time, multiplayer bingo game built as a Telegram Mini App with full on-ch
 
 ## Table of Contents
 
+- [Project status](#project-status)
+- [Running it](#running-it)
+- [What is left](#what-is-left)
 - [Overview](#overview)
 - [How It Works](#how-it-works)
 - [Game Mechanics](#game-mechanics)
@@ -16,6 +19,103 @@ A real-time, multiplayer bingo game built as a Telegram Mini App with full on-ch
 - [Admin Panel](#admin-panel)
 - [Architecture](#architecture)
 - [Vision](#vision)
+
+---
+
+## Project status
+
+**Self-hosted on AWS, ~$30/month.** The server side was originally a hosted
+Supabase project belonging to the upstream repository this is forked from. It is
+being rebuilt on infrastructure this project owns.
+
+| Layer | State |
+|---|---|
+| Infrastructure (VPC, RDS, ECS, KMS, CloudTrail) | live in **dev**, Terraform, applied through CI |
+| Database | PostgreSQL 16 on RDS, 109 migrations, PITR |
+| API (PostgREST) · realtime · game loop · TLS | running |
+| Auth service | running — Telegram `initData` verified, JWT enforced by RLS |
+| Smart contract | **not deployed** — the only thing blocking the money path |
+| Frontend | still points at Supabase, not at this API |
+| Production | Terraform written, never applied |
+
+Engineering detail, decisions and their reasons live in **[AGENTS.md](AGENTS.md)**.
+Read it before changing anything; most of it was learned expensively.
+
+### Security posture, in one paragraph
+
+Authorization is enforced by the **database**, not by application code
+remembering to check. A player proves their Telegram identity once, receives a
+short-lived JWT whose claims match what PostgREST expects, and every subsequent
+query runs under row-level security as that player. The hot wallet is a
+**non-exportable KMS key** — no plaintext copy has ever existed — and exactly one
+IAM role may ask it to sign, with a CloudTrail alarm on anything else. The origin
+accepts traffic only from Cloudflare's published ranges.
+
+---
+
+## Running it
+
+Nothing reaches AWS except through GitHub Actions. There are no manual
+`terraform apply` runs.
+
+```bash
+# infrastructure
+gh workflow run terraform.yml -f environment=dev -f action=plan
+gh workflow run terraform.yml -f environment=dev -f action=apply
+
+# ship a service (build -> ECR -> SSM pointer -> rolling deploy)
+gh workflow run deploy-services.yml -f service=functions -f environment=dev
+
+# database migrations, through an SSM tunnel (RDS has no public endpoint)
+gh workflow run db-migrate.yml -f environment=dev -f dry_run=true
+
+# prove the security controls still work (also runs weekly on its own)
+gh workflow run verify.yml -f environment=dev
+```
+
+Local checks that need no AWS:
+
+```bash
+npm --prefix services/functions install
+npm run test:functions        # 47 assertions
+terraform fmt -check -recursive infra/
+```
+
+---
+
+## What is left
+
+Ordered by what unblocks the most.
+
+**1. Deploy the smart contract.** Free, and it is the only blocker on the entire
+money path. Fund the wallet from the BSC testnet faucet, then:
+
+```bash
+node scripts/deploy-contract.mjs dev              # dry run — checks everything
+node scripts/deploy-contract.mjs dev --broadcast  # deploys, verifies owner()
+```
+
+The deploying wallet becomes the contract owner **permanently**, so this must be
+signed by the KMS key. The script does that and reads `owner()` back to prove it.
+
+**2. Point the frontend at this API.** The URL shape was preserved deliberately
+(`/rest/v1`, `/realtime/v1`, `/functions/v1`), so the ~200 `supabase.from()` call
+sites and 10 realtime subscriptions should work unchanged. Then delete the
+client-side game logic the ticker replaced.
+
+**3. Finish the API surface.** `POST /telegram/webhook` (verify the secret
+strictly), `POST /wins/credit` (needs the contract), `POST /deposits/confirm`.
+Every new route must answer *"why can RLS not do this?"*.
+
+**4. Replace the admin key.** A shared string compared with `!==` in browser
+state. Cognito with TOTP, and an audit log on every privileged mutation.
+
+**5. Production.** Terraform is written and plans cleanly, but has never been
+applied. Needs mainnet values, a funded wallet, and `PROD_APPLY_ENABLED=true`.
+Run the restore drill against prod once — dev's 8–11 minute figure is not prod's.
+
+**Known gaps, deliberately accepted:** single instance in a single AZ (~3–5 min
+MTTR); no load test yet at the 400-concurrent target; runbooks unwritten.
 
 ---
 
@@ -134,14 +234,22 @@ An optional SMS-based deposit flow supports Ethiopian bank transfers:
 
 ## Withdrawals
 
-Players can withdraw their won balance back to their crypto wallet at any time.
+Players withdraw their won balance to their own wallet at any time. The design
+is **non-custodial**: the backend never sends a player's funds and never signs a
+withdrawal.
 
-1. Request a withdrawal from the app
-2. The backend generates a signed authorization
-3. The player submits the signed transaction to the withdrawal contract on BSC
-4. BNB is sent directly to the player's wallet from the contract
+1. The player wins; the backend credits that amount on-chain with
+   `addWinCredits()`, signed by a KMS key no human can export
+2. The player calls `withdraw()` on the contract **themselves**
+3. BNB moves from the contract to their wallet, without the operator in the path
 
-Withdrawal limits apply per day and per week to protect the protocol.
+Withdrawal limits are enforced **on-chain** by the contract, per day and per
+week. Database-side tracking is kept for analytics and is not authoritative.
+
+> Earlier revisions had the backend generate a signed authorization the player
+> then submitted. That was replaced (migration `20260216`) precisely to keep the
+> operator out of the withdrawal path — the backend's only signing job now is
+> crediting wins.
 
 ---
 
