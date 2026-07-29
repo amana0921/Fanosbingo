@@ -1,13 +1,44 @@
+/**
+ * The data client.
+ *
+ * Still supabase-js, pointed at self-hosted infrastructure rather than a hosted
+ * Supabase project. That is deliberate and is why this migration is tractable:
+ * the URL shape was preserved (`/rest/v1`, `/realtime/v1`, `/functions/v1`), so
+ * the ~200 `supabase.from()` call sites and the realtime subscriptions work
+ * unchanged against PostgREST and the Realtime container we run ourselves.
+ *
+ * THE ONE REAL CHANGE IS `accessToken`.
+ *
+ * supabase-js calls that hook for every request and every Realtime reconnect,
+ * and sends whatever it returns as the bearer token. Supplying it also turns
+ * OFF supabase-js's built-in auth, which is what we want — identity comes from
+ * Telegram, verified by our own API, not from GoTrue.
+ *
+ * The effect is that every query now arrives at PostgREST as a PROVEN player
+ * rather than as `anon`, so the 47 RLS policies in the migrations finally do
+ * something. Before this, identity was a telegram id the client asserted and
+ * the server believed.
+ */
+
 import { createClient } from '@supabase/supabase-js';
+import { getAccessToken } from './auth';
 
 const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
 const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
 
 if (!supabaseUrl || !supabaseAnonKey) {
-  throw new Error('Missing Supabase environment variables');
+  throw new Error(
+    'VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY are required. ' +
+      'See .env.example — the URL is now this project\'s own API, not a supabase.co host.',
+  );
 }
 
-export const supabase = createClient(supabaseUrl, supabaseAnonKey);
+export const supabase = createClient(supabaseUrl, supabaseAnonKey, {
+  // Returns the player's token once they have authenticated, and the anon key
+  // before that. Never throws: a failure here would break every query, and
+  // degrading to `anon` shows the player only what anonymous users may see.
+  accessToken: getAccessToken,
+});
 
 export interface Game {
   id: string;

@@ -8,6 +8,7 @@ import { WalletDepositModal } from './components/WalletDepositModal';
 import { NetworkQualityIndicator } from './components/NetworkQualityIndicator';
 import { supabase } from './lib/supabase';
 import { initTelegram, TelegramUser } from './utils/telegram';
+import { authenticate } from './lib/auth';
 import { config, queryClient } from './lib/walletConfig';
 
 const Admin = lazy(() => import('./components/Admin').then(module => ({ default: module.Admin })));
@@ -26,10 +27,37 @@ function AppContent() {
   const walletRegistered = useRef(false);
 
   useEffect(() => {
-    const telegramData = initTelegram();
-    if (telegramData.user) {
-      setAppUser(telegramData.user);
-    }
+    // Exchange Telegram's SIGNED initData for a session token before doing
+    // anything else.
+    //
+    // The identity used to come from initDataUnsafe -- Telegram's own word for
+    // "parsed but not verified" -- and was then sent to the API as a plain
+    // telegram id the server had no way to check. Now the API verifies the HMAC
+    // and returns a token whose claims RLS enforces on every query.
+    //
+    // The returned user is preferred over the local one because it is the one
+    // the server PROVED. Falling back to initTelegram() keeps the app usable
+    // outside Telegram -- a browser tab, a preview -- where there is no
+    // signature to verify and RLS correctly shows only anonymous data.
+    const bootstrapIdentity = async () => {
+      const verified = await authenticate();
+
+      if (verified) {
+        setAppUser({
+          id: Number(verified.telegram_user_id),
+          first_name: verified.first_name,
+          username: verified.username,
+        });
+        return;
+      }
+
+      const telegramData = initTelegram();
+      if (telegramData.user) {
+        setAppUser(telegramData.user);
+      }
+    };
+
+    void bootstrapIdentity();
   }, []);
 
   useEffect(() => {
