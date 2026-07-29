@@ -1,27 +1,52 @@
 # Fanos Bingo — Infrastructure
 
-Terraform for the AWS migration. Target: **~$30/month** at ~200 users, structured so
+Terraform for the AWS build. Target: **~$30/month** at ~200 users, structured so
 growth is a configuration change rather than a rewrite.
+
+**State, ✅ verified 2026-07-29:** `dev` and `account` are applied and healthy —
+five services `ACTIVE 1/1`, ten alarms `OK`, CloudTrail logging, a dev plan
+reporting no changes. **`prod` is written and plans cleanly but has never been
+applied.**
+
+Engineering context and the reasoning behind these decisions live in
+[../AGENTS.md](../AGENTS.md).
 
 ## Layout
 
 ```
 infra/
 ├── environments/
+│   ├── account/ # CloudTrail + account guardrails. SINGLETON, applied on demand.
 │   ├── dev/     # BSC testnet. NOT always-on — apply, test, destroy.
-│   └── prod/    # BSC mainnet. Always-on.
+│   └── prod/    # BSC mainnet. Written, plans cleanly, NEVER APPLIED.
+│       └── ami.tf          one pinned AMI id, bumped by pull request
 └── modules/
     ├── vpc/              VPC, 2 public + 2 isolated subnets, IGW, routes
     ├── security_groups/  sg-app (Cloudflare-locked), sg-rds
     ├── kms/              encryption CMK + secp256k1 wallet signing key
-    ├── ssm/              config and secrets (values set out-of-band)
+    ├── ssm/              config, secrets, and image pointers
     ├── iam/              GitHub OIDC, EC2 instance role, ECS task roles
     ├── rds/              PostgreSQL 16 + parameter group
     ├── ecr/              image repositories
     ├── ecs/              cluster, EC2 capacity provider, ASG, launch template
-    ├── s3_cloudfront/    SPA hosting (Phase 5)
-    └── monitoring/       Budgets, SNS, baseline alarms
+    ├── ecs_service/      one task definition + service
+    ├── app_stack/        ALL FIVE services, called by dev AND prod
+    ├── cloudtrail/       the trail, and the alarms that justify it
+    ├── cloudflare/       DNS + zone settings — the origin lock's other half
+    ├── s3_cloudfront/    SPA hosting (Phase 5) — still empty
+    └── monitoring/       Budgets, SNS, alarms incl. the game loop
 ```
+
+**Three roots, not two.** `account` holds resources that are account-wide
+singletons: one CloudTrail (a second would bill for duplicate management
+events), the S3 account public-access block, EBS default encryption, the IAM
+password policy and Access Analyzer. It is applied on its own and is never
+targeted by a merge.
+
+**`app_stack` is why dev and prod cannot diverge.** The five service definitions
+used to live inline in `dev/main.tf` and were simply absent from prod — applying
+prod would have produced a VPC, a database and an idle container instance with
+no application on it.
 
 ## Design decisions that drive the cost
 
@@ -59,7 +84,7 @@ Through a pull request, and only through a pull request.
 
 ```
 PR opened   ──▶  fmt · validate · trivy · plan ──▶ plan posted as a PR comment
-PR merged   ──▶  apply to prod  (gated by the `prod` GitHub Environment)
+PR merged   ──▶  apply to prod  (gated TWICE — see below)
 Manual      ──▶  plan / apply / destroy any environment (workflow_dispatch)
 ```
 
@@ -67,14 +92,48 @@ Authentication is OIDC — there is no AWS access key anywhere in this repositor
 Dev is deliberately not applied on merge; it is on-demand infrastructure you
 stand up to test something and destroy afterwards.
 
+### Two roles, and the split is load-bearing
+
+| Context | Role | Scope |
+|---|---|---|
+| `plan` on a pull request | `fanosbingo-terraform-planner` | ReadOnlyAccess + state lock; decrypts **dev** only, by resource tag |
+| `apply` / `destroy` | `fanosbingo-terraform-executor` | AdministratorAccess, trusted only from `main` and the environments |
+| deploy · secrets · migrate · drill | `fanosbingo-<env>-github-deploy` | ECR, ECS, this environment's SSM tree, the tunnel, `*-restore-drill` only |
+
+A pull request runs workflow code **taken from the PR branch**. Before the
+split, every workflow used the admin executor, so a modified workflow file in a
+PR was an admin credential.
+
+Two details that are easy to undo by accident:
+
+- **The `plan` job declares no `environment:`.** A job that declares one gets
+  `environment:<name>` as its OIDC subject — the environment context REPLACES the
+  event context — so a PR plan would present `environment:dev` and never
+  `pull_request`, and the planner role would refuse it.
+- **`dev` carries a deployment branch policy limiting it to `main`.** Without it,
+  a modified workflow could declare `environment: dev` and reach the admin
+  executor anyway.
+
 ## One-time bootstrap
 
-Exactly one step is manual, and it is unavoidable: GitHub Actions authenticates
-via an OIDC role, but something already authenticated has to create that role.
+Two commands, and the first is unavoidable: GitHub Actions authenticates via an
+OIDC role, but something already authenticated has to create that role.
 
 ```bash
-./scripts/bootstrap-aws.sh
+./scripts/bootstrap-aws.sh      # state bucket, OIDC provider, BOTH roles
+./scripts/bootstrap-github.sh   # variables, environments, prod's reviewers
 ```
+
+Both are **idempotent** and re-running them is how you repair drift.
+`bootstrap-aws.sh` writes `.bootstrap-output.json`, which the second reads, so
+nothing is copied by hand between them.
+
+`bootstrap-github.sh` **verifies** what it configured rather than assuming it
+worked. That matters: a GitHub Environment that does not exist is created
+implicitly and **without protection rules** the first time a workflow references
+it — so `environment: prod` is not a gate until somebody has created `prod` and
+ticked "required reviewers". A gate that depends on a human having clicked
+something is not a gate.
 
 Idempotent — re-running it repairs drift rather than failing. It creates the
 state bucket (versioned, encrypted, private, with a 90-day lifecycle on old
@@ -95,24 +154,39 @@ policy, which names one repository and specific branches and environments.
 
 ### GitHub configuration
 
-Variables (`Settings > Secrets and variables > Actions > Variables`):
+`scripts/bootstrap-github.sh` sets all of this. The table is here so you can
+check it, not so you can type it.
 
 | Variable | Value |
 |---|---|
-| `AWS_ROLE_ARN` | printed by the bootstrap script |
+| `AWS_ACCOUNT_ID` | used to derive the per-environment deploy role ARN |
+| `AWS_ROLE_ARN` | the **executor** (admin) |
+| `AWS_PLANNER_ROLE_ARN` | the **planner** (read-only, pull requests) |
 | `AWS_REGION` | `us-east-1` |
 | `TF_STATE_BUCKET` | printed by the bootstrap script |
-| `DOMAIN_NAME` | `fanosbingo.com` |
+| `DOMAIN_NAME` | `yisakmesifin.org` |
 | `ALERT_EMAIL` | where alarms go |
+| `CLOUDFLARE_ZONE_ID` | optional; enables `modules/cloudflare` |
+| `PROD_APPLY_ENABLED` | **leave unset.** Setting it to `true` is the second prod gate |
 
-Secrets (`... > Secrets`), consumed by the *Sync secrets to SSM* workflow:
+Secrets, consumed by the *Sync secrets to SSM* workflow:
 
 `TELEGRAM_BOT_TOKEN` · `TELEGRAM_WEBHOOK_SECRET` · `APP_JWT_SECRET` ·
-`APP_ADMIN_BOOTSTRAP_KEY` · `DB_POSTGREST_PASSWORD` · `DB_APP_PASSWORD`
+`APP_ADMIN_BOOTSTRAP_KEY` · `DB_POSTGREST_PASSWORD` · `DB_APP_PASSWORD` ·
+`REALTIME_SECRET_KEY_BASE` · `REALTIME_DB_ENC_KEY` ·
+`REALTIME_METRICS_JWT_SECRET` · `TLS_ORIGIN_CERT` · `TLS_ORIGIN_KEY` ·
+`CLOUDFLARE_API_TOKEN` (optional)
 
-Environments (`Settings > Environments`): create `dev` (no protection) and
-`prod` (**enable required reviewers**). That approval gate is what stops an
-accidental merge from reshaping the environment holding real money.
+Environments: `account`, `dev`, `prod`.
+
+- `prod` and `account` carry **required reviewers**
+- `dev` carries a **deployment branch policy limited to `main`** — not a
+  reviewer, because routine dev applies should not need approval, but a PR branch
+  must not be able to declare `environment: dev` and reach the admin executor
+
+Prod apply needs **both** `PROD_APPLY_ENABLED == "true"` and the environment's
+reviewers. Two gates, because a missing environment is created implicitly and
+without protection rules, so the environment alone would be no gate at all.
 
 ## Running it locally
 
@@ -146,19 +220,50 @@ idempotent, so it is a no-op on a steady-state apply. It handles:
 
 | Step | Why it cannot be automated |
 |---|---|
-| Confirming the SNS subscription email | AWS requires the recipient to click the emailed link. A Lambda→Telegram forwarder auto-confirms and removes this; planned for Phase 6. |
-| Cloudflare DNS records | Automatable via the Cloudflare provider, deferred until there is a real Elastic IP to point at. Until then, set `api.` and `rt.` as **proxied** A records manually. |
-| Funding the hot wallet | Moving money. Deliberately not automated. |
+| Confirming the SNS subscription email | AWS requires the recipient to click the emailed link. Until someone does, **the alarms notify nobody** — `verify-detections.sh` fails on zero confirmed subscribers precisely so this cannot be forgotten quietly. |
+| Creating the Cloudflare API token | A credential. Needs `Zone:Read`, `DNS:Edit`, `Zone Settings:Edit`, `Zone WAF:Edit` and **`Bot Management:Read`** — that last one is separate, not implied by Zone Settings, and without it Bot Fight Mode cannot be verified. |
+| Setting the GitHub Secret *values* | The one thing not derivable. `bootstrap-github.sh` prints the list. |
+| Funding the hot wallet | Moving money. Deliberately not automated. Testnet is a free faucet; mainnet is real BNB. |
+| Deploying the contract | One command (`scripts/deploy-contract.mjs`), but it broadcasts a transaction and permanently sets the owner, so it is deliberately explicit. |
+
+**No longer manual**, and worth knowing because the old instructions are wrong:
+
+| Was | Now |
+|---|---|
+| Set `<SVC>_IMAGE` GitHub variables, then re-dispatch Terraform | Deploy writes the image pointer to `/<prefix>/images/<service>` and dispatches Terraform itself |
+| Create GitHub Environments and tick "required reviewers" | `scripts/bootstrap-github.sh` creates them **and verifies** the rule is present |
+| Set Cloudflare DNS and zone settings in the dashboard | `modules/cloudflare`, gated on `cloudflare_zone_id` |
+| Watch for new ECS AMIs | `ami-bump.yml` opens a PR weekly |
 
 ## Cloudflare settings that are not optional
 
-| Setting | Value | Why |
-|---|---|---|
-| Bot Fight Mode | **Off** | Challenges non-browser clients — which is what Telegram's webhook caller and a WebSocket upgrade look like. |
-| WAF skip rule | on `/functions/v1/telegram-bot-webhook` | Telegram does not solve challenges; it retries a few times and then disables your webhook. |
-| SSL mode | **Full (strict)** | Anything less either loops or silently sends plaintext on the origin leg. |
-| `api.` / `rt.` records | **Proxied** | Required by the origin lock. |
-| Apex / `www` | **DNS-only** | Points at CloudFront; proxying would double-CDN for no gain. |
+**Most of these are Terraform now** (`modules/cloudflare`), gated on
+`cloudflare_zone_id` being set.
+
+| Setting | Value | Managed by | Why |
+|---|---|---|---|
+| SSL mode | **Full (strict)** | Terraform | Anything less either loops or silently sends plaintext on the origin leg |
+| `api.` / `rt.` records | **Proxied** | Terraform | Required by the origin lock — a grey-cloud record black-holes with no error |
+| Minimum TLS | 1.2 | Terraform | |
+| WebSockets | on | Terraform | Realtime cannot upgrade without it |
+| Bot Fight Mode | **Off** | **script only** | No free-plan Terraform resource. Challenges non-browser clients — which is exactly what Telegram's webhook caller and a WebSocket upgrade look like. Telegram does not solve challenges: it retries, then DISABLES your webhook |
+| Apex / `www` | DNS-only | manual | Points at CloudFront; proxying would double-CDN for no gain |
+
+`scripts/verify-cloudflare.sh` asserts the lot against Cloudflare's API — not
+against Terraform state, because a dashboard edit does not update state. It runs
+weekly via `verify.yml`.
+
+> **Exactly one root may own the zone.** dev and prod share a domain and therefore
+> a zone, and two Terraform states managing one DNS record is a fight neither
+> wins — each apply reverts the other, presenting as unexplained DNS flapping.
+> `manage_cloudflare` is `true` in dev, `false` in prod. **At cutover, flip prod
+> on and dev off, in that order.**
+
+> **Records that already exist must be imported, not created.** Cloudflare permits
+> several A records on one name, so a plain apply creates a *second* `api.` record
+> beside the live one — no error, and Terraform then manages a record nobody
+> resolves. Run `cloudflare-import.yml`, merge its PR, apply, then delete the
+> generated `cloudflare-imports.tf`.
 
 ## Troubleshooting
 
@@ -186,6 +291,38 @@ gh api repos/OWNER/NAME/actions/oidc/customization/sub
 
 `scripts/bootstrap-aws.sh` lists both forms and prints the emitted prefix when
 it runs, so re-running it fixes this.
+
+### `Not authorized` on a PR plan, but applies work
+
+The `plan` job must declare **no** `environment:`. A job that declares one gets
+`environment:<name>` as its OIDC subject — the environment context REPLACES the
+event context — so the plan presents `environment:dev` and never `pull_request`,
+and the read-only planner role refuses it. The error is the bare STS message and
+says nothing about environments.
+
+### A service exists in Terraform but ECS never creates it
+
+Its image pointer is absent or still `none`. Terraform declines to create a
+service whose image does not exist, because one that references a missing image
+retries forever without explaining itself.
+
+```bash
+aws ssm get-parameters-by-path --path /fanosbingo-dev/images --query 'Parameters[].[Name,Value]' --output text
+```
+
+Terraform **reads** these and never writes them; the deploy workflow owns them.
+
+### `KMSKeyNotAccessibleFault` restoring a snapshot
+
+The key is fine. Restoring an *encrypted* snapshot makes RDS create a grant on
+the CMK, and the caller needs `kms:CreateGrant`. The error names three possible
+causes and the real one is a fourth.
+
+### The restore drill reports a plausible RTO, then fails to connect
+
+The restored instance landed in the VPC **default** security group, which admits
+traffic only from itself. Pass `--vpc-security-group-ids` from the source. This
+one is dangerous precisely because the timing looks right.
 
 ### Trivy fails the build
 
@@ -267,15 +404,31 @@ matching.
 ## Common operations
 
 ```bash
-# Shell into the instance — no SSH key, no open port
+# Everything goes through workflows. These are the ones you will actually use.
+gh workflow run terraform.yml -f environment=dev     -f action=plan
+gh workflow run terraform.yml -f environment=dev     -f action=apply
+gh workflow run terraform.yml -f environment=account -f action=apply   # rare
+gh workflow run terraform.yml -f environment=dev     -f action=destroy # refuses prod and account
+
+# Ship a service: build -> ECR -> SSM pointer -> roll (creates the service if new)
+gh workflow run deploy-services.yml -f service=functions -f environment=dev
+
+# Prove the security controls still work (also weekly)
+gh workflow run verify.yml -f environment=dev
+
+# Measure the RTO for real (also monthly)
+gh workflow run db-restore-drill.yml -f environment=dev
+
+# Shell into the instance — no SSH key, no open port, CloudTrail-logged
 aws ssm start-session --target <instance-id>
 
-# Tear down dev when you are done testing
-cd environments/dev && terraform destroy
-
-# See what an apply would change
+# See what an apply would change, locally
 terraform plan -out=tfplan && terraform show tfplan
 ```
+
+**A plan's verdict is in the job log**, not only in the step summary: both
+outcomes emit a `::notice::`. A green tick means terraform exited cleanly, not
+that infrastructure matches configuration — only "No changes" means that.
 
 `*.tfplan` files are gitignored: plan output can contain secret values in
 cleartext.
