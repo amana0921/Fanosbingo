@@ -29,10 +29,11 @@
     "lucide-react": "^0.344.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
-    "viem": "^2.45.2",
+    "viem": "^2.55.10",
     "wagmi": "^3.4.2"
   },
   "devDependencies": {
+    "@aws-sdk/client-kms": "^3.1097.0",
     "@eslint/js": "^9.9.1",
     "@types/node": "^25.0.3",
     "@types/react": "^18.3.5",
@@ -47,6 +48,7 @@
     "k6": "^0.0.0",
     "postcss": "^8.4.35",
     "rollup-plugin-visualizer": "^6.0.5",
+    "solc": "^0.8.36",
     "tailwindcss": "^3.4.1",
     "terser": "^5.44.1",
     "tsx": "^4.21.0",
