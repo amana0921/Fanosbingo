@@ -247,6 +247,17 @@ module "cloudflare" {
   # address the instance actually claims on boot, and a stale literal here would
   # black-hole the whole site.
   origin_ip = module.ecs.public_ip
+
+  # The zone is now under Terraform and its DNS has converged, which is the
+  # precondition the variable's own description asks for. Turning it on here
+  # rather than changing the module default, so prod adopts it as a separate,
+  # deliberate change with its own plan.
+  #
+  # Worth being clear about what this is and is not: it throttles
+  # /functions/v1/auth and the wallet account-creation RPC. It is NOT what
+  # protects the money-moving functions -- db/20-post/004 revoked EXECUTE on
+  # those, which holds whether or not Cloudflare is in front.
+  enable_rate_limiting = true
 }
 
 module "monitoring" {

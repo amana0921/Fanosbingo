@@ -35,14 +35,29 @@ variable "enable_rate_limiting" {
 
 variable "rate_limit_requests_per_minute" {
   description = <<-EOT
-    Requests per minute per source IP to the money-moving and auth endpoints
-    before blocking.
+    Requests per minute per source IP to the authentication and account-creation
+    endpoints before blocking.
 
-    Ten is generous for a human: withdrawing is a deliberate act, not something
-    done in a loop. It is restrictive for a script.
+    Thirty, not ten, and the reason is the player base rather than the threat.
+
+    The rule keys on ip.src. This game's players reach Telegram over Ethiopian
+    mobile networks, where large numbers of subscribers share a small pool of
+    carrier-NAT addresses -- so "one IP" here is not one person. At ten per
+    minute, a busy evening on one carrier egress would start blocking players
+    who have done nothing but open the app, and the symptom is a Mini App that
+    fails to log in for some users and not others, with nothing in the origin
+    logs because Cloudflare answered first.
+
+    Thirty still stops a script cold: a real client calls /auth/telegram once per
+    session, so thirty is roughly thirty distinct people behind one address in
+    the same minute, and an attacker looking for volume needs orders of
+    magnitude more than that to be worth their time.
+
+    If this ever needs to be tight rather than generous, the fix is to stop
+    keying on IP -- not to lower this number.
   EOT
   type        = number
-  default     = 10
+  default     = 30
 }
 
 variable "enable_cache_bypass" {

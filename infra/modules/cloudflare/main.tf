@@ -184,10 +184,38 @@ resource "cloudflare_ruleset" "rate_limit" {
   kind    = "zone"
   phase   = "http_ratelimit"
 
+  # THE PATHS BELOW ARE THE ONES THAT EXIST. The previous expression matched
+  #   /functions/v1/process-withdrawal
+  #   /functions/v1/transfer-balance
+  #   /functions/v1/record-withdrawal
+  # all three of which 404 -- they are inherited Deno function names the rebuilt
+  # service never implemented. Confirmed by requesting them. So the one
+  # rate-limiting rule the free plan allows was being spent almost entirely on
+  # paths nothing can reach, while the endpoints that actually accept work were
+  # unthrottled.
+  #
+  # What is actually reachable and worth a rule:
+  #
+  #   /functions/v1/auth/telegram
+  #       The only unauthenticated route on the functions service. It verifies
+  #       an HMAC and then INSERTs into telegram_users. Cheap to call, not cheap
+  #       to serve.
+  #
+  #   /rest/v1/rpc/get_or_create_wallet_user
+  #       Creates a player row from an unauthenticated caller-supplied wallet
+  #       address. The one remaining account-creation path reachable without a
+  #       token.
+  #
+  # Deliberately NOT the whole of /rest/v1/rpc/: the lobby polls
+  # get_lobby_data_instant through it (src/components/Lobby.tsx:95), so a blanket
+  # rule there would throttle normal play. The money-moving RPCs are not listed
+  # because db/20-post/004 revoked EXECUTE on them from anon and authenticated
+  # -- they are closed at the database, which is the better place. This rule is
+  # the edge half of a defence that has a floor underneath it.
   rules = [{
     ref         = "money_and_auth_endpoints"
-    description = "Throttle withdrawal, transfer and auth endpoints"
-    expression  = "(http.host eq \"api.${var.domain_name}\" and (http.request.uri.path contains \"/functions/v1/process-withdrawal\" or http.request.uri.path contains \"/functions/v1/transfer-balance\" or http.request.uri.path contains \"/functions/v1/record-withdrawal\" or http.request.uri.path contains \"/functions/v1/auth\"))"
+    description = "Throttle authentication and account creation"
+    expression  = "(http.host eq \"api.${var.domain_name}\" and (http.request.uri.path contains \"/functions/v1/auth\" or http.request.uri.path contains \"/rest/v1/rpc/get_or_create_wallet_user\"))"
     action      = "block"
 
     ratelimit = {

@@ -114,6 +114,64 @@ except Exception:
   fi
 done
 
+# ---------------------------------------------------------------------------
+# 4. Function execution -- the escalation the table checks above cannot see.
+#
+#    Reading a table is not the only way out. `db/20-post/001` used to end with
+#
+#      GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO anon, authenticated, service_role;
+#
+#    and 30 of the 58 functions in that schema are SECURITY DEFINER -- they run
+#    as the owner, so RLS does not apply inside them. Eight take the caller's own
+#    identity as an ordinary parameter and never check it. The result was that
+#    this exact request, with no token and no apikey, ran against a real
+#    player's balance:
+#
+#      POST /rest/v1/rpc/transfer_balance
+#        {"from_telegram_id": <victim>, "transfer_amount": <n>, "to_telegram_id": <attacker>}
+#
+#    Every check above passed while that was true, because none of them called
+#    a function.
+#
+#    ONE CANARY, DELIBERATELY. The regression this guards against is a blanket
+#    grant -- that is how it happened the first time, and a blanket grant hits
+#    every function at once. Probing one proven-safe function detects it just as
+#    well as probing all eight, without this script POSTing to six money-moving
+#    endpoints on a schedule.
+#
+#    transfer_balance is the canary because it is provably non-mutating for this
+#    input: it reads won_balance, compares, and returns before any write when the
+#    amount exceeds it. 999999999 exceeds any real balance. A 200 here means the
+#    function EXECUTED, which is the finding regardless of what it answered.
+# ---------------------------------------------------------------------------
+canary=$(curl -s -m 15 -o /dev/null -w "%{http_code}" \
+  -X POST "${BASE_URL}/rest/v1/rpc/transfer_balance" \
+  -H 'Content-Type: application/json' \
+  -d '{"from_telegram_id":1,"transfer_amount":999999999,"to_telegram_id":1}' 2>/dev/null)
+
+case "$canary" in
+  200)
+    echo "${RED}FAIL${NC}  transfer_balance EXECUTED for an anonymous caller (HTTP 200)"
+    echo "      EXECUTE has been granted to anon somewhere. Check db/20-post/004."
+    failures=$((failures + 1))
+    ;;
+  401|403)
+    echo "${GREEN}ok${NC}    transfer_balance denied to anonymous callers (${canary})"
+    ;;
+  404)
+    # PostgREST answers 404/PGRST202 both for "no such function" and for a
+    # signature that does not match. Not a pass -- it means the probe did not
+    # reach the function, so it proved nothing either way.
+    echo "${YELLOW}~${NC}     transfer_balance: 404 -- signature changed or function absent"
+    echo "      This check proved nothing. Update the payload to match the current signature."
+    inconclusive=$((inconclusive + 1))
+    ;;
+  *)
+    echo "${YELLOW}~${NC}     transfer_balance: unexpected HTTP ${canary}"
+    inconclusive=$((inconclusive + 1))
+    ;;
+esac
+
 echo
 if [ "$failures" -gt 0 ]; then
   echo "${RED}${BOLD}${failures} exposure(s) found.${NC}"

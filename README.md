@@ -40,6 +40,7 @@ countdown ticks — driven by a server-side game loop, not by a browser tab.
 | Auth service | running — Telegram `initData` verified, JWT enforced by RLS |
 | Mini App | served from Caddy at `app.<domain>`, built into the image |
 | Some API routes | **404** — inherited function names the rebuilt service never implemented |
+| Database authorization | **fix written, not applied** — `db/20-post/004`. Until it runs, an anonymous caller can read player balances and execute the money-moving functions |
 | Smart contract | **not deployed** — blocked on a free faucet visit |
 | Production | Terraform written, plans cleanly, never applied |
 
@@ -61,6 +62,14 @@ query runs under row-level security as that player. The hot wallet is a
 **non-exportable KMS key** — no plaintext copy has ever existed — and exactly one
 IAM role may ask it to sign, with a CloudTrail alarm on anything else. The origin
 accepts traffic only from Cloudflare's published ranges.
+
+That describes the HTTP layer, which was rebuilt, and it is true of it. It was
+**not** true of the database underneath until `db/20-post/004`, which is written
+and not yet applied: the SQL migrations were inherited wholesale from a Supabase
+deployment where the edge functions used the service-role key and RLS was
+decorative, so a permissive policy and a blanket `GRANT EXECUTE` survived into a
+system that depends on neither being there. Both were found by `curl`, not by
+review. See [AGENTS.md](AGENTS.md) §0.
 
 ---
 
@@ -98,7 +107,22 @@ terraform fmt -check -recursive infra/
 
 Ordered by what unblocks the most.
 
-**1. Serve the routes the app calls.** The Mini App calls
+**1. Apply the authorization fix.** `db/20-post/004` closes two live exposures
+on the dev API: `telegram_users` is readable by anyone, and the `SECURITY
+DEFINER` functions that move money are executable by anyone. Both were found by
+`curl` against the running system; both are described in full at the top of
+[AGENTS.md](AGENTS.md).
+
+```bash
+gh workflow run db-migrate.yml -f environment=dev -f dry_run=true
+gh workflow run db-migrate.yml -f environment=dev
+./scripts/probe-public-access.sh https://api.yisakmesifin.org
+```
+
+Do this before deploying the contract. Funding the money path while an
+unauthenticated transfer route is open turns an exposure into a loss.
+
+**2. Serve the routes the app calls.** The Mini App calls
 `/functions/v1/get-card-layouts` and others that 404 — inherited Deno function
 names the rebuilt service never implemented. Get the real list from the app:
 
@@ -110,7 +134,8 @@ grep -rnoE "functions\.invoke\(['\"][a-z-]+|functions/v1/[a-z-]+" src/ \
 For each, ask **"why can RLS not do this?"** Most are plain data access and
 belong in PostgREST as `supabase.from()` calls, not as routes.
 
-**2. Deploy the smart contract.** Free, and the only blocker on the money path.
+**3. Deploy the smart contract.** Free, and the last blocker on the money path
+once (1) has landed.
 Fund the wallet from the BSC testnet faucet, then:
 
 ```bash
@@ -121,14 +146,14 @@ node scripts/deploy-contract.mjs dev --broadcast  # deploys, verifies owner()
 The deploying wallet becomes the contract owner **permanently**, so this must be
 signed by the KMS key. The script does that and reads `owner()` back to prove it.
 
-**3. Finish the API surface.** `POST /telegram/webhook` (verify the secret
+**4. Finish the API surface.** `POST /telegram/webhook` (verify the secret
 strictly), `POST /wins/credit` (needs the contract), `POST /deposits/confirm`.
 Requirements for each are recorded in `services/functions/src/index.js`.
 
-**4. Replace the admin key.** A shared string compared with `!==` in browser
+**5. Replace the admin key.** A shared string compared with `!==` in browser
 state. Cognito with TOTP, and an audit log on every privileged mutation.
 
-**5. Production.** Terraform is written and plans cleanly, but has never been
+**6. Production.** Terraform is written and plans cleanly, but has never been
 applied. Needs mainnet values, a funded wallet, and `PROD_APPLY_ENABLED=true`.
 Run the restore drill against prod once — dev's 8–11 minute figure is not prod's.
 

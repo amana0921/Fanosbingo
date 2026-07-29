@@ -119,10 +119,43 @@ resource "aws_launch_template" "app" {
 
   metadata_options {
     # IMDSv2 only. IMDSv1 is the classic SSRF-to-credential-theft path.
-    http_endpoint               = "enabled"
-    http_tokens                 = "required"
-    http_put_response_hop_limit = 2 # 2 so containers can still reach IMDS
-    instance_metadata_tags      = "enabled"
+    http_endpoint = "enabled"
+    http_tokens   = "required"
+
+    # HOP LIMIT 1, lowered from 2, because 2 was handing every container the
+    # instance role.
+    #
+    # A packet from a bridge-networked container to 169.254.169.254 crosses the
+    # docker bridge, which costs a hop -- so hop_limit = 2 is precisely what
+    # makes IMDS reachable from inside a container. That includes `functions`,
+    # the one process here that terminates requests from the internet. A
+    # server-side request forgery in it, or any container escape, yields the EC2
+    # instance profile: ECR pull, SSM, and ec2:AssociateAddress on this
+    # environment's Elastic IP. It quietly undoes the task-role separation the
+    # iam module is built around.
+    #
+    # MEASURED ON THE RUNNING dev INSTANCE (i-02939b8fd3ca83f9b) rather than
+    # reasoned about, because the cost of being wrong is a cluster that cannot
+    # start:
+    #
+    #   from inside the functions container   PUT /latest/api/token -> 200,
+    #                                         56-byte token. IMDS reachable.
+    #   the container's credential source     AWS_CONTAINER_CREDENTIALS_RELATIVE_URI
+    #                                         = /v2/credentials/<uuid>, i.e. the
+    #                                         ECS agent at 169.254.170.2 -- NOT
+    #                                         IMDS. Nothing legitimate breaks.
+    #   the instance role it would have got   fanosbingo-dev-ec2-instance
+    #   ecs-agent container network mode      host  (one hop; unaffected by 1)
+    #   ecs systemd unit                      active
+    #
+    # The EIP association in user_data also runs on the host, not in a
+    # container, so it is likewise unaffected.
+    #
+    # This takes effect on instance replacement, not on apply -- the ASG's
+    # instance_refresh fires on a launch-template change, which this is.
+    http_put_response_hop_limit = 1
+
+    instance_metadata_tags = "enabled"
   }
 
   monitoring {
