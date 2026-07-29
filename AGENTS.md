@@ -52,10 +52,20 @@ top to bottom once, then used as reference.
 
 ### The next task, in one line
 
-**Phase 4 (auth) — then finish the functions port.** Reasoning in §7. The short
-version: `initData` HMAC is never verified, so anyone can currently claim any
-player's identity. Porting money-moving endpoints onto that surface is the wrong
-order.
+**Fund the dev wallet from the testnet faucet, then deploy the contract.**
+Everything else on the money path is written, tested and blocked behind it.
+
+```
+https://testnet.bnbchain.org/faucet-smart   ->  0xE509727904C1B057E58BCe7f4eC5bFb120D5adDF
+node scripts/deploy-contract.mjs dev              # dry run, checks everything
+node scripts/deploy-contract.mjs dev --broadcast  # deploys, verifies owner()
+```
+
+It is free — testnet tBNB comes from a faucet. Only prod needs real BNB.
+
+If you would rather do something that needs no chain at all, the highest-value
+work is **pointing the SPA at this API** (§7, Phase 5). The auth service is live
+and verified; nothing uses it yet.
 
 ### Three things that are true and easy to get wrong
 
@@ -161,7 +171,15 @@ AWS account 292123551166, us-east-1, Elastic IP 35.153.122.186
 | postgrest | running, 22 relations / 46 functions |
 | realtime | running, v2.120.0 |
 | caddy | running, TLS via Cloudflare Origin Cert (expires 2041) |
+| **functions** | **running — auth service, built here, not ported** |
 | RDS | `available`, PostgreSQL 16.13, db.t4g.micro |
+
+Verified reachable end to end (✅ 2026-07-29):
+
+```
+/functions/v1/healthz   200    /functions/v1/readyz  200 {"ready":true}
+whoami without a token  401    forged initData       401
+```
 
 **prod exists in Terraform but has never been applied.** `PROD_APPLY_ENABLED` is
 deliberately unset, so merging to main plans prod and stops.
@@ -300,30 +318,47 @@ list in this document ending in "set these in the dashboard".
 
 ## 3. Available tooling
 
-Everything below is installed and verified on the workstation.
+Verified on this workstation, ✅ 2026-07-29. Check rather than assume — the
+versions below were read from the tools, not remembered.
 
 | Tool | Version | Notes |
 |---|---|---|
-| `aws` | 2.36.2 | Authenticated via SSO — **`aws login` when the session expires** (it will, mid-task) |
-| `gh` | 2.96.0 | Authenticated as `amana0921`, default repo set |
+| `aws` | 2.36.2 | **`aws login` when the session expires** — it will, mid-task |
+| `gh` | 2.96.0 | authenticated as `amana0921`, default repo set |
 | `terraform` | 1.15.8 | 1.11+ needed for S3-native state locking (`use_lockfile`) |
-| `podman` | 5.7.0 | **Rootless.** Use instead of docker — no group membership needed |
-| `psql` | 18.4 | Client only; server via podman |
+| `podman` | 5.7.0 | **rootless** — use instead of docker |
+| `psql` | 18.4 | client only; server via podman |
 | `node` / `npm` | 22.22.1 / 9.2.0 | |
-| `python3` | 3.14.4 | Used for YAML/JSON validation throughout |
+| `python3` | 3.14.4 | used for YAML/JSON validation throughout |
 | `jq` | 1.8.1 | |
-| `git` | 2.53.0 | SSH auth to GitHub (`git@github.com:amana0921/Fanosbingo.git`) |
+| `git` | 2.53.0 | SSH auth to GitHub |
 | `openssl` | 3.5.5 | |
+| `curl` | 8.18.0 | |
 
-**arm64 emulation is registered** (`qemu-aarch64` binfmt), so you can build and
-run Graviton images locally.
+**arm64 emulation is registered** (`qemu-aarch64` binfmt), so Graviton images
+build and run locally.
 
-### Not installed, and it matters
+### npm packages that matter
 
-- **`session-manager-plugin`** — needed for the SSM tunnel to RDS. CI installs it
-  per-run. To work with the database locally, install it first.
-- **Docker** — deliberately not used. Podman is rootless; docker would need a
-  group change that does not take effect in an already-running shell.
+| Package | Where | For |
+|---|---|---|
+| `viem` | root + functions | keccak, address derivation, tx serialization, RPC |
+| `@aws-sdk/client-kms` | root (dev) + functions | signing |
+| `solc` | root (dev) | compiling the contract at deploy time |
+| `@noble/curves` | transitive via viem | used by the signer tests to produce DER signatures |
+| `express`, `pg`, `jsonwebtoken` | functions | the service itself |
+
+### NOT installed, and each absence has a consequence
+
+| Missing | Consequence |
+|---|---|
+| `session-manager-plugin` | **no SSM tunnel to RDS.** CI installs it per-run; install it locally before touching the database |
+| `supabase` | cannot deploy or delete Supabase functions. Does not matter — see §1, there is no Supabase project |
+| `deno` | cannot run `supabase/functions/`. Also does not matter; they are not being ported |
+| `docker` | deliberate. Podman is rootless; docker needs a group change that will not take effect in an already-running shell |
+| `shellcheck` | shell scripts are checked with `bash -n` only. Worth installing |
+| `trivy` | runs in CI. To reproduce locally: `podman run --rm -v "$PWD:/src:ro" -w /src docker.io/aquasec/trivy:latest config --severity HIGH,CRITICAL infra/` |
+| `forge` / `hardhat` | not needed. `scripts/deploy-contract.mjs` compiles with `solc` directly |
 
 ### Rootless podman quirks you will hit
 
@@ -335,7 +370,16 @@ podman build -f services/postgrest/Dockerfile .      # FROM docker.io/... requir
 podman run -e HTTPS_PORT=8443 ...
 ```
 
----
+### Running the tests
+
+```bash
+npm --prefix services/functions install    # once
+npm run test:functions                     # 47 assertions, no AWS or network
+```
+
+They need no credentials. The signer tests generate their own secp256k1 key and
+never call KMS — signing arbitrary bytes with the wallet key is not a reasonable
+thing to do for a test, and would fire `unexpected-kms-sign`.
 
 ## 4. How to do things
 
@@ -618,6 +662,16 @@ Every one of these cost real time.
 - WebSocket path is **`/socket/websocket`**, not `/realtime/v1/websocket`
 - `DB_SSL_CA_CERT` is a **file path**. `DB_SSL=true` *without* it silently degrades to `verify: :verify_none`
 
+### Auth, chains and signing
+
+| Symptom | Cause |
+|---|---|
+| App loads but every table is empty | The JWT's `sub` is not a UUID. `auth.uid()` casts to uuid; a Telegram bigint fails the cast and every RLS policy matches nothing. No error anywhere |
+| Recovery search finds no matching address | Signing the wrong bytes. `crypto.sign(null, digest, key)` HASHES its input; KMS with `MessageType: 'DIGEST'` does not. The signature then covers `sha256(digest)` |
+| `jq '.x // "default"'` swallowed a `false` | `//` is an *alternative* operator, not a null-coalescer — it fires on `false` too. Cost a day on Bot Fight Mode. Use `has("x")` |
+| A "testnet" signature is valid on mainnet | Chain id came from `settings` (56) not SSM (97). A signature commits to a chain id wherever it was produced |
+| `unexpected-kms-sign` fired | Expected when a human signs, e.g. deploying the contract. Check CloudTrail shows your principal — that is the alarm working |
+
 ### CI
 
 - A **21-minute hang on "Assume AWS role"** has been observed once. Cancel and re-dispatch; do not wait it out.
@@ -670,105 +724,109 @@ if they still work.
 
 ---
 
-#### Phase 3 (remaining) — port the edge functions
+#### Phase 3 — the API surface. **Rebuilt, not ported.**
 
-> **First decide whether to port them at all.** They are inherited source that
-> has never run under this account, so "port all 25" is a choice, not a
-> migration. Three were already deleted for having no callers at all
-> (`transfer-balance`, `mark-cell`, `manual-sms-verification`), and
-> `bingo-auto-caller` and `force-finish-game` were already marked for deletion
-> below. That is five of 25 gone before writing a line.
->
-> Every one that IS ported carries its current security posture with it unless
-> it is fixed on the way — see the survey in Phase 4. Porting is the cheapest
-> moment to fix them, because nothing depends on the old behaviour yet.
+The decision, and it is settled: **the 25 inherited Deno functions are not being
+ported.** All 25 built their client with `SERVICE_ROLE_KEY`, which bypasses row
+level security — so the 47 RLS policies and the working `auth.uid()` shim did
+nothing on those paths — and all 25 took the caller's identity from the request
+body. Porting would have carried both onto infrastructure built to avoid them.
 
-Target: `services/functions`, one Node/Express container on host port 8080.
-Caddy **already routes** `/functions/v1/*` there, so no proxy work is needed.
+Nothing depended on their behaviour: no deployment, no users, no Supabase
+project. That made it the cheapest moment the design will ever be changed.
 
-The 25 are not equal. Surveyed and categorised:
+**What exists now** (`services/functions`, live in dev):
 
-**A. Delete — do not port (2)**
-
-| Function | Why |
+| Route | Auth |
 |---|---|
-| `bingo-auto-caller` | 123 lines, **0 client references**. `game_tick()` replaced it |
-| `force-finish-game` | 139 lines, 1 reference — [GameRoom.tsx:167](src/components/GameRoom.tsx:167), the browser-driven stuck-game recovery the ticker now owns. Remove the client call too |
+| `POST /auth/telegram` | none — this is where identity is *proved*, via Telegram's `initData` HMAC |
+| `GET /auth/whoami` | bearer token |
+| `GET /healthz`, `/readyz` | none |
 
-**B. Real changes, not mechanical (5)**
+`POST /auth/telegram` returns a 15-minute JWT whose claims are shaped for the
+database:
 
-| Function | Change required |
+```
+sub  = telegram_users.id   the UUID auth.uid() casts to
+role = authenticated       the role the RLS policies name
+```
+
+Every other request goes to **PostgREST** carrying that token. PostgREST puts
+the claims in `request.jwt.claims`, and RLS enforces authorization in the
+database, on every query, whether or not anybody remembered to check.
+
+> `sub` must be the UUID, not the Telegram bigint. The bigint fails the uuid cast
+> in `auth.uid()`, every policy then matches nothing, and it presents as *"the
+> app loads but all the data is empty"* rather than as an error. Verified by
+> feeding real claims to the shim: `auth.uid()` resolved to the right row.
+
+**The rule for every new route: "why can RLS not do this?"** Legitimate answers
+are minting a token, signing with KMS, and talking to Telegram or a chain RPC.
+Plain data access is not one, and goes straight to PostgREST. That rule is what
+stops 25 insecure endpoints reappearing one convenience at a time.
+
+**Still to build**, with the auth each needs — recorded in
+`services/functions/src/index.js` so it sits where the work happens:
+
+| Route | Notes |
 |---|---|
-| `claim-bingo` (99) | **Delete the post-response `setTimeout`.** This is a bug fix, not a port: serverless can freeze the isolate after responding, so winners could never be paid. The ticker owns claim-window finalization via `game_tick()`. The old query also had no game-id filter, so it could finalize the wrong game |
-| `claim-winnings-to-contract` (239) | Sign via **KMS** (`kms:Sign`, key alias `fanosbingo-<env>-wallet-signing`), not a private key from the `settings` table |
-| `credit-win-to-contract` (123) | Same |
-| `get-withdrawal-wallet-info` (73) | Derive the address from the KMS public key — see `scripts/derive-wallet-address.mjs`; the address is already published to SSM at `/fanosbingo-<env>/bsc/hot_wallet_address` |
-| `update-settings` (220) | Allowlist already added in Phase 0. Swap `ADMIN_KEY` for Cognito in Phase 4 |
+| `POST /telegram/webhook` | verify `X-Telegram-Bot-Api-Secret-Token` **strictly**. `setWebhook` must be called WITH `secret_token`, and re-registered BEFORE the check is deployed or the bot goes silent |
+| `POST /wins/credit` | `requireAuth`, debit in the DB, then `addWinCredits` on the contract signed by KMS. **Blocked on the contract existing** |
+| `POST /deposits/confirm` | `requireAuth`. Credit `req.auth.uid` only, never an id from the body |
 
-**C. Mechanical (18).** `Deno.serve(handler)` → Express route, `Deno.env.get(x)`
-→ `process.env.x`, `npm:@supabase/supabase-js` → plain `pg` or direct HTTP to
-PostgREST. Largest is `telegram-bot-webhook` (807 lines) but it is mostly a
-message-handling switch.
-
-Also fold in: **`monitor-deposits` (220) becomes a scheduled job inside the
-ticker container**, not an HTTP route. Today it only runs when an admin clicks a
-button ([DepositManagement.tsx:81](src/components/DepositManagement.tsx:81)),
-which means **deposits are not credited unless someone has the admin page open**.
-
-Suggested batching — prove the path before touching money:
-1. Container skeleton + 2–3 trivial routes (`get-card-layouts`, `mark-cell`) → deploy → verify through Caddy
-2. The other mechanical routes
-3. `claim-bingo` and the KMS signing functions, tested against **BSC testnet** locally first
+Card selection, cell marking and game state are deliberately absent — plain data
+access, belongs in PostgREST under RLS.
 
 ---
 
-#### Phase 4 — auth hardening. **The gate before real money.**
+#### Phase 4 — auth hardening. **Mostly done.**
 
-Four gaps, and they compound:
-
-> **Surveyed against the code on 2026-07-29, and it is worse than the numbers
-> below suggested.** `initData` is not merely unverified — it is *not referenced
-> anywhere in the functions*. There is nothing to verify. Identity is asserted:
-> a `telegram_id` in the request body, trusted as-is.
->
-> **All 25** functions construct their Supabase client with
-> `SERVICE_ROLE_KEY`, which bypasses RLS entirely — so the 47 RLS policies
-> protect nothing on these paths. **All 25** send `Access-Control-Allow-Origin: *`
-> (the doc previously said 15).
->
-> Nine took a caller identity straight from the body with no check at all.
-> Three of those had no callers and were deleted rather than secured; the
-> remaining six are the Phase 4 work:
->
-> | Function | Why it needs auth |
-> |---|---|
-> | `record-withdrawal` | moves money out |
-> | `submit-deposit` | credits money in |
-> | `select-card` / `deselect-card` | spend and refund balance |
-> | `monitor-deposits` | credits deposits |
-> | `telegram-bot-webhook` | must verify `X-Telegram-Bot-Api-Secret-Token` |
->
-> The gate on all of them is the Supabase **anon key**, which is a `VITE_`
-> compile-time variable and therefore baked into the published bundle. It is
-> public by construction — see the note in `.gitignore` saying exactly that.
-
-| Gap | Consequence |
+| Gap | State |
 |---|---|
-| Telegram `initData` HMAC **never verified** | Anyone can claim any Telegram identity. With RLS keyed on `auth.uid()`, that is full account takeover |
-| No wallet signature challenge | A client asserts an address without proving control of it |
-| Admin = one shared string in browser React state | [Admin.tsx:348](src/components/Admin.tsx:348). Non-constant-time compare, no per-admin identity, no audit trail. **6 functions** gate on it |
-| `Access-Control-Allow-Origin: *` on **15 functions** | Includes `process-withdrawal` and `transfer-balance` |
+| `initData` HMAC never verified | ✅ `verifyInitData`, 22 assertions, both directions |
+| CORS `*` on every function | ✅ locked to one origin, falls back to `"null"` not `"*"` so misconfiguration fails closed |
+| Identity taken from the request body | ✅ replaced by proven identity + RLS |
+| No wallet signature challenge | ⬜ SIWE-style nonce, if wallet login is wanted |
+| Admin = one shared string | ⬜ Cognito with TOTP, plus `admin_audit_log` |
 
-Work:
-- An `auth` route that verifies `initData` HMAC against the bot token and mints a
-  short-lived (15 min) JWT whose claims match what PostgREST and Realtime expect.
-  **`app/jwt_secret` in SSM is already shared by both** — a token accepted by one
-  must be accepted by the other.
-- SIWE-style nonce challenge for wallet auth.
-- Cognito user pool with TOTP required; replace `accessKey` React state with a
-  Cognito session; add `admin_audit_log` written on every privileged mutation.
-- Lock CORS to `https://<domain>` — the value is already in SSM at
-  `/fanosbingo-<env>/app/allowed_origin`.
+The admin gap is the significant one left. It is a shared string compared with
+`!==` in browser React state, and six inherited functions gate on it. None of
+those functions run, so nothing is exposed today — but any admin surface built
+on the new service must not reproduce it.
+
+---
+
+#### The money path — written, tested, blocked on one faucet visit
+
+The design is **non-custodial**, and that is worth understanding before touching
+it. From the `20260216` migration:
+
+> Users call `withdraw()` directly on the smart contract.
+> The backend only credits wins via `addWinCredits()`, and **never signs
+> withdrawal transactions.**
+
+So the KMS key's only job is crediting wins. A route that sends BNB from the hot
+wallet would rebuild exactly the custodial model this moved away from.
+
+| Piece | State |
+|---|---|
+| KMS signer — DER parsing, EIP-2 low-s, recovery id | ✅ 19 assertions |
+| Chain-id guard | ✅ verified against the RPC at boot; refuses to start on mismatch |
+| Contract deployment from the KMS key | ✅ `scripts/deploy-contract.mjs`, dry run passes |
+| **Contract deployed** | ⬜ **blocked: the wallet has 0 tBNB** |
+| `POST /wins/credit` | ⬜ needs the contract |
+
+`FanosBingoDeposit` sets `owner = msg.sender` and `addWinCredits` is
+`onlyOwner`, so **the deploying wallet owns it permanently**. Deploy from
+anything other than the KMS key and the backend can never credit a win, with no
+recovery. That is why deployment is a script that signs with KMS and reads
+`owner()` back afterwards, rather than a README step.
+
+> **Chain id comes from SSM, never from `settings`.** Three sources disagreed:
+> the RPC and SSM said 97 (testnet), `settings.deposit_contract_chain_id` said
+> **56 — mainnet**. A signature committing to 56 is a valid mainnet transaction
+> wherever it was produced. The settings table is application data; it must never
+> decide what a signature commits to.
 
 ---
 
@@ -873,9 +931,15 @@ db/
     002_game_tick             THE GAME LOOP — server-authoritative, one transaction
     003_settings_rls_hardening  deny-by-default RLS + anon assertions
 services/
-  ticker/                     Node. Game loop. Only genuinely new code
+  ticker/                     Node. Game loop
   postgrest/ realtime/ caddy/ Thin images over upstream (CA bundle, config)
-  functions/                  EMPTY — Phase 3's remaining work
+  functions/                  Node/Express. Auth + operations RLS cannot express
+    src/index.js              routes, CORS, chain check at boot
+    src/auth.js               initData -> JWT shaped for auth.uid()
+    src/telegram-auth.js      HMAC verification. PLAIN JS so the test imports it
+    src/kms-signer.js         DER -> (r,s,v), EIP-2, recovery by checking
+    src/chain.js              refuses to run if the RPC serves another chain
+    src/*.test.mjs            47 assertions, no AWS, no network
 scripts/
   bootstrap-aws.sh            One-time. Idempotent. State bucket, OIDC, both roles
   bootstrap-github.sh         One-time. Idempotent. Variables, environments,
@@ -888,6 +952,18 @@ scripts/
   verify-detections.sh        Proves the CloudTrail alarms fire AND stay quiet
   verify-cloudflare.sh        Asserts what Terraform cannot enforce (Bot Fight Mode)
   derive-wallet-address.mjs   Address from the KMS public key
+  cloudflare-import.sh        Emits import blocks for DNS that already exists
+  deploy-contract.mjs         Deploys FROM the KMS key, then verifies owner()
+
+.github/workflows/
+  terraform.yml               plan/apply/destroy. Read-only role on PRs
+  deploy-services.yml         build -> ECR -> SSM pointer -> roll (self-triggers TF)
+  db-migrate.yml              versioned + repeatable, through the SSM tunnel
+  sync-secrets.yml            GitHub Secrets -> SSM SecureStrings
+  verify.yml                  WEEKLY. Runs all three assertion scripts
+  db-restore-drill.yml        MONTHLY. Restores, times, verifies, deletes
+  ami-bump.yml                WEEKLY. Opens a PR when a newer AMI ships
+  cloudflare-import.yml       One-time DNS adoption, opens a PR
 docker/rds-global-bundle.pem  Amazon RDS CA, 108 certs. COPYed into images
 supabase/
   migrations/                 104 versioned migrations. NEVER EDIT (see §4)
