@@ -90,7 +90,10 @@ Anonymous key for ${ENVIRONMENT}:
 
 ${jwt}
 
-Put it in .env as VITE_SUPABASE_ANON_KEY, and in the build environment for CI.
+Set it WITHOUT copying it by hand -- transcribing a token is how a variable
+ends up holding a description of a token rather than one:
+
+  gh variable set SPA_ANON_KEY --body "$(node scripts/mint-anon-key.mjs ${ENVIRONMENT} | grep -E '^eyJ')"
 
 It is PUBLIC — it ends up in the compiled bundle. Its authority is whatever RLS
 grants the anon role, and nothing more. Reading player data needs a token from
