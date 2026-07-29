@@ -670,6 +670,32 @@ Suggested batching — prove the path before touching money:
 
 Four gaps, and they compound:
 
+> **Surveyed against the code on 2026-07-29, and it is worse than the numbers
+> below suggested.** `initData` is not merely unverified — it is *not referenced
+> anywhere in the functions*. There is nothing to verify. Identity is asserted:
+> a `telegram_id` in the request body, trusted as-is.
+>
+> **All 25** functions construct their Supabase client with
+> `SERVICE_ROLE_KEY`, which bypasses RLS entirely — so the 47 RLS policies
+> protect nothing on these paths. **All 25** send `Access-Control-Allow-Origin: *`
+> (the doc previously said 15).
+>
+> Nine took a caller identity straight from the body with no check at all.
+> Three of those had no callers and were deleted rather than secured; the
+> remaining six are the Phase 4 work:
+>
+> | Function | Why it needs auth |
+> |---|---|
+> | `record-withdrawal` | moves money out |
+> | `submit-deposit` | credits money in |
+> | `select-card` / `deselect-card` | spend and refund balance |
+> | `monitor-deposits` | credits deposits |
+> | `telegram-bot-webhook` | must verify `X-Telegram-Bot-Api-Secret-Token` |
+>
+> The gate on all of them is the Supabase **anon key**, which is a `VITE_`
+> compile-time variable and therefore baked into the published bundle. It is
+> public by construction — see the note in `.gitignore` saying exactly that.
+
 | Gap | Consequence |
 |---|---|
 | Telegram `initData` HMAC **never verified** | Anyone can claim any Telegram identity. With RLS keyed on `auth.uid()`, that is full account takeover |
