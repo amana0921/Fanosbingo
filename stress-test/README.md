@@ -1,5 +1,24 @@
 # Bingo Stress Testing Suite
 
+> ## Never run against the current infrastructure
+>
+> ✅ 2026-07-29: **this suite has never been run** on the AWS stack, so the
+> 400-concurrent target is an aspiration rather than a measurement.
+>
+> That matters because the whole architecture rests on one unvalidated
+> assumption: that a single `t4g.small` running five containers can carry the
+> load. Nothing has tested it. `AGENTS.md` §7 lists "confirm instance memory
+> stays under ~1.6 GB" as the check that would validate the instance class.
+>
+> **Point it at this API, not at Supabase.** `stress-test/.env.example` still
+> names `your-project.supabase.co`; there is no Supabase project. Use
+> `https://api.<domain>` and an anon key from `scripts/mint-anon-key.mjs`.
+>
+> **Run it against `dev` only**, and expect it to trip alarms — that is the
+> point. `fanosbingo-dev-rds-connections-high` and the CPU-credit alarms are the
+> ones to watch, since a burstable instance does not degrade gracefully once its
+> credits are gone.
+
 Comprehensive stress testing framework for testing the bingo application with 400 concurrent users joining within 10-30 seconds.
 
 ## Overview

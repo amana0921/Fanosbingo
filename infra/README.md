@@ -5,8 +5,26 @@ growth is a configuration change rather than a rewrite.
 
 **State, ✅ verified 2026-07-29:** `dev` and `account` are applied and healthy —
 five services `ACTIVE 1/1`, ten alarms `OK`, CloudTrail logging, a dev plan
-reporting no changes. **`prod` is written and plans cleanly but has never been
-applied.**
+reporting no changes, and the Mini App serving at `app.<domain>`. **`prod` is
+written and plans cleanly but has never been applied.**
+
+### Three hostnames, and what each one is
+
+| Host | Served by | Notes |
+|---|---|---|
+| `app.<domain>` | Caddy, static files | The Mini App. **This is the URL BotFather needs.** Built into the Caddy image |
+| `api.<domain>` | Caddy → PostgREST : 3000, functions : 8080 | `/rest/v1/*` and `/functions/v1/*` |
+| `rt.<domain>` | Caddy → Realtime : 4000 | `/realtime/v1/*`, rewritten to `/socket/*` |
+
+All three must be **proxied** in Cloudflare. The origin admits Cloudflare ranges
+only, so a grey-cloud record black-holes with no error anywhere.
+
+> **`ALLOWED_ORIGIN` on the functions service must equal `https://app.<domain>`
+> exactly.** The app and the API are on different hosts, so every call the Mini
+> App makes is cross-origin. A mismatch fails in the quietest way available: the
+> preflight answers `204`, the access log fills with what look like successful
+> requests, and the browser never sends the POST. `verify.yml` asserts this
+> weekly for exactly that reason.
 
 Engineering context and the reasoning behind these decisions live in
 [../AGENTS.md](../AGENTS.md).
@@ -317,6 +335,23 @@ Terraform **reads** these and never writes them; the deploy workflow owns them.
 The key is fine. Restoring an *encrypted* snapshot makes RDS create a grant on
 the CMK, and the caller needs `kms:CreateGrant`. The error names three possible
 causes and the real one is a fourth.
+
+### The Mini App loads but never logs in
+
+CORS. Look for `204` responses on `/functions/v1/auth/telegram` in the Caddy
+access log — that is the preflight, and a wall of them means the POST is never
+being sent. `ALLOWED_ORIGIN` on the functions service must equal the app's origin
+exactly, and the app is served from `app.<domain>`, not the apex.
+
+The app degrades to the unverified identity from `initDataUnsafe` when auth
+fails, so it shows a name and appears to work. That is the trap.
+
+### A `/functions/v1/...` route returns 404
+
+It is an inherited Deno function name that the rebuilt service never
+implemented. The 25 upstream functions were deliberately not ported — see
+`../AGENTS.md` §7. Decide whether it should be a route at all: most are plain
+data access and belong in PostgREST under RLS.
 
 ### The restore drill reports a plausible RTO, then fails to connect
 

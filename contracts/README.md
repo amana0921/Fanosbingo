@@ -1,5 +1,44 @@
 # Fanos Bingo Smart Contract
 
+> ## Status: NOT DEPLOYED, and how you deploy it matters permanently
+>
+> `settings.deposit_contract_address` is empty. Nothing on the money path works
+> until this is deployed.
+>
+> **The constructor sets `owner = msg.sender`, and `addWinCredits` — the only
+> function the backend ever calls — is `onlyOwner`.** So the deploying wallet
+> owns it forever. Deploy from MetaMask, or from any key that is not the KMS
+> one, and the backend can never credit a win. There is no recovery: you
+> redeploy and migrate balances.
+>
+> Use the script. It signs with the KMS key, so ownership is correct by
+> construction, and it reads `owner()` back afterwards to prove it:
+>
+> ```bash
+> node scripts/deploy-contract.mjs dev              # dry run, checks everything
+> node scripts/deploy-contract.mjs dev --broadcast  # deploys and verifies
+> ```
+>
+> **Blocked on gas.** The signing wallet
+> `0xE509727904C1B057E58BCe7f4eC5bFb120D5adDF` holds 0 tBNB. Testnet gas is free:
+> https://testnet.bnbchain.org/faucet-smart
+>
+> Deploying **will** fire the `unexpected-kms-sign` alarm, because a human
+> signing with the wallet key is exactly the rare event it exists to surface.
+> Confirm CloudTrail shows your principal.
+
+## The withdrawal model is non-custodial
+
+Worth understanding before changing anything here. From migration `20260216`:
+
+> Users call `withdraw()` directly on the contract.
+> The backend only credits wins via `addWinCredits()`, and **never signs
+> withdrawal transactions.**
+
+So the operator is not in the withdrawal path, and withdrawal limits are enforced
+**on-chain**. A backend route that sends BNB from the hot wallet would rebuild
+the custodial model this design deliberately moved away from.
+
 ## Overview
 
 This Solidity smart contract handles BNB deposits for the Fanos Bingo game. Users send BNB to the contract, and their game balance is credited automatically.
