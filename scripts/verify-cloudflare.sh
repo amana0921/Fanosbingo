@@ -52,20 +52,43 @@ echo
 # ---------------------------------------------------------------------------
 # The one that silently kills the Telegram integration
 # ---------------------------------------------------------------------------
-BFM="$(cf "/zones/${CLOUDFLARE_ZONE_ID}/bot_management" 2>/dev/null \
-  | jq -r '.result.fight_mode // "unknown"' 2>/dev/null || echo "unknown")"
+# Reported the failure as "could not read (token may lack ...)" and moved on,
+# which is how the single check that cannot be enforced any other way ended up
+# unverified behind a green tick. `2>/dev/null || echo unknown` collapses every
+# possible cause -- wrong permission, wrong plan, network blip -- into one word,
+# and the word is a guess.
+#
+# So: capture the status and the body, and let the CAUSE decide the severity.
+# A missing permission is fixable and therefore a failure. A plan that does not
+# expose the endpoint is not fixable and stays a warning, because a check that
+# can never pass trains people to ignore red runs.
+BFM_BODY="$(curl -sS -o /tmp/cf-bfm.json -w '%{http_code}' \
+  -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+  -H "Content-Type: application/json" \
+  "${API}/zones/${CLOUDFLARE_ZONE_ID}/bot_management" 2>&1 || echo "000")"
 
-case "$BFM" in
-  false)
+BFM="$(jq -r '.result.fight_mode // empty' /tmp/cf-bfm.json 2>/dev/null || true)"
+BFM_ERR="$(jq -r '[.errors[]? | "\(.code): \(.message)"] | join("; ")' /tmp/cf-bfm.json 2>/dev/null || true)"
+
+case "${BFM_BODY}|${BFM}" in
+  200\|false)
     pass "Bot Fight Mode is OFF"
     ;;
-  true)
+  200\|true)
     fail "Bot Fight Mode is ON. Telegram's webhook caller and WebSocket upgrades will be challenged, and Telegram responds by disabling the webhook. Turn it off: Security > Bots."
     ;;
+  403*|401*)
+    fail "cannot read Bot Fight Mode -- HTTP ${BFM_BODY}: ${BFM_ERR:-no detail}. The token is missing a permission; add Zone > Zone Settings > Read and re-run. This is the ONE setting Terraform cannot enforce, so leaving it unreadable means it is unverified."
+    ;;
+  404*)
+    warn "Bot Fight Mode endpoint returned 404 -- not exposed on this zone's plan. ${BFM_ERR:-} Check it by hand: Security > Bots. Not a failure, because no token can make this readable."
+    ;;
   *)
-    warn "could not read Bot Fight Mode (token may lack Zone Settings:Read). Check it by hand: Security > Bots."
+    fail "cannot read Bot Fight Mode -- HTTP ${BFM_BODY}: ${BFM_ERR:-no detail}. Investigate rather than assume; this check exists because the setting cannot be enforced in Terraform."
     ;;
 esac
+
+rm -f /tmp/cf-bfm.json
 
 # ---------------------------------------------------------------------------
 # Proxy status — asserted against the API, not against Terraform state

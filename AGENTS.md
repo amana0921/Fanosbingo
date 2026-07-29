@@ -227,6 +227,13 @@ Bot Fight Mode is the exception: it has no Terraform resource on the free plan.
 mode — read from Cloudflare's API rather than from Terraform state, because a
 dashboard edit does not update state.
 
+> **The API token needs `Zone > Zone Settings > Read`** for that assertion to
+> work. Without it the check cannot read the setting, and the first version of
+> this script reported that as a warning and exited zero — so the one control
+> that cannot be enforced any other way sat unverified behind a green run. It
+> now fails on a missing permission and warns only when the endpoint genuinely
+> is not available on the plan.
+
 **Exactly one root may own the zone.** Dev and prod share a domain, so they share
 a zone, and two Terraform states managing one DNS record is a fight neither wins
 — each apply reverts the other, and the losing side presents as unexplained DNS
