@@ -151,8 +151,27 @@ resource "aws_launch_template" "app" {
     # The EIP association in user_data also runs on the host, not in a
     # container, so it is likewise unaffected.
     #
-    # This takes effect on instance replacement, not on apply -- the ASG's
-    # instance_refresh fires on a launch-template change, which this is.
+    # THIS DOES NOT TAKE EFFECT ON APPLY, and not by itself afterwards either.
+    #
+    # Metadata options are a property of the launch template, so changing this
+    # updates the template in place and creates a new version. The ASG
+    # references `version = "$Latest"`, so that reference does not change --
+    # Terraform sees no diff on the autoscaling group, the instance_refresh
+    # block below is never triggered, and the RUNNING instance keeps hop limit 2
+    # until it is replaced for some unrelated reason.
+    #
+    # Confirmed on the plan for this change: "1 to add, 1 to change" with the
+    # ASG absent from the change set.
+    #
+    # So after applying, start the refresh explicitly:
+    #
+    #   aws autoscaling start-instance-refresh \
+    #     --auto-scaling-group-name <fanosbingo-dev-app-...> \
+    #     --preferences MinHealthyPercentage=0
+    #
+    # That is a 3-5 minute outage on a single-instance deployment -- the same
+    # trade the header comment describes for an AMI bump. Do it deliberately,
+    # not at peak play.
     http_put_response_hop_limit = 1
 
     instance_metadata_tags = "enabled"
