@@ -130,9 +130,15 @@ BEGIN
     WHERE schemaname = 'public'
       AND tablename = 'telegram_users'
       AND cmd IN ('SELECT', 'ALL')
-      -- Privileged server-side code keeps its access. service_role also holds
-      -- BYPASSRLS, so this policy is belt-and-braces rather than load-bearing.
-      AND policyname <> 'Service role has full access to telegram_users'
+      -- Privileged server-side code keeps its access. Matched on the ROLE, not
+      -- on a policy name -- the first version of this exempted the literal
+      -- 'Service role has full access to telegram_users' and the live database
+      -- turned out to have one called 'Service role can manage telegram users',
+      -- which was therefore dropped. Same class of mistake as guessing a name
+      -- in DROP POLICY, which this file already warns about two lines up.
+      -- service_role also holds BYPASSRLS, so nothing broke; the point is that
+      -- name-matching keeps being wrong here.
+      AND NOT ('service_role' = ANY(roles))
   LOOP
     EXECUTE format('DROP POLICY IF EXISTS %I ON telegram_users', v_policy.policyname);
     RAISE NOTICE 'Dropped policy % on telegram_users', v_policy.policyname;
@@ -235,6 +241,35 @@ ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
 -- connect as app_service and inherit service_role -- keeps everything.
 GRANT EXECUTE ON ALL ROUTINES IN SCHEMA public TO service_role;
 
+-- ---------------------------------------------------------------------------
+-- 2b. Drop the superseded get_lobby_data_instant overload
+--
+-- FOUND WHEN THIS MIGRATION FAILED against the real database, which is the only
+-- place it could have been found: `GRANT ... ON FUNCTION public.<name>` raised
+--
+--   ERROR: function name "public.get_lobby_data_instant" is not unique
+--
+-- Three migrations define this function and they do not agree on its arity:
+--
+--   20251222083326  get_lobby_data_instant(bigint)
+--   20251222115912  get_lobby_data_instant(bigint)              <- redefines it
+--   20260216092910  get_lobby_data_instant(bigint, text)        <- ADDS a second
+--
+-- CREATE OR REPLACE only replaces a function with a MATCHING signature, so the
+-- last of those did not supersede the first two -- it created an overload and
+-- left the one-argument version in place, still carrying its original body.
+--
+-- That is not merely untidy. Section 3 below rewrites the two-argument version
+-- so identity comes from the JWT; the one-argument version would have kept
+-- trusting the telegram id in the request body, and PostgREST resolves
+-- {"user_telegram_id": N} to it by exact arity. The guard would have been
+-- shipped, reported as a fix, and bypassable by omitting one field.
+--
+-- Dropping it is safe: the two-argument version defaults user_wallet_address to
+-- NULL, so every call the one-argument version served resolves to it unchanged.
+-- ---------------------------------------------------------------------------
+DROP FUNCTION IF EXISTS public.get_lobby_data_instant(bigint);
+
 -- The allowlist.
 --
 -- Derived from what the SPA actually calls, enumerated from source rather than
@@ -285,21 +320,45 @@ DECLARE
     -- financial data and was readable by anyone before this.
     'get_bnb_withdrawal_stats'
   ];
+  v_sig text;
+  v_n integer;
 BEGIN
+  -- GRANTS ARE ISSUED PER SIGNATURE, not per name.
+  --
+  -- `GRANT ... ON FUNCTION public.<name>` requires the name to be unique and
+  -- fails outright when it is not -- which is how the stale overload in 2b was
+  -- discovered. oid::regprocedure renders the full identity
+  -- (`public.f(bigint,text)`), so overloads are addressed unambiguously and a
+  -- future one cannot silently go ungranted.
   FOREACH v_fn IN ARRAY v_anon LOOP
-    IF EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
-               WHERE n.nspname = 'public' AND p.proname = v_fn) THEN
-      EXECUTE format('GRANT EXECUTE ON FUNCTION public.%I TO anon', v_fn);
-    ELSE
+    v_n := 0;
+    FOR v_sig IN
+      SELECT p.oid::regprocedure::text
+      FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+      WHERE n.nspname = 'public' AND p.proname = v_fn
+    LOOP
+      EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO anon', v_sig);
+      v_n := v_n + 1;
+    END LOOP;
+
+    IF v_n = 0 THEN
       RAISE NOTICE 'Allowlisted function %() does not exist; skipping', v_fn;
+    ELSIF v_n > 1 THEN
+      -- Not fatal, but say so. An allowlisted name with several signatures
+      -- means several bodies are reachable, and only the ones this file
+      -- rewrites have been read.
+      RAISE NOTICE 'Allowlisted %() has % overloads; all granted to anon', v_fn, v_n;
     END IF;
   END LOOP;
 
   FOREACH v_fn IN ARRAY v_authenticated LOOP
-    IF EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
-               WHERE n.nspname = 'public' AND p.proname = v_fn) THEN
-      EXECUTE format('GRANT EXECUTE ON FUNCTION public.%I TO authenticated', v_fn);
-    END IF;
+    FOR v_sig IN
+      SELECT p.oid::regprocedure::text
+      FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+      WHERE n.nspname = 'public' AND p.proname = v_fn
+    LOOP
+      EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO authenticated', v_sig);
+    END LOOP;
   END LOOP;
 END $$;
 
@@ -579,6 +638,33 @@ BEGIN
   END IF;
 
   RAISE NOTICE 'Money-moving functions: not callable by anon or authenticated';
+END $$;
+
+-- 4e. Exactly one get_lobby_data_instant survives, and it is the guarded one.
+--
+--     Section 3 rewrites the two-argument signature. A surviving one-argument
+--     overload would keep the old body -- trusting the telegram id in the
+--     request body -- and PostgREST resolves {"user_telegram_id": N} to it by
+--     exact arity, so the guard would be bypassable by omitting a field. That
+--     was the live state until 2b dropped it, and this is what stops a future
+--     migration from reintroducing it unnoticed.
+DO $$
+DECLARE
+  v_sigs text;
+  v_count integer;
+BEGIN
+  SELECT count(*), string_agg(p.oid::regprocedure::text, ', ')
+  INTO v_count, v_sigs
+  FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+  WHERE n.nspname = 'public' AND p.proname = 'get_lobby_data_instant';
+
+  IF v_count <> 1 THEN
+    RAISE EXCEPTION
+      'Expected exactly one get_lobby_data_instant, found %: %. An overload this file did not rewrite still trusts the caller-supplied telegram id.',
+      v_count, v_sigs;
+  END IF;
+
+  RAISE NOTICE 'get_lobby_data_instant: one signature, identity taken from the token';
 END $$;
 
 -- 4d. A function created by the NEXT migration is not anon-callable the moment
