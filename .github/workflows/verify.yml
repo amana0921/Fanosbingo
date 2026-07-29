@@ -1,0 +1,152 @@
+name: Verify controls
+
+# Runs the three assertions that nothing else runs.
+#
+# WHY THIS EXISTS
+#
+# The repository had grown three verification scripts and executed one of them
+# regularly. That is the same failure this project keeps finding: a control that
+# exists, is well written, and is never exercised.
+#
+#   verify-detections.sh    ran only on an `account` apply -- which happens
+#                           perhaps twice a year. A metric filter edited in the
+#                           console, or an SNS subscription that lapsed, would
+#                           not be noticed until the alarm failed to fire during
+#                           an actual incident.
+#
+#   verify-cloudflare.sh    ran NOWHERE. It asserts Bot Fight Mode is off -- the
+#                           one setting Terraform cannot enforce on the free
+#                           plan, and the one whose failure mode is Telegram
+#                           quietly disabling your webhook hours later.
+#
+#   probe-public-access.sh  ran only after a migration.
+#
+# All three are read-only. Weekly is the right cadence: often enough that drift
+# is caught in days rather than during an incident, rare enough that a green run
+# still means something.
+#
+# EVERY CHECK RUNS EVEN IF AN EARLIER ONE FAILS. A run that stops at the first
+# failure tells you about one problem; this tells you about all of them, which
+# matters when the cause is common to several.
+
+on:
+  schedule:
+    # Mondays 07:00 UTC, an hour after the AMI check, so a Monday morning gives
+    # one combined picture rather than two notifications.
+    - cron: '0 7 * * 1'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to verify'
+        required: true
+        type: choice
+        options: [dev, prod]
+        default: dev
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: verify-${{ github.event.inputs.environment || 'dev' }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify (${{ github.event.inputs.environment || 'dev' }})
+    runs-on: ubuntu-latest
+    env:
+      ENVIRONMENT: ${{ github.event.inputs.environment || 'dev' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the repository is bootstrapped
+        env:
+          ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+        run: |
+          if [ -z "$ACCOUNT_ID" ]; then
+            echo "::error::AWS_ACCOUNT_ID is not set. Run ./scripts/bootstrap-github.sh."
+            exit 1
+          fi
+
+      # The scoped deploy role. Everything below is read-only; a scheduled job
+      # has no business holding a credential that can change anything.
+      - name: Assume AWS role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/fanosbingo-${{ github.event.inputs.environment || 'dev' }}-github-deploy
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: verify-${{ github.run_id }}
+
+      # --- the three assertions, each independent -------------------------
+
+      - name: Security detections fire, and stay quiet
+        id: detections
+        continue-on-error: true
+        run: ./scripts/verify-detections.sh
+
+      - name: Cloudflare settings Terraform cannot enforce
+        id: cloudflare
+        continue-on-error: true
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ZONE_ID: ${{ vars.CLOUDFLARE_ZONE_ID }}
+          DOMAIN_NAME: ${{ vars.DOMAIN_NAME }}
+        run: |
+          if [ -z "${CLOUDFLARE_API_TOKEN}" ] || [ -z "${CLOUDFLARE_ZONE_ID}" ]; then
+            echo "::warning::Cloudflare is not configured, so its settings are unverified. This is the one place Bot Fight Mode would be caught."
+            exit 0
+          fi
+          ./scripts/verify-cloudflare.sh
+
+      - name: Nothing is exposed anonymously
+        id: probe
+        continue-on-error: true
+        env:
+          DOMAIN_NAME: ${{ vars.DOMAIN_NAME }}
+        run: ./scripts/probe-public-access.sh "https://api.${DOMAIN_NAME}"
+
+      # --- verdict --------------------------------------------------------
+      #
+      # continue-on-error above means the job would otherwise report success
+      # regardless of what the checks found. This step is what makes the run's
+      # status mean something.
+      - name: Verdict
+        run: |
+          set -uo pipefail
+
+          detections="${{ steps.detections.outcome }}"
+          cloudflare="${{ steps.cloudflare.outcome }}"
+          probe="${{ steps.probe.outcome }}"
+
+          icon() { [ "$1" = "success" ] && echo "pass" || echo "**FAIL**"; }
+
+          {
+            echo "### Control verification — ${ENVIRONMENT}"
+            echo
+            echo "| Check | Result |"
+            echo "|---|---|"
+            echo "| Security detections (kms:Sign, root usage) | $(icon "$detections") |"
+            echo "| Cloudflare settings (Bot Fight Mode, SSL, proxy) | $(icon "$cloudflare") |"
+            echo "| Anonymous access probe | $(icon "$probe") |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          failed=0
+          for r in "$detections" "$cloudflare" "$probe"; do
+            [ "$r" = "success" ] || failed=$((failed + 1))
+          done
+
+          if [ "$failed" -ne 0 ]; then
+            {
+              echo
+              echo "${failed} check(s) failed. These are assertions about controls that"
+              echo "are supposed to be protecting real money — treat a failure here as"
+              echo "a live gap, not a flaky test."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::${failed} control verification(s) failed."
+            exit 1
+          fi
+
+          echo "::notice::All controls verified."
+          echo >> "$GITHUB_STEP_SUMMARY"
+          echo "All controls verified." >> "$GITHUB_STEP_SUMMARY"

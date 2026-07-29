@@ -314,6 +314,33 @@ data "aws_iam_policy_document" "github_deploy" {
   }
 
   # ---------------------------------------------------------------------
+  # Security control verification
+  #
+  # verify-detections.sh reads the DEPLOYED metric filters back and tests them
+  # against synthetic events. Read-only, and scheduled weekly -- a detector is
+  # only coverage for as long as it still matches the thing it watches, and
+  # nothing else would notice a filter being edited or a subscription lapsing.
+  #
+  # logs:TestMetricFilter evaluates a pattern against strings supplied in the
+  # request. It reads nothing and writes nothing.
+  # ---------------------------------------------------------------------
+  statement {
+    sid    = "VerifySecurityControls"
+    effect = "Allow"
+    actions = [
+      "logs:DescribeLogGroups",
+      "logs:DescribeMetricFilters",
+      "logs:TestMetricFilter",
+      "cloudtrail:GetTrailStatus",
+      "cloudtrail:DescribeTrails",
+      "sns:ListTopics",
+      "sns:ListSubscriptionsByTopic",
+      "cloudwatch:DescribeAlarms",
+    ]
+    resources = ["*"] # None of these read actions supports resource scoping.
+  }
+
+  # ---------------------------------------------------------------------
   # Restore drill
   #
   # Scoped by identifier to instances ending in "-restore-drill", so this role
