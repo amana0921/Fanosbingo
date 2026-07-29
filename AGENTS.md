@@ -227,12 +227,18 @@ Bot Fight Mode is the exception: it has no Terraform resource on the free plan.
 mode — read from Cloudflare's API rather than from Terraform state, because a
 dashboard edit does not update state.
 
-> **The API token needs `Zone > Zone Settings > Read`** for that assertion to
-> work. Without it the check cannot read the setting, and the first version of
-> this script reported that as a warning and exited zero — so the one control
-> that cannot be enforced any other way sat unverified behind a green run. It
-> now fails on a missing permission and warns only when the endpoint genuinely
-> is not available on the plan.
+> **The API token needs `Zone > Bot Management > Read`** for that assertion to
+> work — it is grantable on the free plan, and it is NOT covered by
+> `Zone Settings: Edit`. Without it the endpoint returns `403 / 10000
+> Authentication error`.
+>
+> Full token scope: `Zone:Read`, `DNS:Edit`, `Zone Settings:Edit`,
+> `Zone WAF:Edit`, `Bot Management:Read` — scoped to this zone, not all zones.
+>
+> Getting here took two bugs stacked on each other: the missing permission, and
+> a `jq '// empty'` that discarded `fight_mode: false`. The first version
+> reported both as one warning and exited zero, so the single control that
+> cannot be enforced any other way sat unverified behind a green run.
 
 **Exactly one root may own the zone.** Dev and prod share a domain, so they share
 a zone, and two Terraform states managing one DNS record is a fight neither wins
@@ -589,6 +595,7 @@ Every one of these cost real time.
 
 - A **21-minute hang on "Assume AWS role"** has been observed once. Cancel and re-dispatch; do not wait it out.
 - Piping `psql` into `sed` under `set -e -o pipefail` **discards the error text**. Capture with `2>&1` and print explicitly.
+- `jq '.x // "default"'` fires on **`false`** as well as `null` — `//` is an *alternative* operator, not a null-coalescer. A check reading a boolean flag will silently discard `false`, which is usually the value you most wanted to see. Use `has("x")` to test presence, then stringify.
 - Same shape, different command: `VAR="$(aws ... 2>/dev/null)"` turns an authorisation failure into a bare `exit code 254` with no message anywhere. `set -e` aborts on the assignment before the script's own error handling runs, and the CLI's explanation is already gone. `scripts/db-tunnel.sh` uses an `_aws` wrapper that captures stderr and prints it.
 - A literal ESC byte (`0x1b`) in a workflow file makes YAML unparseable. Check with `grep -P '\x1b'`.
 
