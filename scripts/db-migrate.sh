@@ -185,6 +185,42 @@ update the recorded checksum deliberately:
   applied=$((applied + 1))
 done
 
+# ---------------------------------------------------------------------------
+# Tell PostgREST the schema moved under it.
+#
+# PostgREST builds a schema cache ONCE, at boot. It does not notice DDL. So a
+# migration that adds, drops or changes the signature of anything PostgREST
+# exposes leaves the API serving from a picture of a database that no longer
+# exists — and the failure is not a clean 404.
+#
+# THIS COST A LIVE OUTAGE. db/20-post/004 dropped a superseded overload of
+# get_lobby_data_instant, leaving one signature. The cache still listed two, so
+# every lobby call answered:
+#
+#   PGRST203  Could not choose the best candidate function between:
+#             public.get_lobby_data_instant(user_telegram_id => bigint),
+#             public.get_lobby_data_instant(user_telegram_id => bigint, ...)
+#
+# The migration was correct, the database was correct, and the app was down
+# until the container was restarted by hand. Nothing in the pipeline would have
+# caught it: the migration reported success, and it WAS a success.
+#
+# NOTIFY is how PostgREST is meant to be told (db-channel-enabled defaults to
+# on, channel `pgrst`). It costs nothing, needs no restart, and is safe to send
+# when no listener exists — an unheard NOTIFY is simply discarded.
+#
+# Not fatal if it fails: the migrations are already committed at this point, and
+# a stale cache is recoverable with a restart. Say so loudly instead.
+if [ "$DRY_RUN" = false ] && [ "$applied" -gt 0 ]; then
+  if "${PSQL[@]}" -c "NOTIFY pgrst, 'reload schema'" >/dev/null 2>&1; then
+    info "Told PostgREST to reload its schema cache"
+  else
+    warn "Could not NOTIFY pgrst. If the API starts returning PGRST202/PGRST203,"
+    warn "its schema cache is stale — force a new deployment of the postgrest service:"
+    warn "  aws ecs update-service --cluster fanosbingo-<env> --service postgrest --force-new-deployment"
+  fi
+fi
+
 echo
 if [ "$DRY_RUN" = true ]; then
   info "Dry run: ${applied} would be applied, ${skipped} already recorded"
