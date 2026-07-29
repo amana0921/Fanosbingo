@@ -156,21 +156,24 @@ BEGIN
   RAISE NOTICE 'Verified as anon: no secret settings are readable';
 END $$;
 
--- Same technique for the rest of the sensitive tables, so a permissive policy
--- anywhere else fails the migration instead of being found by probing the live
--- endpoint -- which is how the settings exposure was actually discovered.
-DO $$
-DECLARE
-  v_count bigint;
-BEGIN
-  SET LOCAL ROLE anon;
-
-  SELECT count(*) INTO v_count FROM telegram_users;
-  IF v_count > 0 THEN
-    RESET ROLE;
-    RAISE EXCEPTION 'anon can read % rows from telegram_users (balances).', v_count;
-  END IF;
-
-  RESET ROLE;
-  RAISE NOTICE 'Verified as anon: telegram_users is not readable';
-END $$;
+-- The telegram_users assertion that used to sit here has MOVED to
+-- db/20-post/004, rewritten, because the version here was unsound:
+--
+--   SET LOCAL ROLE anon;
+--   SELECT count(*) INTO v_count FROM telegram_users;
+--   IF v_count > 0 THEN RAISE EXCEPTION ...
+--
+-- It counted ROWS, not POLICIES. telegram_users was empty every time migrations
+-- ran, so it passed while `CREATE POLICY ... TO anon, public USING (true)` --
+-- inherited from 20251229180739 -- was live the whole time. The exposure
+-- appeared the day a real player registered, and a `curl` found it that
+-- afternoon.
+--
+-- The lesson generalises past this one table: an assertion whose result depends
+-- on how much data happens to be present is not testing the control. Its
+-- replacement in 004 interrogates pg_policies and has_function_privilege, so it
+-- holds on an empty database and on a full one alike.
+--
+-- The settings assertion above is NOT affected by this: settings keys exist
+-- regardless of how much data is present, which is exactly why its header says
+-- so.

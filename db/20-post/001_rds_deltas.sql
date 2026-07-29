@@ -121,7 +121,21 @@ GRANT SELECT ON ALL TABLES IN SCHEMA public TO anon;
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
 GRANT ALL ON ALL TABLES IN SCHEMA public TO service_role;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO anon, authenticated, service_role;
-GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO anon, authenticated, service_role;
+
+-- EXECUTE is granted to service_role ONLY.
+--
+-- This line used to read `TO anon, authenticated, service_role`, which was
+-- catastrophic and not obviously so: 30 of the 58 functions in this schema are
+-- SECURITY DEFINER, and eight of those take the caller's own identity as an
+-- ordinary parameter without checking it. The blanket grant made
+-- transfer_balance and process_bnb_withdrawal_request callable by an
+-- unauthenticated HTTP request. Verified against the live dev API before it was
+-- closed; see db/20-post/004 for the probe and the full account.
+--
+-- What anon and authenticated may call is an explicit allowlist, in 004. Adding
+-- to it should be a deliberate line in a diff, not a side effect of a function
+-- being created.
+GRANT EXECUTE ON ALL ROUTINES IN SCHEMA public TO service_role;
 
 -- ---------------------------------------------------------------------------
 -- 5. Sanity assertions

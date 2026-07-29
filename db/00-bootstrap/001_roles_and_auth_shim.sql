@@ -153,6 +153,22 @@ AS $$
   )::jsonb
 $$;
 
+-- EXECUTE granted EXPLICITLY, not inherited.
+--
+-- These three used to rely on PostgreSQL's built-in "new functions are
+-- executable by PUBLIC" default. db/20-post/004 removes that default, because
+-- it is what made six money-moving functions in `public` callable by an
+-- unauthenticated HTTP request without anyone ever writing a GRANT.
+--
+-- Removing it makes this dependency load-bearing in a way that would only
+-- surface on a FRESH database -- a restore drill, or the first prod apply --
+-- where a function added to this schema after 004 has run once would be created
+-- without PUBLIC execute. Every RLS policy in the system calls auth.uid(), so
+-- the symptom would be "permission denied for function uid" on every query, at
+-- the least convenient possible moment.
+GRANT EXECUTE ON FUNCTION auth.uid(), auth.role(), auth.jwt()
+  TO anon, authenticated, service_role;
+
 -- ---------------------------------------------------------------------------
 -- 3. Extensions
 --

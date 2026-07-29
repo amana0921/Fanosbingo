@@ -52,7 +52,49 @@ top to bottom once, then used as reference.
 
 ### The next task, in one line
 
-**Port the routes the app still calls but the API does not serve.** The Mini App
+**Apply `db/20-post/004`.** It is written, tested and unapplied, and until it
+lands the live dev API lets an unauthenticated caller read every player's
+balance and execute the functions that move money. Two findings, both found by
+`curl` against the running system rather than by reading policies:
+
+```bash
+# returns telegram_user_id, username, balance, won_balance, wallet_address
+curl https://api.yisakmesifin.org/rest/v1/telegram_users?select=*
+
+# no token, no apikey -- and it EXECUTES
+curl -X POST https://api.yisakmesifin.org/rest/v1/rpc/transfer_balance \
+  -H 'content-type: application/json' \
+  -d '{"from_telegram_id":<a real player>,"transfer_amount":999999999,"to_telegram_id":<attacker>}'
+# {"success": false, "error": "Insufficient won balance"}
+```
+
+That second response is a **business-logic** rejection, not an authorization
+one. The amount was chosen to exceed the balance so the probe returned before
+any write; with an amount the balance covered, the transfer would have
+completed. The first finding supplies the `telegram_user_id` the second needs.
+
+Causes, and why nothing caught them: an inherited policy
+(`20251229180739_fix_telegram_users_rls_for_lobby.sql`) grants `anon` a
+`USING (true)` read and is never dropped; `db/20-post/001` granted `EXECUTE ON
+ALL FUNCTIONS` to `anon`, and 30 of the 58 functions in `public` are
+`SECURITY DEFINER` with eight taking the caller's identity as an unchecked
+parameter. The guard in `003` asserted exactly this and passed, because it
+counted **rows** on a table that was empty every time migrations ran. See §6.
+
+```bash
+gh workflow run db-migrate.yml -f environment=dev -f dry_run=true
+gh workflow run db-migrate.yml -f environment=dev
+./scripts/probe-public-access.sh https://api.yisakmesifin.org   # must be green after
+```
+
+`scripts/probe-public-access.sh` now fails on both, so this cannot regress
+silently. **Do not deploy the contract before this is applied** — funding the
+money path while an unauthenticated transfer route is open converts an exposure
+into a loss.
+
+### Then: port the routes the app still calls but the API does not serve
+
+The Mini App
 runs inside Telegram today and calls `/functions/v1/get-card-layouts`, among
 others, which 404s — those are inherited Deno function names the rebuilt service
 never implemented.
@@ -144,8 +186,19 @@ configuration being valid.
 
 ### What is NOT done
 
+- **`db/20-post/004` is not applied.** Written and tested against PostgreSQL
+  16.14; the live dev database is still exposed until it runs. See the top of
+  this section.
 - **The routes the app still calls.** `get-card-layouts` and friends are
   inherited Deno names the rebuilt service never implemented. They 404 today.
+- **Wallet login proves nothing.** `get_or_create_wallet_user` and the wallet
+  branch of `get_lobby_data_instant` trust a caller-supplied address: connecting
+  a wallet is not a signature. Left working deliberately rather than breaking
+  the flow, and it needs a sign-in-with-Ethereum challenge before mainnet. The
+  Telegram path is now proven end to end.
+- **The admin count.** `Admin.tsx:206` counts all of `telegram_users` and will
+  return 0 once 004 lands. It only worked because the table was world-readable;
+  it should come back as an explicit admin policy.
 - **The bot webhook.** Requirements in `services/functions/src/index.js`.
 - **The contract.** Written, deployable, blocked on a free faucet visit.
 - **Prod.** Terraform is complete and plans cleanly; it has never been applied.
@@ -655,6 +708,9 @@ Every one of these cost real time.
 | `no schema has been selected to create in` | **Textually identical** whether the schema is missing *or* the role lacks CREATE on it. Check ownership before assuming absence |
 | `must not contain non-printable control characters` | RDS treats any non-ASCII as non-printable. **Keep every AWS-bound string plain ASCII** (an em-dash in a description fails the apply) |
 | A `DROP POLICY IF EXISTS` that does nothing | Wrong name = **silent no-op**, and PostgreSQL **ORs permissive policies**. Enumerate `pg_policies`; never guess a name |
+| An RLS assertion that passes while the data is exposed | `SELECT count(*) ... IF count > 0 THEN RAISE` tests **rows**, not **policies**, and passes vacuously on an empty table. Assert against `pg_policies` / `has_function_privilege` instead — those hold on an empty database *and* a full one |
+| `ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC` | Reports success, writes **no** `pg_default_acl` row, and has **no effect**. The PUBLIC-executes-functions rule is a **database-wide** default; a per-schema entry can only add to it. Drop `IN SCHEMA` and it works. Verified on PG 16.14 |
+| `permission denied for function uid` on every query | Something revoked the PUBLIC EXECUTE default and `auth.uid()` was relying on it. `db/00-bootstrap/001` now grants it explicitly — do not remove that |
 
 ### AWS
 
