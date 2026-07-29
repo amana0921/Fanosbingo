@@ -192,6 +192,11 @@ module "app_stack" {
   wallet_signing_key_id   = module.kms.wallet_signing_key_id
   metric_namespace        = module.iam.metric_namespace
 
+  # Must match what the ssm module publishes, and what the RPC actually serves.
+  # The service checks the latter at startup and refuses to run on a mismatch.
+  bsc_chain_id    = 97
+  bsc_rpc_primary = "https://data-seed-prebsc-1-s1.binance.org:8545"
+
   image_overrides = local.image_overrides
 }
 
