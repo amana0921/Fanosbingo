@@ -1,0 +1,20 @@
+{
+  "name": "fanosbingo-functions",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Auth and privileged operations. Everything else goes to PostgREST, where RLS enforces authorization.",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node src/telegram-auth.test.mjs"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "jsonwebtoken": "^9.0.2",
+    "pg": "^8.13.1"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

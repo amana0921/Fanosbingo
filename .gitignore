@@ -48,3 +48,6 @@ terraform.rc
 
 # Bootstrap handoff. Contains the AWS account id; not secret, not repo content.
 .bootstrap-output.json
+
+# Service dependencies are installed in the image, not committed.
+services/*/node_modules
