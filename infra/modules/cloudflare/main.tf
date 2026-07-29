@@ -67,6 +67,19 @@ resource "cloudflare_dns_record" "api" {
   comment = "Fanos Bingo API. Proxied: the origin security group admits Cloudflare ranges only."
 }
 
+# The Mini App. Proxied like the others -- the origin admits Cloudflare only, so
+# a DNS-only record here would black-hole exactly as it would for the API.
+resource "cloudflare_dns_record" "app" {
+  zone_id = var.zone_id
+  name    = "app.${var.domain_name}"
+  type    = "A"
+  content = var.origin_ip
+  proxied = true
+  ttl     = 1
+
+  comment = "Fanos Bingo Mini App, served by Caddy. This is the URL BotFather needs."
+}
+
 resource "cloudflare_dns_record" "realtime" {
   zone_id = var.zone_id
   name    = "rt.${var.domain_name}"

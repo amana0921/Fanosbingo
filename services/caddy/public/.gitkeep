@@ -1,0 +1,3 @@
+# The built SPA lands here in CI, and is COPYed into the Caddy image.
+# Kept in git so the Dockerfile's COPY always has a source, even on a build
+# where the SPA was not rebuilt.
