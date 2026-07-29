@@ -17,7 +17,8 @@
     "stress:sustained": "cd stress-test && ./run-test.sh sustained",
     "stress:gradual": "cd stress-test && ./run-test.sh gradual",
     "stress:all": "cd stress-test && ./run-test.sh all",
-    "stress:full-suite": "cd stress-test && ./full-test-suite.sh"
+    "stress:full-suite": "cd stress-test && ./full-test-suite.sh",
+    "test:auth": "node supabase/functions/_shared/telegram-auth.test.mjs"
   },
   "dependencies": {
     "@reown/appkit": "^1.8.17",

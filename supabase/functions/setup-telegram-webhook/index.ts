@@ -64,6 +64,21 @@ Deno.serve(async (req: Request) => {
 
     const webhookUrl = `${Deno.env.get("SUPABASE_URL")}/functions/v1/telegram-bot-webhook`;
 
+    // Refuse to register a webhook that cannot be authenticated. Registering
+    // without a secret is precisely the state being repaired, so doing it
+    // silently on a missing env var would quietly undo the fix.
+    const webhookSecret = Deno.env.get("TELEGRAM_WEBHOOK_SECRET") ?? "";
+    if (!webhookSecret) {
+      return new Response(
+        JSON.stringify({
+          error: "TELEGRAM_WEBHOOK_SECRET is not set",
+          detail:
+            "Refusing to register a webhook with no secret_token -- Telegram would send no verifiable header and the handler would reject every delivery. Set it with: supabase secrets set TELEGRAM_WEBHOOK_SECRET=...",
+        }),
+        { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+      );
+    }
+
     const telegramResponse = await fetch(
       `https://api.telegram.org/bot${botToken}/setWebhook`,
       {
@@ -71,8 +86,16 @@ Deno.serve(async (req: Request) => {
         headers: {
           "Content-Type": "application/json",
         },
+        // secret_token is what makes the webhook verifiable at all. Telegram
+        // echoes it in X-Telegram-Bot-Api-Secret-Token on every delivery, and
+        // without it the handler has no way to tell Telegram from anyone else
+        // who knows the URL -- which is how this webhook accepted forged
+        // updates for months.
+        //
+        // Telegram accepts 1-256 chars of A-Z a-z 0-9 _ -
         body: JSON.stringify({
           url: webhookUrl,
+          secret_token: webhookSecret,
         }),
       }
     );

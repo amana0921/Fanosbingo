@@ -1,5 +1,6 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "npm:@supabase/supabase-js@2";
+import { verifyWebhookSecret } from "../_shared/telegram-auth.js";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -97,6 +98,41 @@ Deno.serve(async (req: Request) => {
     return new Response(null, {
       status: 200,
       headers: corsHeaders,
+    });
+  }
+
+  // AUTHENTICATE FIRST, before reading the body or touching the database.
+  //
+  // This handler processes balance and withdrawal commands, and until now it
+  // accepted a POST from anyone who knew the URL -- no signature, no secret, no
+  // check of any kind. Forging an update meant impersonating any player to the
+  // bot.
+  //
+  // Strict on a missing header, deliberately. "Verify it if present" is not a
+  // check: a forger simply omits it.
+  //
+  // DEPLOY ORDER MATTERS. Telegram only sends this header if setWebhook was
+  // called with secret_token. Deploy setup-telegram-webhook, RUN it, and only
+  // then deploy this -- the reverse takes the bot down until someone notices.
+  const secretCheck = verifyWebhookSecret(
+    req,
+    Deno.env.get("TELEGRAM_WEBHOOK_SECRET") ?? "",
+  );
+
+  if (!secretCheck.ok) {
+    // Logged, because a spike here is somebody probing the endpoint. The
+    // response says nothing useful, so a prober learns only that it failed.
+    console.warn(
+      JSON.stringify({
+        level: "warn",
+        event: "webhook_auth_rejected",
+        reason: secretCheck.reason,
+      }),
+    );
+
+    return new Response(JSON.stringify({ error: "unauthorized" }), {
+      status: 401,
+      headers: { ...corsHeaders, "Content-Type": "application/json" },
     });
   }
 
