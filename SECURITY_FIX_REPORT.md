@@ -1,5 +1,18 @@
 # SMS Verification Security Fix Report
 
+> ### 📥 Inherited document — verify before acting on it
+>
+> This predates the AWS rebuild and describes the upstream project's **Supabase**
+> deployment. There is no Supabase project here: no `config.toml`, no `.env`, no
+> project ref. Any instruction below involving `supabase.co`, edge-function
+> deployment, or `SUPABASE_URL` does not apply.
+>
+> Kept because the DESIGN reasoning is often still valid and worth reading. The
+> operational steps are not.
+>
+> Current state: [README.md](README.md) · [AGENTS.md](AGENTS.md) ·
+> [infra/README.md](infra/README.md)
+
 ## Executive Summary
 
 This report documents a critical security vulnerability that was discovered and fixed in the SMS verification system. The vulnerability allowed users to create fake bank deposit confirmations and credit their accounts without making real deposits.

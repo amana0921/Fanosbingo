@@ -1,5 +1,18 @@
 # Balance Transfer System Update
 
+> ### 📥 Inherited document — verify before acting on it
+>
+> This predates the AWS rebuild and describes the upstream project's **Supabase**
+> deployment. There is no Supabase project here: no `config.toml`, no `.env`, no
+> project ref. Any instruction below involving `supabase.co`, edge-function
+> deployment, or `SUPABASE_URL` does not apply.
+>
+> Kept because the DESIGN reasoning is often still valid and worth reading. The
+> operational steps are not.
+>
+> Current state: [README.md](README.md) · [AGENTS.md](AGENTS.md) ·
+> [infra/README.md](infra/README.md)
+
 ## Summary of Changes
 
 This update enables users to transfer both deposited and won balance, and fixes the hardcoded external bot URL issue.
