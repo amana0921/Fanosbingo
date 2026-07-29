@@ -711,6 +711,8 @@ Every one of these cost real time.
 | An RLS assertion that passes while the data is exposed | `SELECT count(*) ... IF count > 0 THEN RAISE` tests **rows**, not **policies**, and passes vacuously on an empty table. Assert against `pg_policies` / `has_function_privilege` instead — those hold on an empty database *and* a full one |
 | `ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC` | Reports success, writes **no** `pg_default_acl` row, and has **no effect**. The PUBLIC-executes-functions rule is a **database-wide** default; a per-schema entry can only add to it. Drop `IN SCHEMA` and it works. Verified on PG 16.14 |
 | `permission denied for function uid` on every query | Something revoked the PUBLIC EXECUTE default and `auth.uid()` was relying on it. `db/00-bootstrap/001` now grants it explicitly — do not remove that |
+| `PGRST203 Could not choose the best candidate function` after a **successful** migration | PostgREST builds its schema cache **at boot** and does not notice DDL. Dropping or changing a function signature leaves it serving from a database that no longer exists. `db-migrate.sh` now sends `NOTIFY pgrst, 'reload schema'`; if that ever fails, `aws ecs update-service --service postgrest --force-new-deployment`. This took the lobby down once |
+| `CREATE OR REPLACE FUNCTION` that does not replace | It only replaces a **matching signature**. Add a parameter and you have created an **overload**, with the old body still live and still reachable. Three migrations did this to `get_lobby_data_instant`. Check `pg_proc` for the name before assuming your version is the only one |
 
 ### AWS
 
