@@ -86,6 +86,62 @@ https://api.{$DOMAIN}:{$HTTPS_PORT:443} {
 }
 
 # ---------------------------------------------------------------------------
+# The Mini App itself
+#
+# Served from here rather than S3 + CloudFront, deliberately. This stack's whole
+# shape is "Cloudflare is the CDN, one instance is the origin" -- no ALB, no NAT,
+# no WAF. Putting CloudFront behind Cloudflare would be a second CDN in front of
+# the first, which is exactly what the apex records avoid, plus an ACM
+# certificate and DNS validation for no benefit at this size.
+#
+# The build is baked into the image, so a deploy is one artifact with one version
+# and a rollback is re-deploying an older tag. Cloudflare caches the hashed
+# assets at its edge, so an instance replacement does not blank the app for
+# everyone -- only for whoever misses the cache during those few minutes.
+#
+# Revisit at Stage 2: once there is a second instance, or once the app must stay
+# up while the origin is down, S3 + CloudFront becomes worth its complexity.
+# ---------------------------------------------------------------------------
+https://app.{$DOMAIN}:{$HTTPS_PORT:443} {
+	tls /etc/caddy/certs/origin.pem /etc/caddy/certs/origin.key
+
+	log {
+		output stdout
+		format json
+	}
+
+	root * /srv/app
+
+	# Hashed filenames, so the content at a given URL can never change. A year is
+	# the conventional maximum and `immutable` stops revalidation entirely.
+	# Vite emits `index-RO1vvAQ2.js` -- a HYPHEN before the hash, not a dot. An
+	# earlier version of this matcher expected a dot and therefore matched
+	# nothing, so every asset was served with no cache header at all. It looked
+	# correct and quietly cost a full re-download on every visit.
+	@hashed path_regexp [-.][0-9a-zA-Z_-]{8,}\.(js|css|woff2?|png|jpe?g|svg|webp|avif)$
+	header @hashed Cache-Control "public, max-age=31536000, immutable"
+
+	# index.html must NOT be cached. It is the file that names the current
+	# bundle, so a stale copy pins players to an old build indefinitely -- the
+	# classic way a deploy appears to do nothing for some users and not others.
+	@html path *.html /
+	header @html Cache-Control "no-cache, must-revalidate"
+
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		# No X-Frame-Options / frame-ancestors: a Telegram Mini App is loaded
+		# inside Telegram's own webview, and denying framing would break it.
+		-Server
+	}
+
+	# SPA routing: unknown paths are client-side routes, not 404s. try_files
+	# falls back to index.html so a deep link works on first load.
+	try_files {path} /index.html
+	file_server
+}
+
+# ---------------------------------------------------------------------------
 # Realtime
 #
 # Two rewrites here are mandatory, and both were established by running the

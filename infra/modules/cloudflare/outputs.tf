@@ -3,6 +3,11 @@ output "api_hostname" {
   value       = cloudflare_dns_record.api.name
 }
 
+output "app_hostname" {
+  description = "The Mini App URL. This is what goes into BotFather."
+  value       = cloudflare_dns_record.app.name
+}
+
 output "realtime_hostname" {
   description = "Proxied Realtime hostname."
   value       = cloudflare_dns_record.realtime.name

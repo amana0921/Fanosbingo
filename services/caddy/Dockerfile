@@ -17,6 +17,15 @@ FROM docker.io/library/caddy:2.8-alpine
 COPY services/caddy/Caddyfile /etc/caddy/Caddyfile
 COPY services/caddy/entrypoint.sh /usr/local/bin/entrypoint.sh
 
+# The built Mini App.
+#
+# Assembled by the deploy workflow into services/caddy/public before this build
+# runs -- on the runner, natively, because a vite build under QEMU arm64 is
+# needlessly slow. The directory is committed with only a .gitkeep so this COPY
+# always has a source; a build that did not rebuild the SPA simply ships an
+# empty one, and app.<domain> then serves 404s rather than failing to build.
+COPY services/caddy/public /srv/app
+
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
 # 80 is not exposed: Cloudflare connects to the origin on 443 only, and the

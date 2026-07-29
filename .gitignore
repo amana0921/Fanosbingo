@@ -51,3 +51,7 @@ terraform.rc
 
 # Service dependencies are installed in the image, not committed.
 services/*/node_modules
+
+# Built SPA, assembled in CI and baked into the Caddy image. Never committed.
+services/caddy/public/*
+!services/caddy/public/.gitkeep

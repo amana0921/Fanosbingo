@@ -117,6 +117,47 @@ jobs:
 
       - uses: docker/setup-buildx-action@v3
 
+      # The Mini App is baked into the Caddy image, so it is built here first --
+      # natively on the runner, because a vite build under QEMU arm64 is
+      # needlessly slow, and the output is static either way.
+      #
+      # VITE_ variables are COMPILE-TIME: whatever is set here is inlined into
+      # the bundle and shipped to every browser. Nothing secret belongs in them,
+      # and the anon key is public by design.
+      - uses: actions/setup-node@v4
+        if: github.event.inputs.service == 'caddy'
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Build the Mini App
+        if: github.event.inputs.service == 'caddy'
+        env:
+          VITE_SUPABASE_URL: https://api.${{ vars.DOMAIN_NAME }}
+          VITE_API_BASE_URL: https://api.${{ vars.DOMAIN_NAME }}
+          VITE_SUPABASE_ANON_KEY: ${{ vars.SPA_ANON_KEY }}
+          VITE_REOWN_PROJECT_ID: ${{ vars.REOWN_PROJECT_ID }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${VITE_SUPABASE_ANON_KEY}" ]; then
+            echo "::error::SPA_ANON_KEY is not set. Generate it with 'node scripts/mint-anon-key.mjs ${ENVIRONMENT}' and set it with 'gh variable set SPA_ANON_KEY'. Without it the app cannot reach PostgREST at all."
+            exit 1
+          fi
+
+          npm ci --no-audit --no-fund
+          npx vite build --outDir services/caddy/public --emptyOutDir
+
+          echo "Built $(find services/caddy/public -type f | wc -l) files"
+
+          # A bundle still naming supabase.co would mean the environment did not
+          # reach the build, and the app would fail at runtime against a host
+          # that does not exist.
+          if grep -rq "supabase\.co" services/caddy/public/assets 2>/dev/null; then
+            echo "::error::the built bundle still references supabase.co"
+            exit 1
+          fi
+
       - name: Build and push
         id: build
         uses: docker/build-push-action@v6
