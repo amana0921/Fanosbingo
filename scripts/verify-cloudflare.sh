@@ -67,7 +67,15 @@ BFM_BODY="$(curl -sS -o /tmp/cf-bfm.json -w '%{http_code}' \
   -H "Content-Type: application/json" \
   "${API}/zones/${CLOUDFLARE_ZONE_ID}/bot_management" 2>&1 || echo "000")"
 
-BFM="$(jq -r '.result.fight_mode // empty' /tmp/cf-bfm.json 2>/dev/null || true)"
+# NOT `.result.fight_mode // empty`.
+#
+# jq's `//` is an ALTERNATIVE operator, and it fires on `false` as well as on
+# `null`. So `false // empty` is empty -- and `false` is precisely the value
+# this check wants to see, because it means Bot Fight Mode is OFF. The guard
+# meant to handle a missing field was silently discarding the good answer.
+#
+# Ask whether the key EXISTS, then stringify whatever it holds.
+BFM="$(jq -r 'if (.result? | objects | has("fight_mode")) then (.result.fight_mode | tostring) else "absent" end' /tmp/cf-bfm.json 2>/dev/null || echo "absent")"
 BFM_ERR="$(jq -r '[.errors[]? | "\(.code): \(.message)"] | join("; ")' /tmp/cf-bfm.json 2>/dev/null || true)"
 
 case "${BFM_BODY}|${BFM}" in
@@ -76,6 +84,9 @@ case "${BFM_BODY}|${BFM}" in
     ;;
   200\|true)
     fail "Bot Fight Mode is ON. Telegram's webhook caller and WebSocket upgrades will be challenged, and Telegram responds by disabling the webhook. Turn it off: Security > Bots."
+    ;;
+  200\|absent)
+    fail "the bot_management response has no fight_mode field. The API shape has changed, so this assertion is no longer checking anything -- fix it rather than trusting it."
     ;;
   403*|401*)
     fail "cannot read Bot Fight Mode -- HTTP ${BFM_BODY}: ${BFM_ERR:-no detail}. The token is missing a permission; add Zone > Zone Settings > Read and re-run. This is the ONE setting Terraform cannot enforce, so leaving it unreadable means it is unverified."
