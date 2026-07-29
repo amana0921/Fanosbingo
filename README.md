@@ -28,15 +28,20 @@ A real-time, multiplayer bingo game built as a Telegram Mini App with full on-ch
 Supabase project belonging to the upstream repository this is forked from. It is
 being rebuilt on infrastructure this project owns.
 
+**The game runs.** It loads inside Telegram at
+[app.yisakmesifin.org](https://app.yisakmesifin.org), the board renders and the
+countdown ticks — driven by a server-side game loop, not by a browser tab.
+
 | Layer | State |
 |---|---|
 | Infrastructure (VPC, RDS, ECS, KMS, CloudTrail) | live in **dev**, Terraform, applied through CI |
-| Database | PostgreSQL 16 on RDS, 109 migrations, PITR |
+| Database | PostgreSQL 16 on RDS, 109 migrations, PITR, restore drilled monthly |
 | API (PostgREST) · realtime · game loop · TLS | running |
 | Auth service | running — Telegram `initData` verified, JWT enforced by RLS |
-| Smart contract | **not deployed** — the only thing blocking the money path |
-| Frontend | still points at Supabase, not at this API |
-| Production | Terraform written, never applied |
+| Mini App | served from Caddy at `app.<domain>`, built into the image |
+| Some API routes | **404** — inherited function names the rebuilt service never implemented |
+| Smart contract | **not deployed** — blocked on a free faucet visit |
+| Production | Terraform written, plans cleanly, never applied |
 
 Engineering detail, decisions and their reasons live in **[AGENTS.md](AGENTS.md)**.
 Read it before changing anything; most of it was learned expensively.
@@ -87,8 +92,20 @@ terraform fmt -check -recursive infra/
 
 Ordered by what unblocks the most.
 
-**1. Deploy the smart contract.** Free, and it is the only blocker on the entire
-money path. Fund the wallet from the BSC testnet faucet, then:
+**1. Serve the routes the app calls.** The Mini App calls
+`/functions/v1/get-card-layouts` and others that 404 — inherited Deno function
+names the rebuilt service never implemented. Get the real list from the app:
+
+```bash
+grep -rnoE "functions\.invoke\(['\"][a-z-]+|functions/v1/[a-z-]+" src/ \
+  | sed -E "s/.*(invoke\(['\"]|v1\/)//" | sort -u
+```
+
+For each, ask **"why can RLS not do this?"** Most are plain data access and
+belong in PostgREST as `supabase.from()` calls, not as routes.
+
+**2. Deploy the smart contract.** Free, and the only blocker on the money path.
+Fund the wallet from the BSC testnet faucet, then:
 
 ```bash
 node scripts/deploy-contract.mjs dev              # dry run — checks everything
@@ -98,14 +115,9 @@ node scripts/deploy-contract.mjs dev --broadcast  # deploys, verifies owner()
 The deploying wallet becomes the contract owner **permanently**, so this must be
 signed by the KMS key. The script does that and reads `owner()` back to prove it.
 
-**2. Point the frontend at this API.** The URL shape was preserved deliberately
-(`/rest/v1`, `/realtime/v1`, `/functions/v1`), so the ~200 `supabase.from()` call
-sites and 10 realtime subscriptions should work unchanged. Then delete the
-client-side game logic the ticker replaced.
-
 **3. Finish the API surface.** `POST /telegram/webhook` (verify the secret
 strictly), `POST /wins/credit` (needs the contract), `POST /deposits/confirm`.
-Every new route must answer *"why can RLS not do this?"*.
+Requirements for each are recorded in `services/functions/src/index.js`.
 
 **4. Replace the admin key.** A shared string compared with `!==` in browser
 state. Cognito with TOTP, and an audit log on every privileged mutation.
@@ -115,7 +127,9 @@ applied. Needs mainnet values, a funded wallet, and `PROD_APPLY_ENABLED=true`.
 Run the restore drill against prod once — dev's 8–11 minute figure is not prod's.
 
 **Known gaps, deliberately accepted:** single instance in a single AZ (~3–5 min
-MTTR); no load test yet at the 400-concurrent target; runbooks unwritten.
+MTTR); the SPA is served from that same instance, so a replacement blanks it for
+anyone who misses Cloudflare's cache; no load test yet at the 400-concurrent
+target, so `t4g.small` is unvalidated under load; runbooks unwritten.
 
 ---
 

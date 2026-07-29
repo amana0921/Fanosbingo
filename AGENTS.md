@@ -52,20 +52,29 @@ top to bottom once, then used as reference.
 
 ### The next task, in one line
 
-**Fund the dev wallet from the testnet faucet, then deploy the contract.**
-Everything else on the money path is written, tested and blocked behind it.
+**Port the routes the app still calls but the API does not serve.** The Mini App
+runs inside Telegram today and calls `/functions/v1/get-card-layouts`, among
+others, which 404s — those are inherited Deno function names the rebuilt service
+never implemented.
 
+Find the full list from the app itself rather than from this document:
+
+```bash
+grep -rnoE "functions\.invoke\(['\"][a-z-]+|functions/v1/[a-z-]+" src/ | sed -E "s/.*(invoke\(['\"]|v1\/)//" | sort -u
 ```
-https://testnet.bnbchain.org/faucet-smart   ->  0xE509727904C1B057E58BCe7f4eC5bFb120D5adDF
-node scripts/deploy-contract.mjs dev              # dry run, checks everything
-node scripts/deploy-contract.mjs dev --broadcast  # deploys, verifies owner()
-```
 
-It is free — testnet tBNB comes from a faucet. Only prod needs real BNB.
+Then, for each, ask the question that governs this codebase: **why can RLS not
+do this?** Most are plain data access and should become `supabase.from()` calls
+against PostgREST, not routes. See §7.
 
-If you would rather do something that needs no chain at all, the highest-value
-work is **pointing the SPA at this API** (§7, Phase 5). The auth service is live
-and verified; nothing uses it yet.
+**Two other things are one step from working:**
+
+- The contract needs deploying, which needs the dev wallet funded. Free, from a
+  faucet: `https://testnet.bnbchain.org/faucet-smart` → `0xE509727904C1B057E58BCe7f4eC5bFb120D5adDF`,
+  then `node scripts/deploy-contract.mjs dev --broadcast`. Everything else on the
+  money path is written and tested behind it.
+- The bot webhook is unbuilt. Requirements are recorded in
+  `services/functions/src/index.js`.
 
 ### Three things that are true and easy to get wrong
 
@@ -79,11 +88,17 @@ and verified; nothing uses it yet.
 
 ### Operational hardening that has landed since
 
-**Applied to `dev` and `account` on 2026-07-28.** Prod is written but still
-unapplied. Verified after the fact rather than assumed: four services `ACTIVE
-1/1` through the `moved` refactor with no outage, both game-loop alarms in `OK`
-reading the ticker's live metric, the trail logging, and all twelve detector
-assertions passing.
+**Applied to `dev` and `account`. Prod is written, plans cleanly, never applied.**
+
+✅ Verified 2026-07-29, against the running system rather than assumed:
+
+- **five** services `ACTIVE 1/1` — ticker, postgrest, realtime, caddy, functions
+- the Mini App loads inside Telegram and the game loop counts down
+- `app.yisakmesifin.org` serves the SPA; the bundle names this API and no
+  `supabase.co`; the anon key extracted FROM the served bundle is accepted by
+  PostgREST
+- ten alarms `OK`, CloudTrail logging, twelve detector assertions passing
+- a dev plan reporting no changes
 
 | Change | Why |
 |---|---|
@@ -97,6 +112,10 @@ assertions passing.
 | Deployment circuit breaker | A bad image left the service down instead of rolling back |
 | Cloudflare in Terraform | Half the origin lock was dashboard state |
 | Monthly restore drill | The `~25 min` MTTR had never been measured. It is now 8–11 min to a restored instance |
+| `bootstrap-github.sh` | The prod gate depended on somebody having ticked a checkbox |
+| `services/functions` — auth service | Rebuilt rather than ported. All 25 inherited functions bypassed RLS with the service-role key |
+| SPA served from Caddy at `app.<domain>` | The frontend had never been hosted anywhere, so there was no URL for BotFather |
+| SPA authenticates against this API | It took its identity from `initDataUnsafe` — Telegram's own word for "not verified" |
 
 Between them these changes surfaced **six defects that `terraform validate` could
 not catch**, every one found by running the thing rather than checking it:
@@ -113,19 +132,27 @@ not catch**, every one found by running the thing rather than checking it:
    and reports success *with a plausible RTO* before failing at verification.
 6. `cache_level = "bypass"` is not a valid zone setting; bypass is a cache RULE.
    The provider types the value as a string, so only Cloudflare rejects it.
+7. `ALLOWED_ORIGIN` was the apex while the app is served from `app.<domain>`.
+   The preflight answered 204 forty-one times, the access log looked healthy,
+   and the browser silently never sent a single POST — so the app fell back to
+   the unverified identity and *appeared to work*.
 
-Four of the six were in code paths that had never executed before. Tightening
+Four of the seven were in code paths that had never executed before. Tightening
 permissions moves failures from "never happens" to "happens the first time you
 actually use it", which is why exercising each path once matters more than the
 configuration being valid.
-| `bootstrap-github.sh` | The prod gate depended on somebody having ticked a checkbox |
 
-### What this session did NOT do
+### What is NOT done
 
-- Port the 25 edge functions (Phase 3's remainder)
-- Any of Phase 4, 5 or 6
-- Apply prod — it exists in Terraform and has never run
-- Sweep the old BSC wallet (**operator action, still outstanding**)
+- **The routes the app still calls.** `get-card-layouts` and friends are
+  inherited Deno names the rebuilt service never implemented. They 404 today.
+- **The bot webhook.** Requirements in `services/functions/src/index.js`.
+- **The contract.** Written, deployable, blocked on a free faucet visit.
+- **Prod.** Terraform is complete and plans cleanly; it has never been applied.
+- **The admin surface.** Still a shared string compared with `!==`. No admin path
+  should be built on the new service until that is replaced.
+- **A load test.** `stress-test/k6-spike-test.js` has never run at its
+  400-concurrent target, so `t4g.small` is unvalidated under load.
 
 ---
 
@@ -671,6 +698,8 @@ Every one of these cost real time.
 | `jq '.x // "default"'` swallowed a `false` | `//` is an *alternative* operator, not a null-coalescer — it fires on `false` too. Cost a day on Bot Fight Mode. Use `has("x")` |
 | A "testnet" signature is valid on mainnet | Chain id came from `settings` (56) not SSM (97). A signature commits to a chain id wherever it was produced |
 | `unexpected-kms-sign` fired | Expected when a human signs, e.g. deploying the contract. Check CloudTrail shows your principal — that is the alarm working |
+| The app loads and shows a name, but never logs in | CORS. The access log fills with `204` on `/functions/v1/auth/telegram` — that is the PREFLIGHT, and the POST is never sent. `ALLOWED_ORIGIN` must equal the app's origin exactly. `verify.yml` now asserts this |
+| A `/functions/v1/...` route 404s | It is an inherited Deno function name the rebuilt service never implemented. Decide whether it should be a route at all, or plain data access through PostgREST under RLS |
 
 ### CI
 
