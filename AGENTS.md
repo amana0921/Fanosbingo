@@ -976,6 +976,28 @@ Still outstanding:
 
 ---
 
+### The test suites ran nowhere until 2026-07-30
+
+Sixty-one assertions across four suites — Telegram `initData` verification, KMS
+signature recovery, chain-id mismatch refusal, request-body handling — and **no
+workflow executed any of them**. `npm run test:functions` was a README
+instruction, which means it ran when somebody remembered.
+
+The only pull-request-triggered workflows were `db-migrate` (paths `db/**`) and
+`terraform` (paths `infra/**`), so a change confined to `services/` triggered
+nothing at all. And `deploy-services.yml` built, pushed, repointed SSM and rolled
+out without running them either — so a service failing its own suite could ship.
+
+Fixed with `test.yml` (pull requests touching `services/**`; no AWS, no secrets)
+and a gate in `deploy-services.yml` before the image build. The gate detects
+suites by glob rather than a hardcoded list, so a suite added to the ticker starts
+gating its own deploys.
+
+Same shape as `verify.yml`'s stated reason for existing, one layer down: these
+tests were written carefully — `chain.test.mjs` runs a real HTTP server rather
+than stubbing `fetch`, specifically so it cannot pass against code that could not
+parse a real response — and then left unwired.
+
 ### Two things measured on 2026-07-30 that are NOT working
 
 Recorded here rather than in a commit message, because a reader needs both
