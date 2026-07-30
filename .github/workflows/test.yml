@@ -31,6 +31,8 @@ on:
       - 'services/**'
       - 'scripts/**'
       - 'src/**'
+      - 'db/**'
+      - 'supabase/migrations/**'
       - 'package.json'
       - 'package-lock.json'
       - 'tsconfig*.json'
@@ -41,6 +43,8 @@ on:
       - 'services/**'
       - 'scripts/**'
       - 'src/**'
+      - 'db/**'
+      - 'supabase/migrations/**'
       - '.github/workflows/test.yml'
   workflow_dispatch:
 
@@ -170,6 +174,36 @@ jobs:
         run: |
           npm run typecheck || \
             echo "::warning::typecheck reported findings. Advisory -- see the workflow comment. Real type errors are NOT tolerated; these are unused declarations."
+
+  migrations:
+    name: migration contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # A HARD GATE, unlike the advisory checks in this file, and it is clean
+      # today so turning it on blocks nothing.
+      #
+      # It catches one bug class: a function ending the migration set with more
+      # than one live signature. `CREATE OR REPLACE FUNCTION` only replaces a
+      # MATCHING signature, so changing the parameter list creates an OVERLOAD and
+      # leaves the old body callable.
+      #
+      # That has cost this project three times, most expensively when
+      # db/20-post/004 rewrote get_lobby_data_instant to take identity from the
+      # JWT while a surviving one-argument version kept trusting the request body
+      # -- a security fix that would have shipped bypassable by omitting a field.
+      # It was found by a migration FAILING against the real database, after
+      # passing every local check there was.
+      #
+      # No database required, so it runs in milliseconds on every pull request
+      # that touches a migration.
+      - name: No function ends up with two signatures
+        run: node scripts/check-migrations.mjs
 
   scripts:
     name: shell scripts
