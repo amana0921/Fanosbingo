@@ -55,6 +55,7 @@ import pg from 'pg';
 import fs from 'node:fs';
 import { authenticateTelegram, requireAuth } from './auth.js';
 import { verifyChainId, chainName } from './chain.js';
+import { bodyParserErrorHandler } from './http-errors.js';
 
 const {
   PORT = '8080',
@@ -121,7 +122,6 @@ const pool = new pg.Pool({
 
 const app = express();
 app.disable('x-powered-by');
-app.use(express.json({ limit: '64kb' }));
 
 // CORS locked to one origin.
 //
@@ -130,6 +130,11 @@ app.use(express.json({ limit: '64kb' }));
 // issue those requests. Falls back to "null" rather than "*" when unset, so a
 // misconfiguration fails closed instead of silently restoring the old
 // behaviour.
+//
+// REGISTERED BEFORE THE BODY PARSER, deliberately. A request whose body does not
+// parse still needs these headers on its 400, or the browser reports an opaque
+// CORS failure instead of the real reason. It also means an OPTIONS preflight is
+// answered without parsing a body it does not have.
 app.use((req, res, next) => {
   res.set('Access-Control-Allow-Origin', ALLOWED_ORIGIN || 'null');
   res.set('Vary', 'Origin');
@@ -139,6 +144,17 @@ app.use((req, res, next) => {
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   return next();
 });
+
+app.use(express.json({ limit: '64kb' }));
+
+// Answer a malformed body with 400 rather than letting it reach the generic
+// handler as a 500.
+//
+// This is not tidiness. Three unparseable bodies used to take the entire service
+// out of Caddy's rotation for ten seconds, for every player -- a 500 is what its
+// passive health check counts. See services/functions/src/http-errors.js for the
+// measurement and the full chain.
+app.use(bodyParserErrorHandler(log));
 
 app.use((req, _res, next) => {
   req.log = {

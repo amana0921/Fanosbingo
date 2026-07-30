@@ -1011,25 +1011,44 @@ the **database** by `db/20-post/004`, which does hold. The rate limit was never
 the thing protecting them. What it was supposed to protect is `/auth/telegram`,
 and that is finding 2.
 
-**2. `/functions/v1/auth/telegram` falls over under trivial concurrency.**
+**2. FIXED — three malformed request bodies took auth down for everybody.**
 
-60 concurrent POSTs with an empty body — no valid `initData`, so each one is
-rejected before doing real work:
+First recorded here as "falls over under trivial concurrency", from a burst of 60
+concurrent requests that produced `3x 500` then `57x 503`. **That diagnosis was
+wrong, and the truth is both simpler and worse.** Concurrency had nothing to do
+with it. The `xargs -I{}` in the test had substituted a loop counter into
+`-d '{}'`, so the bodies on the wire were bare numbers — and it takes three of
+them, sent at any speed at all:
 
 ```
-3x 500      the functions service itself
-57x 503     Caddy, upstream taken out of rotation by its passive health check
+curl -X POST .../functions/v1/auth/telegram -H 'content-type: application/json' \
+     --data-binary '7'
+  -> 500, 500, 500
+
+...then a perfectly valid request, from anyone:
+  -> 503, 503, 503
 ```
 
-It recovered on its own within ~20s and the service stayed `1/1`. But 60
-concurrent requests from one machine is not an attack, and this is the one
-unauthenticated route on the service. `max: 5` on its pg pool and a single
-`t4g.small` shared with four other containers is the whole budget. With the edge
-rule not enforcing, nothing throttles this.
+Every link ordinary: `express.json()` throws → the generic handler answers **500**,
+calling a client mistake a server failure → Caddy's `unhealthy_status 5xx` with
+`max_fails 3` ejects the upstream for 10s → there is only ONE upstream, so
+ejection has no peer to shed load onto and simply turns three bad requests from
+one caller into an outage for every player. Repeat every ten seconds and nobody
+logs in.
 
-This is also the first real datapoint on the load question §7 lists as open, and
-it is worse than expected: `stress-test/k6-spike-test.js` targets 400 concurrent
-and has never run.
+Fixed in two places, because it needed both:
+
+- `services/functions/src/http-errors.js` — a body that does not parse is a
+  **400**, so it never enters the bucket the health check watches. 14 assertions,
+  including that a genuine server fault is *still* 500: this narrows what counts
+  as 5xx rather than blinding the check.
+- `services/caddy/Caddyfile` — `unhealthy_status 5xx` removed from both proxied
+  routes. Ejection is the right behaviour when there is somewhere else to send
+  traffic, and there is not until Stage 2. Reinstate it then.
+
+**The load question is still open.** This was never a load finding, so it says
+nothing about capacity. `stress-test/k6-spike-test.js` targets 400 concurrent and
+has still never run.
 
 ### Known-deliberate weaknesses, accepted at this tier
 
