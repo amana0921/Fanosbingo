@@ -771,6 +771,56 @@ Every one of these cost real time.
 
 ## 7. Outstanding work and known risks
 
+### Replacing the container instance (the only planned-outage procedure)
+
+There is one instance in one AZ, so replacing it is a **3–5 minute outage**. This
+is the procedure for the AMI bumps `ami-bump.yml` proposes, and for any
+launch-template change — `metadata_options`, `user_data`, `instance_type`.
+
+**Terraform will not do it for you.** The ASG references `version = "$Latest"`, so
+a launch-template change produces a new version, Terraform sees no diff on the
+ASG, and `instance_refresh` never fires. The template updates and the running
+instance keeps the old settings indefinitely. Confirmed on the plan for the IMDS
+change: `1 to add, 1 to change` with the ASG absent from the change set.
+
+Before starting, record the baseline — you want to be able to tell whether
+anything came back *different*, not just whether it came back:
+
+```bash
+aws ec2 describe-launch-template-versions --launch-template-id <lt-id> \
+  --query 'reverse(sort_by(LaunchTemplateVersions,&VersionNumber))[0].[VersionNumber,LaunchTemplateData.ImageId,LaunchTemplateData.MetadataOptions.HttpPutResponseHopLimit]'
+aws ec2 describe-instances --instance-ids <id> \
+  --query 'Reservations[].Instances[].[ImageId,MetadataOptions.HttpPutResponseHopLimit,PublicIpAddress]'
+aws ec2 describe-addresses --query 'Addresses[0].[PublicIp,InstanceId]'
+```
+
+**Check the AMI in the template against the AMI on the instance.** If they differ,
+the refresh is also an OS upgrade and you are taking two changes in one outage.
+That is what the pin in `environments/<env>/ami.tf` exists to prevent — leave it
+empty and every refresh silently carries whatever AWS last published.
+
+```bash
+aws autoscaling start-instance-refresh \
+  --auto-scaling-group-name <asg-name> \
+  --preferences MinHealthyPercentage=0
+```
+
+`MinHealthyPercentage=0` because with one instance there is no way to roll without
+a gap. Then verify, in this order — each one has failed before:
+
+1. **the EIP reattached.** `user_data` claims it on boot via `ec2:AssociateAddress`.
+   If that fails the instance is healthy and serving on an address Cloudflare does
+   not resolve to, and the symptom is "the site is down and nothing looks wrong".
+2. **all five ECS services are 1/1.** The new instance rejoins the cluster and
+   pulls from the SSM image pointers, so a service whose pointer is `none` will
+   not come back.
+3. **the setting you changed is actually on the instance**, not just in the
+   template.
+4. **the game loop is advancing** — `starts_at` on the waiting game should move.
+   The ticker reacquires its advisory lock on a new connection; a lock still held
+   by a dead session is released when Postgres reaps the connection, not
+   instantly.
+
 ### Operator actions
 
 > **Read the provenance column before acting on any of these.** This repository
