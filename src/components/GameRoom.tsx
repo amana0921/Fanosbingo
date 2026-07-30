@@ -77,8 +77,20 @@ export function GameRoom({ gameId, playerId, onReturnToLobby }: GameRoomProps) {
   // Server-synchronized countdown for returning to lobby
   useEffect(() => {
     if (game?.status === 'finished' && game.return_to_lobby_at) {
+      // Captured into a const, because the narrowing from the `if` above does not
+      // survive into this closure -- `return_to_lobby_at` is `string | null`, and
+      // TypeScript must assume `game` could change before the interval fires, so
+      // inside here it is nullable again and `new Date(string | null)` matches no
+      // overload.
+      //
+      // That assumption is not paranoia: this runs on an interval, and reading
+      // the field afresh each tick would genuinely be reading it from a later
+      // `game`. Capturing the value the countdown was STARTED for is both what
+      // types correctly and what the code means.
+      const returnToLobbyAt = game.return_to_lobby_at;
+
       const updateCountdown = () => {
-        const returnTime = new Date(game.return_to_lobby_at).getTime();
+        const returnTime = new Date(returnToLobbyAt).getTime();
         const now = Date.now();
         const remainingMs = returnTime - now;
         const remainingSeconds = Math.ceil(remainingMs / 1000);
@@ -500,10 +512,37 @@ export function GameRoom({ gameId, playerId, onReturnToLobby }: GameRoomProps) {
                       return winningPattern.cells.some(([c, r]) => c === col && r === row);
                     };
 
-                    const getLastWinningNumber = () => {
+                    // The RETURN TYPE is annotated, and annotating the variable
+                    // alone was not enough -- which is the actual mechanism and
+                    // worth stating, because the obvious fix looks like it should
+                    // work.
+                    //
+                    // TypeScript's control-flow analysis narrows `lastNumber` to
+                    // `null` immediately after `= null`, and it does not track
+                    // the assignment inside the forEach callback. So at `return
+                    // lastNumber` the NARROWED type is still `null`, the inferred
+                    // return type is `null`, and every later
+                    // `lastWinningNumber.number` became an access on `never`.
+                    // Declaring the variable's type changes nothing about that,
+                    // because CFA narrowing wins over the declaration.
+                    //
+                    // Declaring what the FUNCTION returns is what fixes it.
+                    const getLastWinningNumber = (): { col: number; row: number; number: number } | null => {
                       if (!winningPattern || !winningPattern.cells) return null;
 
-                      let lastNumber = null;
+                      // Annotated, because `let lastNumber = null` infers the
+                      // type `null` and TypeScript does not track the assignment
+                      // below across the forEach callback boundary. It therefore
+                      // concluded this function ALWAYS returns null, which made
+                      // every later `lastWinningNumber.number` / `.col` / `.row`
+                      // an access on type `never` -- five type errors pointing at
+                      // the use sites rather than at the cause.
+                      //
+                      // Nothing was broken at runtime; the assignment always
+                      // worked. But the wrong type here is what stopped the whole
+                      // file from typechecking, and a file that cannot typecheck
+                      // hides the next error that IS real.
+                      let lastNumber: { col: number; row: number; number: number } | null = null;
                       let lastIndex = -1;
 
                       winningPattern.cells.forEach(([col, row]) => {

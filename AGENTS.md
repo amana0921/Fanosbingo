@@ -1026,6 +1026,35 @@ Still outstanding:
 
 ---
 
+### Spectator mode is documented and dead
+
+`App.tsx:300` defines `handleSpectateGame`, `App.tsx:355` passes it to `Lobby` as
+`onSpectateGame`, and `Lobby.tsx` **never calls it**. There is no UI element that
+invokes it. `SPECTATOR_MODE_IMPLEMENTATION.md` describes the feature as built.
+
+Found because it is one of the 17 remaining `typecheck` findings — an unused prop,
+which the compiler reports as noise and is in fact a feature that was wired
+halfway. Deliberately **not** "fixed" by deleting the prop to satisfy the
+compiler: that would remove the hook somebody intended, and leave the document
+describing something with no trace in the code at all.
+
+Several of the other unused `useState` setters may be the same story
+(`setIsJoining`, `isTimeSynced`, `isLoadingData` in `Lobby.tsx`) — a state that is
+declared and never updated is a spinner or a guard that never fires. Each needs
+reading individually before it is either wired up or removed.
+
+That is why `typecheck` is advisory in `test.yml` rather than a gate: the findings
+are a to-do list, not lint. Promote it once each has been decided.
+
+**Real type errors are not tolerated, and were fixed.** Five in `GameRoom.tsx`:
+four `Property does not exist on type 'never'` in the winning-number display, and
+one `No overload matches this call` on `new Date(string | null)` in the
+return-to-lobby countdown. The `never` cascade is worth knowing about — annotating
+the *variable* does not fix it, because control-flow analysis narrows a `let` to
+`null` after `= null` and does not track assignment inside a `forEach` callback,
+so the inferred **return type** was `null`. Annotating what the function returns
+is what fixes it.
+
 ### The test suites ran nowhere until 2026-07-30
 
 Sixty-one assertions across four suites — Telegram `initData` verification, KMS
