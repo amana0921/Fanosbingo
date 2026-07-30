@@ -1093,6 +1093,47 @@ Fixed in two places, because it needed both:
 nothing about capacity. `stress-test/k6-spike-test.js` targets 400 concurrent and
 has still never run.
 
+### The balance ledger has no copy outside this region or account
+
+PITR covers the failures that have actually been rehearsed — a bad migration, a
+wrong `UPDATE`, a dropped table — and the restore drill measures them at 8–11
+minutes. It covers nothing that takes the **region** or the **account** with it,
+because the backups live in the same account and region as the instance:
+
+- a principal holding `rds:DeleteDBInstance` and `rds:DeleteDBSnapshot` removes
+  the ledger and its recovery points in one sitting. `deletion_protection` stops
+  the careless case, not the deliberate one.
+- a region-wide RDS impairment leaves nothing to restore *from*.
+
+The fix is `aws_db_instance_automated_backups_replication` — backup **storage**
+in a second region, not a standby, so no second instance-hour. Roughly $2–4/month
+on 20 GB with 7-day retention.
+
+**Deliberately not implemented yet, and this is the reason.** It was written and
+then reverted, because it cannot be exercised:
+
+```
+Error: Provider configuration not present
+  module.rds.provider["registry.terraform.io/hashicorp/aws"].replica is required
+```
+
+Making it work needs four things, none of which can be verified today:
+
+1. `configuration_aliases = [aws.replica]` in `modules/rds`
+2. a second aliased `provider "aws"` block in **both** environment roots
+3. a customer-managed KMS key **in the destination region** — a KMS key is
+   regional, so the key this instance is encrypted with cannot be reused, and
+   passing it yields "KMS key not found in region", which reads like a
+   permissions problem and is not one
+4. `providers = { aws = aws, aws.replica = aws.replica }` on every `rds` call
+
+Dev should never have it (throwaway data, torn down between sessions) and **prod
+has never been applied**. So landing it would mean adding provider plumbing and a
+second regional key that nothing has ever run — the "control that exists, is well
+written, and is never exercised" pattern this repository keeps paying for. Build
+it with the first prod apply, when the restore can actually be drilled from the
+replica.
+
 ### Known-deliberate weaknesses, accepted at this tier
 
 - **A pull request can read dev SecureStrings.** Terraform refreshes
