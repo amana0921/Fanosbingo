@@ -50,17 +50,45 @@ const TOKEN_TTL_SECONDS = 15 * 60;
  * @param {string} initData raw payload from Telegram.WebApp.initData
  * @param {string} botToken
  * @param {string} jwtSecret shared with PostgREST and Realtime via SSM
+ * @param {{check: (key: string|number) => {allowed: boolean, retryAfterSeconds: number}}} [limiter]
+ *        Optional. See src/rate-limit.js for why the key is the telegram id and
+ *        not the IP address.
  */
-export async function authenticateTelegram(pool, initData, botToken, jwtSecret) {
+export async function authenticateTelegram(pool, initData, botToken, jwtSecret, limiter) {
   const verified = await verifyInitData(initData, botToken);
 
   if (!verified.ok) {
     // The caller gets a generic failure; the reason is logged. A prober should
     // not learn WHICH part of their forgery was wrong.
+    //
+    // Deliberately NOT rate limited: there is no trustworthy key for a request
+    // that failed verification, and the only alternative -- the source IP -- is
+    // shared by many players behind carrier NAT. These are also cheap: an HMAC
+    // over a short payload, no database, no pool connection.
     return { ok: false, status: 401, reason: verified.reason };
   }
 
   const tg = verified.user;
+
+  // RATE LIMIT HERE: after the HMAC proved who this is, before the write.
+  //
+  // This ordering is the point. The identity is now trustworthy, so the limit
+  // cannot be evaded by changing address and cannot punish a player for sharing
+  // one. And it is still ahead of the INSERT, which is the expensive part -- the
+  // pool is max: 5, and exhausting it stalls the ticker's queries too, turning a
+  // login flood into a frozen game rather than merely slow logins.
+  if (limiter) {
+    const verdict = limiter.check(tg.id);
+    if (!verdict.allowed) {
+      return {
+        ok: false,
+        status: 429,
+        retryAfterSeconds: verdict.retryAfterSeconds,
+        reason: 'rate limited',
+        telegramUserId: tg.id,
+      };
+    }
+  }
 
   // ON CONFLICT so a returning player updates rather than collides, and so two
   // simultaneous first requests cannot race into a duplicate.

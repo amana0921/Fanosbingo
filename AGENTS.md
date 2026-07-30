@@ -1030,8 +1030,29 @@ needs a token this repository does not hold.
 
 The reason this matters more than it looks: the money-moving RPCs are closed at
 the **database** by `db/20-post/004`, which does hold. The rate limit was never
-the thing protecting them. What it was supposed to protect is `/auth/telegram`,
-and that is finding 2.
+the thing protecting them. What it was supposed to protect is `/auth/telegram`.
+
+**There is now a floor underneath it**, in `services/functions/src/rate-limit.js`
+— ten authentications per minute **per verified telegram user id**, enforced
+in-process after the HMAC and *before* the database write.
+
+Keying on the telegram id rather than the IP is the whole point, and it is why
+this is not simply the Cloudflare rule reimplemented. `ip.src` is a poor key for
+this player base: they reach Telegram over Ethiopian carrier NAT, so one address
+is many people, and any threshold tight enough to stop a script also locks out
+players who did nothing but open the app. A verified telegram id is one person
+regardless of egress address, and cannot be forged without the bot token.
+
+What it does **not** cover, stated plainly: requests whose `initData` fails
+verification. Those have no trustworthy key, and the only alternative is the IP,
+which brings the NAT problem back. They are cheap — one HMAC, no database, no
+pool connection — and they now answer 401 rather than 500, so they no longer trip
+Caddy's health check either. Raw volume against that path remains an edge job,
+and the edge is not doing it.
+
+It is also **per process**. One instance today, so that is exact; at Stage 2 two
+instances would each permit the full budget. Move the counter into PostgreSQL
+then, or accept 2× and write it down.
 
 **2. FIXED — three malformed request bodies took auth down for everybody.**
 

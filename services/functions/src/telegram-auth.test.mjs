@@ -23,6 +23,7 @@ import {
   verifyInitData,
   verifyWebhookSecret,
 } from './telegram-auth.js';
+import { signInitData as signWithToken } from './telegram-auth.test-helpers.mjs';
 
 if (!globalThis.crypto) globalThis.crypto = webcrypto;
 
@@ -38,21 +39,10 @@ const check = (label, cond) => {
 // Builds a genuine initData exactly as Telegram's servers would, so the
 // "accepts" cases are testing against a real signature rather than against the
 // verifier's own output.
-async function signInitData(fields) {
-  const hmac = async (keyData, msg) => {
-    const k = await crypto.subtle.importKey(
-      'raw', keyData, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'],
-    );
-    return new Uint8Array(await crypto.subtle.sign('HMAC', k, enc.encode(msg)));
-  };
-  const hex = (b) => Array.from(b).map((x) => x.toString(16).padStart(2, '0')).join('');
-
-  const p = new URLSearchParams(fields);
-  const dcs = [...p.entries()].map(([k, v]) => `${k}=${v}`).sort().join('\n');
-  const secretKey = await hmac(enc.encode('WebAppData'), BOT_TOKEN);
-  p.set('hash', hex(await hmac(secretKey, dcs)));
-  return p.toString();
-}
+// The implementation now lives in telegram-auth.test-helpers.mjs, because
+// rate-limit.test.mjs needs the same thing and a second copy would drift. The
+// bot token is bound here so every call site below is unchanged.
+const signInitData = (fields) => signWithToken(BOT_TOKEN, fields);
 
 const now = () => Math.floor(Date.now() / 1000);
 const USER = JSON.stringify({ id: 987654321, username: 'player', first_name: 'A' });
