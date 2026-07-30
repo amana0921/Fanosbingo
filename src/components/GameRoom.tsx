@@ -1,5 +1,6 @@
 import { useEffect, useState, useRef, useCallback } from 'react';
 import { supabase, Game, Player } from '../lib/supabase';
+import { getAccessToken } from '../lib/auth';
 import { BingoCard } from './BingoCard';
 import { getBingoLetter } from '../utils/bingoUtils';
 import { Trophy, Eye } from 'lucide-react';
@@ -262,8 +263,17 @@ export function GameRoom({ gameId, playerId, onReturnToLobby }: GameRoomProps) {
 
     const claimBingoWithRetry = async (attempt: number = 1): Promise<boolean> => {
       const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
-      const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
       const maxAttempts = 3;
+
+      // The PLAYER'S token, not the anon key.
+      //
+      // /claim-bingo now requires a proven identity and checks that the player
+      // row being claimed for actually belongs to it. Previously the anon key was
+      // sent and playerId came from the body, so any caller could submit a claim
+      // on behalf of any player -- which cannot invent a win, since the database
+      // validates the pattern, but can spend a rival's single claim and get them
+      // disqualified for a losing one.
+      const token = await getAccessToken();
 
       try {
         const controller = new AbortController();
@@ -272,7 +282,7 @@ export function GameRoom({ gameId, playerId, onReturnToLobby }: GameRoomProps) {
         const response = await fetch(`${supabaseUrl}/functions/v1/claim-bingo`, {
           method: 'POST',
           headers: {
-            'Authorization': `Bearer ${supabaseAnonKey}`,
+            'Authorization': `Bearer ${token}`,
             'Content-Type': 'application/json',
           },
           body: JSON.stringify({ playerId, claimId }),

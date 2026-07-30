@@ -58,6 +58,7 @@ import { verifyChainId, chainName } from './chain.js';
 import { bodyParserErrorHandler } from './http-errors.js';
 import { createRateLimiter } from './rate-limit.js';
 import { createSelectCardHandler } from './select-card.js';
+import { createClaimBingoHandler } from './claim-bingo.js';
 
 const {
   PORT = '8080',
@@ -290,6 +291,19 @@ app.get('/auth/whoami', requireAuth(JWT_SECRET), (req, res) => {
  * taken from the request body.
  */
 app.post('/select-card', requireAuth(JWT_SECRET), createSelectCardHandler(pool));
+
+/**
+ * POST /claim-bingo  { playerId }  ->  atomic_claim_bingo's result
+ *
+ * Claiming a win. The other half of a playable game, and the other half of the
+ * 404 pair with /select-card.
+ *
+ * Its authorization question differs: atomic_claim_bingo takes a PLAYER ROW id,
+ * so the token saying who you are is not enough on its own -- the row must be
+ * checked to be yours. See src/claim-bingo.js for what claiming on somebody
+ * else's behalf would let you do to them.
+ */
+app.post('/claim-bingo', requireAuth(JWT_SECRET), createClaimBingoHandler(pool));
 
 app.use((req, res) => res.status(404).json({ error: 'not found', path: req.path }));
 
