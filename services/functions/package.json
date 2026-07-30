@@ -10,13 +10,16 @@
     "test": "node src/telegram-auth.test.mjs && node src/kms-signer.test.mjs && node src/chain.test.mjs && node src/http-errors.test.mjs && node src/rate-limit.test.mjs && node src/select-card.test.mjs && node src/claim-bingo.test.mjs"
   },
   "dependencies": {
+    "@aws-sdk/client-kms": "^3.700.0",
     "express": "^4.21.2",
     "jsonwebtoken": "^9.0.2",
     "pg": "^8.13.1",
-    "@aws-sdk/client-kms": "^3.700.0",
     "viem": "^2.45.2"
   },
   "engines": {
     "node": ">=22"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3"
   }
 }

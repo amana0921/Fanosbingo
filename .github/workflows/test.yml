@@ -76,6 +76,22 @@ jobs:
         run: npm test
         working-directory: services/functions
 
+      # ADVISORY. See services/functions/tsconfig.json for why this exists: ~2,000
+      # lines of JavaScript that verify HMACs, mint sessions, spend stakes and
+      # sign BSC transactions were checked by nothing, while the 7,900-line
+      # TypeScript Mini App in front of them was fully typechecked. The risk was
+      # inverted.
+      #
+      # Advisory rather than a gate for the same reason as shellcheck and the SPA
+      # typecheck: the existing findings are a to-do list to be read, not lint to
+      # be swept. Promote once they are cleared.
+      - name: typecheck (advisory)
+        continue-on-error: true
+        run: |
+          npx tsc -p tsconfig.json || \
+            echo "::warning::checkJs reported findings in the functions service. Advisory -- see tsconfig.json."
+        working-directory: services/functions
+
   ticker:
     name: ticker service
     runs-on: ubuntu-latest
@@ -101,6 +117,16 @@ jobs:
       # database. When the ticker gains real tests, replace this with `npm test`.
       - name: Parse check
         run: node --check src/index.js
+        working-directory: services/ticker
+
+      # The ticker has no unit tests, so this is the only thing that inspects it
+      # beyond "does it parse". It is the process that calls game_tick() once a
+      # second; a wrong argument shape here stops the game.
+      - name: typecheck (advisory)
+        continue-on-error: true
+        run: |
+          npx tsc -p tsconfig.json || \
+            echo "::warning::checkJs reported findings in the ticker."
         working-directory: services/ticker
 
   spa:
