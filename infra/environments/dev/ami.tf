@@ -15,5 +15,22 @@
  */
 
 locals {
-  ecs_ami_id = ""
+  # Pinned 2026-07-29 to the image the running instance is already on, so this
+  # is a no-op rather than an upgrade.
+  #
+  # It was "" until now, which meant the launch template's image_id followed the
+  # SSM recommended pointer -- the exact behaviour modules/ecs warns about in its
+  # header. AWS has since published ami-0d52a9965700d5237, so the next apply for
+  # any reason at all was going to rewrite image_id as a side effect. It showed
+  # up in the plan for a Cloudflare rate-limit change, which is precisely the
+  # "riding along invisibly" the pin exists to prevent.
+  #
+  # ami-bump.yml was meant to fill this in and has never run: its first
+  # scheduled fire is the Monday after the workflow landed. Waiting for that
+  # left the environment unpinned in the meantime.
+  #
+  # The upgrade to the newer image is deliberately NOT taken here. It belongs in
+  # its own pull request, from ami-bump.yml, where the instance replacement it
+  # causes is the subject of the change rather than a footnote to one.
+  ecs_ami_id = "ami-0b196d9d9718c1dd3"
 }
