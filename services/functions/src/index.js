@@ -57,6 +57,7 @@ import { authenticateTelegram, requireAuth } from './auth.js';
 import { verifyChainId, chainName } from './chain.js';
 import { bodyParserErrorHandler } from './http-errors.js';
 import { createRateLimiter } from './rate-limit.js';
+import { createSelectCardHandler } from './select-card.js';
 
 const {
   PORT = '8080',
@@ -272,6 +273,23 @@ app.get('/auth/whoami', requireAuth(JWT_SECRET), (req, res) => {
     role: req.auth.role,
   });
 });
+
+/**
+ * POST /select-card  { gameId, cardNumber }  ->  select_card_atomic's result
+ *
+ * Joining a game. The first of the inherited routes to be built rather than
+ * merely enumerated, and it is here rather than in PostgREST because it spends a
+ * player's balance: select_card_atomic is SECURITY DEFINER and takes the
+ * caller's identity as an unchecked parameter, so db/20-post/004 revoked EXECUTE
+ * on it from anon and authenticated. This is its only caller.
+ *
+ * Until this existed the game was not playable. The loop ran, the board
+ * rendered, the countdown ticked, and pressing join answered 404.
+ *
+ * See src/select-card.js for why neither the identity nor the CARD LAYOUT is
+ * taken from the request body.
+ */
+app.post('/select-card', requireAuth(JWT_SECRET), createSelectCardHandler(pool));
 
 app.use((req, res) => res.status(404).json({ error: 'not found', path: req.path }));
 
