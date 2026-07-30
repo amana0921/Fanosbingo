@@ -976,6 +976,61 @@ Still outstanding:
 
 ---
 
+### Two things measured on 2026-07-30 that are NOT working
+
+Recorded here rather than in a commit message, because a reader needs both
+before they trust the edge with anything.
+
+**1. The Cloudflare rate-limit rule is created, enabled, and does not enforce.**
+
+Applied and confirmed in state: `phase = http_ratelimit`, `enabled = true`,
+`action = block`, `period = 10`, `requests_per_period = 20`,
+`characteristics = [ip.src, cf.colo.id]`, expression matching
+`/functions/v1/auth` and `/rest/v1/rpc/get_or_create_wallet_user` on
+`api.<domain>`. Cloudflare accepted it — the ruleset id is
+`79478d40c4f74f338bb951c3a7593241`.
+
+Then 160 requests to a covered path in a few seconds, from one IP, across two
+bursts of 80 concurrent, several minutes after creation:
+
+```
+80 concurrent -> 80x 200
+80 concurrent -> 80x 200      # immediately after
+```
+
+Zero `429`. A path deliberately left out of the expression behaved identically,
+so there is no observable difference between covered and uncovered. **Do not
+treat this rule as a control.** Cause not established; the plausible candidates
+are a free-plan entitlement that is accepted at write time and ignored at
+enforcement time, or an expression field free is not entitled to match on.
+Diagnosing it needs the Cloudflare dashboard's rate-limiting analytics, which
+needs a token this repository does not hold.
+
+The reason this matters more than it looks: the money-moving RPCs are closed at
+the **database** by `db/20-post/004`, which does hold. The rate limit was never
+the thing protecting them. What it was supposed to protect is `/auth/telegram`,
+and that is finding 2.
+
+**2. `/functions/v1/auth/telegram` falls over under trivial concurrency.**
+
+60 concurrent POSTs with an empty body — no valid `initData`, so each one is
+rejected before doing real work:
+
+```
+3x 500      the functions service itself
+57x 503     Caddy, upstream taken out of rotation by its passive health check
+```
+
+It recovered on its own within ~20s and the service stayed `1/1`. But 60
+concurrent requests from one machine is not an attack, and this is the one
+unauthenticated route on the service. `max: 5` on its pg pool and a single
+`t4g.small` shared with four other containers is the whole budget. With the edge
+rule not enforcing, nothing throttles this.
+
+This is also the first real datapoint on the load question §7 lists as open, and
+it is worse than expected: `stress-test/k6-spike-test.js` targets 400 concurrent
+and has never run.
+
 ### Known-deliberate weaknesses, accepted at this tier
 
 - **A pull request can read dev SecureStrings.** Terraform refreshes
