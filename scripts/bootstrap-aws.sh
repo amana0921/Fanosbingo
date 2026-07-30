@@ -160,6 +160,59 @@ aws s3api put-public-access-block --bucket "${BUCKET}" \
   "BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true"
 info "  public access blocked"
 
+# Refuse plaintext HTTP outright.
+#
+# This bucket had NO policy at all until 2026-07-30, while the CloudTrail bucket
+# next to it has carried this same condition since it was created -- so the audit
+# log was protected in transit and the file describing every piece of
+# infrastructure was not.
+#
+# S3 does not require TLS on its own; it merely offers it. Without this, a request
+# that reaches the endpoint over HTTP is served, and Terraform state is a
+# plaintext JSON document containing RDS endpoints, subnet and security group
+# ids, and every attribute of every managed resource.
+#
+# Deny with Principal "*" is safe here and cannot lock anybody out: it applies
+# only when aws:SecureTransport is false, and every AWS SDK and CLI path uses
+# HTTPS. It is also enforced regardless of what any IAM policy allows, which is
+# the point of putting it on the bucket rather than on a role.
+aws s3api put-bucket-policy --bucket "${BUCKET}" --policy "$(cat <<JSON
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DenyUnencryptedTransport",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": "s3:*",
+      "Resource": [
+        "arn:aws:s3:::${BUCKET}",
+        "arn:aws:s3:::${BUCKET}/*"
+      ],
+      "Condition": { "Bool": { "aws:SecureTransport": "false" } }
+    }
+  ]
+}
+JSON
+)"
+info "  plaintext HTTP denied"
+
+# ON ENCRYPTION, and why it is SSE-S3 rather than SSE-KMS.
+#
+# The CloudTrail bucket uses a customer-managed KMS key, and the obvious question
+# is why this one does not. The answer is ordering, not oversight: every KMS key
+# in this project is created by Terraform, and Terraform's state lives in THIS
+# bucket. A KMS key for the state bucket therefore cannot come from the same
+# place -- it would have to be created here, by CLI, and then be a key nobody
+# manages as code.
+#
+# What SSE-KMS would add over SSE-S3 is defence against a principal holding s3:Get
+# on this bucket but no kms:Decrypt. The bucket blocks all public access, the only
+# roles with access are the scoped planner and executor, and the objects are
+# encrypted at rest either way. That is a small gain for an unmanaged key, so the
+# trade is deliberate. Revisit if the state bucket ever gains a reader that is not
+# one of those two roles.
+
 # Expire old state versions after 90 days so the bucket does not grow forever.
 aws s3api put-bucket-lifecycle-configuration --bucket "${BUCKET}" \
   --lifecycle-configuration '{

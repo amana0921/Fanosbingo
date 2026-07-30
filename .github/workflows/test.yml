@@ -29,6 +29,7 @@ on:
   pull_request:
     paths:
       - 'services/**'
+      - 'scripts/**'
       - 'package.json'
       - 'package-lock.json'
       - '.github/workflows/test.yml'
@@ -36,6 +37,7 @@ on:
     branches: [main]
     paths:
       - 'services/**'
+      - 'scripts/**'
       - '.github/workflows/test.yml'
   workflow_dispatch:
 
@@ -97,3 +99,50 @@ jobs:
       - name: Parse check
         run: node --check src/index.js
         working-directory: services/ticker
+
+  scripts:
+    name: shell scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Nothing watched scripts/ until now, which is how a 500-line bash file
+      # that bootstraps IAM roles, tunnels to the database and writes bucket
+      # policies came to have no gate on it at all. A pull request touching only
+      # scripts/ ran zero checks.
+      #
+      # These scripts are not incidental: db-migrate.sh applies schema changes to
+      # the database holding player balances, bootstrap-aws.sh creates the roles
+      # everything else authenticates with, and probe-public-access.sh is one of
+      # the three controls verify.yml relies on. A syntax error in any of them
+      # fails at the least convenient moment.
+      - name: Syntax
+        run: |
+          set -euo pipefail
+          fail=0
+          for f in scripts/*.sh stress-test/*.sh; do
+            [ -f "$f" ] || continue
+            if bash -n "$f"; then
+              echo "  ok    $f"
+            else
+              echo "::error file=$f::bash -n failed"
+              fail=1
+            fi
+          done
+          exit $fail
+
+      # shellcheck is preinstalled on ubuntu-latest runners, so this costs
+      # nothing to run.
+      #
+      # NOT a gate yet, deliberately. These scripts predate it and shellcheck
+      # will have opinions about all of them; turning it into a hard failure in
+      # the same change that introduces it would either block unrelated work or
+      # invite a sweep of unreviewed edits across files that move money. It
+      # reports, visibly, and can be promoted to a gate once the existing
+      # findings have been read and either fixed or explicitly ignored.
+      - name: shellcheck (advisory)
+        continue-on-error: true
+        run: |
+          shellcheck --version
+          shellcheck --severity=warning scripts/*.sh stress-test/*.sh || \
+            echo "::warning::shellcheck reported findings. Advisory for now -- see the workflow comment."
