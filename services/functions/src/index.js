@@ -56,6 +56,7 @@ import fs from 'node:fs';
 import { authenticateTelegram, requireAuth } from './auth.js';
 import { verifyChainId, chainName } from './chain.js';
 import { bodyParserErrorHandler } from './http-errors.js';
+import { createRateLimiter } from './rate-limit.js';
 
 const {
   PORT = '8080',
@@ -118,6 +119,22 @@ const pool = new pg.Pool({
   max: 5,
   idleTimeoutMillis: 30_000,
   connectionTimeoutMillis: 10_000,
+});
+
+// Per-player limit on the one unauthenticated route.
+//
+// Ten per minute against a token that lives fifteen minutes: a real client
+// authenticates once per session, so this is roughly thirty times what normal
+// use needs, and still a hard ceiling on a script. Keyed on the VERIFIED
+// telegram id rather than the source IP -- see src/rate-limit.js for why that
+// distinction matters to this player base specifically.
+//
+// Overridable so the value is not buried in a build. It is not in SSM because
+// changing it should not need a Terraform apply, and there is nothing secret
+// about it.
+const authLimiter = createRateLimiter({
+  limit: Number(process.env.AUTH_RATE_LIMIT ?? 10),
+  windowMs: Number(process.env.AUTH_RATE_WINDOW_MS ?? 60_000),
 });
 
 const app = express();
@@ -200,9 +217,29 @@ app.post('/auth/telegram', async (req, res) => {
       initData,
       TELEGRAM_BOT_TOKEN,
       JWT_SECRET,
+      authLimiter,
     );
 
     if (!result.ok) {
+      // A 429 is answered differently from a 401, deliberately.
+      //
+      // Rate limiting is not an authentication failure and pretending otherwise
+      // would be actively harmful: a real client told "authentication failed"
+      // will re-verify and retry, adding load, while one told 429 with
+      // Retry-After can wait. Nothing is leaked by admitting to a rate limit --
+      // the caller already proved who they are to get here.
+      if (result.status === 429) {
+        log('warn', 'authentication rate limited', {
+          telegram_user_id: result.telegramUserId,
+          retry_after_seconds: result.retryAfterSeconds,
+        });
+        res.set('Retry-After', String(result.retryAfterSeconds));
+        return res.status(429).json({
+          error: 'too many authentication attempts',
+          retry_after_seconds: result.retryAfterSeconds,
+        });
+      }
+
       // Logged with the reason, answered without it.
       log('warn', 'authentication rejected', { reason: result.reason });
       return res.status(result.status).json({ error: 'authentication failed' });
