@@ -178,24 +178,27 @@ export function GameRoom({ gameId, playerId, onReturnToLobby }: GameRoomProps) {
     if (gameData) {
       setGame(gameData);
 
-      // Check if game is stuck (75 numbers called but still playing)
-      if (gameData.status === 'playing' && gameData.called_numbers && gameData.called_numbers.length >= 75) {
-        const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
-        const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
-
-        try {
-          await fetch(`${supabaseUrl}/functions/v1/force-finish-game`, {
-            method: 'POST',
-            headers: {
-              'Authorization': `Bearer ${supabaseAnonKey}`,
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({ gameId }),
-          });
-        } catch (error) {
-          console.error('Failed to force finish game:', error);
-        }
-      }
+      // NOTHING HERE. This used to POST /functions/v1/force-finish-game when it
+      // saw 75 called numbers on a game still marked `playing`.
+      //
+      // Two things were wrong with it. The route is a 404 -- an inherited Deno
+      // name the rebuilt service never implemented -- so the "fix" never ran. And
+      // it was client-driven game logic, which is exactly what moving the loop
+      // into the ticker existed to remove: a game that only finishes when
+      // somebody has the tab open is the failure mode AGENTS.md warns against.
+      //
+      // game_tick() already owns it, and has since db/20-post/002:
+      //
+      //   -- Exhausted the board: finish rather than spin.
+      //   IF coalesce(array_length(v_game.called_numbers, 1), 0) >= p_max_numbers
+      //     SET status = 'finished', finished_at = now()
+      //
+      // with p_max_numbers defaulting to 75, evaluated once a second by the
+      // ticker whether or not any browser is watching. Setting `finished` there
+      // also fires payout_winners(), which this client call never would have.
+      //
+      // So the route was not worth building: the correct fix was deleting the
+      // caller.
     }
 
     await loadPlayers();
