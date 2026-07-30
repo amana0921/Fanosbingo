@@ -8,7 +8,7 @@ import { WalletDepositModal } from './components/WalletDepositModal';
 import { NetworkQualityIndicator } from './components/NetworkQualityIndicator';
 import { supabase } from './lib/supabase';
 import { initTelegram, TelegramUser } from './utils/telegram';
-import { authenticate } from './lib/auth';
+import { authenticate, getAccessToken } from './lib/auth';
 import { config, queryClient } from './lib/walletConfig';
 
 const Admin = lazy(() => import('./components/Admin').then(module => ({ default: module.Admin })));
@@ -251,29 +251,45 @@ function AppContent() {
     };
   }, [playerId, gameId, gameStarted]);
 
-  const handleJoinGame = async (gameId: string, selectedNumber: number, user: TelegramUser, cardLayout?: number[][]) => {
-    const playerName = user.username
-      ? `@${user.username}`
-      : user.first_name;
+  // `user` and the former `cardLayout` parameter are gone from the request body:
+  // the server derives both from the verified token and from the card number. The
+  // parameter is kept in the signature because Lobby still passes it, and removing
+  // it is a caller change belonging with the next route rather than this one.
+  const handleJoinGame = async (gameId: string, selectedNumber: number, user: TelegramUser, _cardLayout?: number[][]) => {
 
     const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
-    const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
 
+    // The PLAYER'S token, not the anon key.
+    //
+    // This route requires a proven identity and derives everything else from it,
+    // so sending the anon key would simply be rejected. Previously the anon key
+    // was sent and the identity came from the body below, which the server had no
+    // way to check.
+    const token = await getAccessToken();
+
+    // gameId and cardNumber ONLY. Everything else this used to send is now
+    // derived server-side, and deliberately so:
+    //
+    //   telegramUserId    was the caller naming their own account. The server
+    //                     takes it from the verified token instead.
+    //   playerName etc.   read from the row the server stores for that identity.
+    //   cardLayout        THE PLAYER CHOOSING THEIR OWN BINGO CARD. It went
+    //                     straight into players.card_numbers, so a crafted
+    //                     request could join with a card of numbers already
+    //                     called. Now from get_or_create_card_layout(cardNumber),
+    //                     which is deterministic and identical for everybody.
+    //
+    // Choosing a card NUMBER is still the player's decision. Choosing what is
+    // printed on it never was.
     const response = await fetch(`${supabaseUrl}/functions/v1/select-card`, {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${supabaseAnonKey}`,
+        'Authorization': `Bearer ${token}`,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
         gameId,
         cardNumber: selectedNumber,
-        telegramUserId: user.id,
-        playerName,
-        telegramUsername: user.username || null,
-        telegramFirstName: user.first_name,
-        telegramLastName: user.last_name || null,
-        cardLayout,
       }),
     });
 
