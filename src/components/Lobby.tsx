@@ -251,21 +251,33 @@ export function Lobby({ onJoinGame, onSpectateGame, telegramUser }: LobbyProps) 
         return;
       }
 
-      const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
-      const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
+      // An RPC, not an edge function.
+      //
+      // This called /functions/v1/get-card-layouts?all=true, which 404s: it is an
+      // inherited Deno function name the rebuilt API never implemented, so the
+      // card grid depended on a route that does not exist.
+      //
+      // Nothing needed building. get_all_card_layouts() has existed since
+      // 20251227080915 and returns exactly this shape --
+      // jsonb_object_agg(card_number::text, layout) is Record<string, number[][]>
+      // -- so the fix is to call the database instead of an absent service.
+      //
+      // This is the question §7 of AGENTS.md says to ask of every 404 route
+      // before porting it: "why can RLS not do this?" Here it can. Card layouts
+      // are deterministic, permanent, and hold no player data, so they are plain
+      // data access and belong in PostgREST rather than behind a route that
+      // would only forward the same query.
+      //
+      // Reached through `supabase` rather than fetch, so the accessToken hook
+      // supplies whatever identity the caller has. Executable by anon by design
+      // -- db/20-post/004 allowlists it -- because this runs before
+      // authentication resolves and must also work outside Telegram, where there
+      // is no token at all.
+      const { data, error } = await supabase.rpc('get_all_card_layouts');
 
-      const response = await fetch(`${supabaseUrl}/functions/v1/get-card-layouts?all=true`, {
-        headers: {
-          'Authorization': `Bearer ${supabaseAnonKey}`,
-          'Content-Type': 'application/json',
-        },
-      });
+      if (error) throw error;
 
-      if (!response.ok) {
-        throw new Error('Failed to fetch card layouts');
-      }
-
-      const layouts: Record<string, number[][]> = await response.json();
+      const layouts: Record<string, number[][]> = data ?? {};
 
       const newCache = new Map<number, number[][]>();
       const persistLayouts: Record<number, number[][]> = {};

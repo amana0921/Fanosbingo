@@ -300,7 +300,29 @@ DECLARE
     'get_or_create_wallet_user',
     -- Lobby. Rewritten in section 3 so that an unauthenticated caller gets the
     -- public game state and NO user record.
-    'get_lobby_data_instant'
+    'get_lobby_data_instant',
+    -- Card layouts: READ ONLY, and anon genuinely needs them.
+    --
+    -- These return the board for a card number -- deterministic, permanent by
+    -- design (20251227075119 "permanent card layouts system"), and containing no
+    -- player data whatsoever. Knowing which numbers are on card 42 is not an
+    -- advantage; every player can see it before choosing.
+    --
+    -- Anon is required rather than merely convenient. src/App.tsx authenticates
+    -- ASYNCHRONOUSLY on mount, so the Lobby can render before a token exists,
+    -- and outside Telegram -- a browser tab, a preview -- there is never one at
+    -- all, which App.tsx's own comment says must keep working. The card grid
+    -- would be blank in both cases.
+    --
+    -- This is also the status quo, not a widening: the SPA has always fetched
+    -- these with the anon key.
+    --
+    -- get_or_create_card_layout is deliberately NOT here and stays at
+    -- authenticated. It WRITES a row when one is absent, and there is no reason
+    -- an unauthenticated caller needs to cause that -- get_all_card_layouts
+    -- covers what the app reads.
+    'get_all_card_layouts',
+    'get_card_layouts_batch'
   ];
   -- Callable once a player holds a token this system issued.
   v_authenticated text[] := ARRAY[
@@ -588,9 +610,14 @@ BEGIN
   JOIN pg_namespace n ON n.oid = p.pronamespace
   WHERE n.nspname = 'public'
     AND has_function_privilege('anon', p.oid, 'EXECUTE')
+    -- Must stay in step with v_anon in section 2. Restated rather than shared,
+    -- deliberately: an assertion that reads the same variable as the code it
+    -- checks proves only that the variable equals itself. Adding to one list and
+    -- not the other fails this check, which is the intended behaviour.
     AND p.proname <> ALL (ARRAY[
       'get_server_timestamp_ms', 'get_server_timestamp',
-      'get_or_create_wallet_user', 'get_lobby_data_instant'
+      'get_or_create_wallet_user', 'get_lobby_data_instant',
+      'get_all_card_layouts', 'get_card_layouts_batch'
     ]);
 
   IF v_bad IS NOT NULL THEN
