@@ -6,17 +6,38 @@
 # shared across services rather than duplicated. Build with:
 #   docker build -f services/ticker/Dockerfile .
 
-FROM docker.io/library/node:22-alpine AS deps
+# --platform=$BUILDPLATFORM: install NATIVELY, do not emulate.
+#
+# Same change, and same reason, as services/functions/Dockerfile: running npm
+# under QEMU arm64 killed a functions deploy with
+#
+#   qemu: uncaught target signal 4 (Illegal instruction) - core dumped
+#
+# and then hung rather than failing. This image has the same exposure -- pg and
+# @aws-sdk/client-cloudwatch, both pure JavaScript -- so it gets the same fix
+# before it bites here too, rather than after.
+#
+# The .node guard below is what keeps the assumption honest if a dependency with
+# a native addon is ever added.
+FROM --platform=$BUILDPLATFORM docker.io/library/node:22-alpine AS deps
 
 WORKDIR /app
 
-# Manifests only, so a source-only change reuses the cached dependency layer
-# instead of reinstalling on every build -- which matters under QEMU emulation.
+# Manifests only, so a source-only change reuses the cached dependency layer.
 COPY services/ticker/package.json services/ticker/package-lock.json* ./
 
 # --omit=dev: nothing here needs a build step, so dev dependencies would only
 # enlarge the image and its vulnerability surface.
 RUN npm ci --omit=dev --no-audit --no-fund
+
+RUN if find node_modules -name '*.node' -print -quit 2>/dev/null | grep -q .; then \
+      echo "FATAL: a dependency ships a native addon (.node):" >&2; \
+      find node_modules -name '*.node' >&2; \
+      echo "This stage installs on the BUILD architecture, so that binary would" >&2; \
+      echo "be the wrong one for the arm64 runtime image. Either drop the" >&2; \
+      echo "dependency or remove --platform=\$BUILDPLATFORM and accept QEMU." >&2; \
+      exit 1; \
+    fi
 
 # ---------------------------------------------------------------------------
 
