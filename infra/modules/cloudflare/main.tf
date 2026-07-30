@@ -169,6 +169,14 @@ resource "cloudflare_zone_setting" "websockets" {
 # ---------------------------------------------------------------------------
 # Rate limiting
 #
+# !! MEASURED NOT TO ENFORCE. Applied to dev on 2026-07-30; Cloudflare accepted
+# !! the ruleset and reports enabled = true, and 160 requests from one IP to a
+# !! covered path in a few seconds produced zero 429s. A path deliberately
+# !! excluded from the expression behaved identically. Cause not established --
+# !! diagnosing it needs the dashboard's rate-limiting analytics. See AGENTS.md
+# !! §7. Do not count this as a control; the money paths are closed at the
+# !! database by db/20-post/004, which is what actually holds.
+#
 # The free plan allows one rate-limiting rule, and this is the one worth
 # spending it on: the endpoints that move money and mint sessions.
 #
