@@ -217,9 +217,25 @@ https://rt.{$DOMAIN}:{$HTTPS_PORT:443} {
 			# upgrade answers 101 immediately and then stays open for the whole
 			# session, so "slow response" is meaningless here -- only an outright
 			# failure to answer means anything.
+			#
+			# `unhealthy_status 5xx` removed here too, completing a change that
+			# claimed to cover "both proxied routes" and missed this one -- there
+			# are THREE. Found by grepping the DEPLOYED Caddyfile out of the
+			# running container and counting, rather than trusting the diff.
+			#
+			# The reasoning is identical and does not depend on how the upstream
+			# behaves: there is one Realtime container, so taking it out of
+			# rotation has nowhere to send traffic instead. It converts errors
+			# affecting some callers into 503 for every player with a game open.
+			#
+			# It is if anything more exposed here than on the routes where this
+			# was actually measured. Realtime runs its Ecto migrations on boot and
+			# can answer 5xx for a few seconds while doing so, which is exactly
+			# when a self-inflicted ten-second ejection helps least.
+			#
+			# Reinstate at Stage 2, with the other two.
 			fail_duration 10s
 			max_fails 3
-			unhealthy_status 5xx
 		}
 	}
 
