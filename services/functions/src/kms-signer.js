@@ -42,7 +42,27 @@ const SECP256K1_HALF_N = SECP256K1_N / 2n;
 
 const kms = new KMSClient({ region: process.env.AWS_REGION ?? 'us-east-1' });
 
-const hex = (buf) => `0x${Buffer.from(buf).toString('hex')}`;
+/**
+ * Bytes to a 0x-prefixed hex string.
+ *
+ * The RETURN TYPE is annotated, and it is load-bearing rather than decorative.
+ *
+ * TypeScript infers a template literal as plain `string`, so without this every
+ * value derived from hex() -- which is `r` and `s` on the signing path -- reached
+ * viem as `string` where its types demand `0x${string}`. viem uses that template
+ * type deliberately: it is the difference between "some text" and "something that
+ * can be parsed as hex", and the check it enables is exactly the one worth having
+ * on a function that serialises a transaction.
+ *
+ * Nothing was wrong at runtime; this function has always returned a 0x-prefixed
+ * string. But it was the only thing asserting that, and it was asserting it to
+ * nobody. Found by pointing checkJs at this service for the first time -- four of
+ * its six findings traced back to this single line.
+ *
+ * @param {Uint8Array|Buffer|ArrayLike<number>} buf
+ * @returns {`0x${string}`}
+ */
+const hex = (buf) => /** @type {`0x${string}`} */ (`0x${Buffer.from(buf).toString('hex')}`);
 
 /**
  * Pull (r, s) out of a DER SEQUENCE { INTEGER r, INTEGER s }.

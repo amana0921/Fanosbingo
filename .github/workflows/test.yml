@@ -80,20 +80,23 @@ jobs:
         run: npm test
         working-directory: services/functions
 
-      # ADVISORY. See services/functions/tsconfig.json for why this exists: ~2,000
+      # A GATE. See services/functions/tsconfig.json for why this exists: ~2,000
       # lines of JavaScript that verify HMACs, mint sessions, spend stakes and
       # sign BSC transactions were checked by nothing, while the 7,900-line
       # TypeScript Mini App in front of them was fully typechecked. The risk was
       # inverted.
       #
-      # Advisory rather than a gate for the same reason as shellcheck and the SPA
-      # typecheck: the existing findings are a to-do list to be read, not lint to
-      # be swept. Promote once they are cleared.
-      - name: typecheck (advisory)
-        continue-on-error: true
-        run: |
-          npx tsc -p tsconfig.json || \
-            echo "::warning::checkJs reported findings in the functions service. Advisory -- see tsconfig.json."
+      # It landed advisory, with six findings. All six are now cleared, so it is a
+      # gate -- which costs nothing today and means the next one is caught at the
+      # pull request rather than found by pointing a tool at this service months
+      # from now.
+      #
+      # Four of the six traced to a single un-annotated line: `hex()` returned a
+      # template literal, which TypeScript infers as plain `string`, so `r` and
+      # `s` reached viem's serializeTransaction as `string` where its types demand
+      # `0x${string}`.
+      - name: typecheck
+        run: npx tsc -p tsconfig.json
         working-directory: services/functions
 
   ticker:
@@ -126,11 +129,11 @@ jobs:
       # The ticker has no unit tests, so this is the only thing that inspects it
       # beyond "does it parse". It is the process that calls game_tick() once a
       # second; a wrong argument shape here stops the game.
-      - name: typecheck (advisory)
-        continue-on-error: true
-        run: |
-          npx tsc -p tsconfig.json || \
-            echo "::warning::checkJs reported findings in the ticker."
+      # Also a gate, and clean. The ticker has no unit tests, so beyond "does it
+      # parse" this is the only thing inspecting the process that calls
+      # game_tick() once a second.
+      - name: typecheck
+        run: npx tsc -p tsconfig.json
         working-directory: services/ticker
 
   spa:
