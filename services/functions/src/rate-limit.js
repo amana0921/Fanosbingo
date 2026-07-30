@@ -62,11 +62,20 @@
  * that with one integer per key. A bucket's smoother behaviour buys nothing when
  * the legitimate rate is roughly one request per player per fifteen minutes.
  *
- * @param {object} opts
- * @param {number} opts.limit     requests permitted per window, per key
- * @param {number} opts.windowMs  window length
- * @param {number} opts.maxKeys   hard cap on tracked keys, so this cannot itself
- *                                become the memory problem it exists to prevent
+ * Every option is OPTIONAL, and the `[opts.x]` brackets are what say so.
+ *
+ * Without them TypeScript reads the destructuring pattern and infers all three as
+ * required, so `createRateLimiter({ limit, windowMs })` -- which is exactly how
+ * index.js calls it -- is reported as missing `maxKeys`. The defaults were always
+ * applied at runtime; the contract simply described itself wrongly. Found by
+ * pointing checkJs at this service for the first time.
+ *
+ * @param {object}  [opts]
+ * @param {number}  [opts.limit]     requests permitted per window, per key
+ * @param {number}  [opts.windowMs]  window length
+ * @param {number}  [opts.maxKeys]   hard cap on tracked keys, so this cannot
+ *                                   itself become the memory problem it exists
+ *                                   to prevent
  */
 export function createRateLimiter({ limit = 10, windowMs = 60_000, maxKeys = 10_000 } = {}) {
   /** @type {Map<string, {count: number, resetAt: number}>} */

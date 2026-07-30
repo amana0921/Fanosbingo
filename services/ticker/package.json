@@ -14,5 +14,8 @@
   "dependencies": {
     "@aws-sdk/client-cloudwatch": "^3.700.0",
     "pg": "^8.13.1"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3"
   }
 }

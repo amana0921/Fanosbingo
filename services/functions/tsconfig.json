@@ -1,0 +1,38 @@
+{
+  /*
+   * Type checking for a plain-JavaScript service. NO BUILD STEP.
+   *
+   * `checkJs` runs the TypeScript compiler over .js files using the JSDoc already
+   * in them, with `noEmit`. Nothing is transpiled, the Dockerfile still copies
+   * src/ and runs `node src/index.js`, and there is no dist/ to keep in step.
+   *
+   * WHY THIS EXISTS. The Mini App is 7,900 lines of TypeScript and is
+   * typechecked. These services are ~2,000 lines of JavaScript that were checked
+   * by nothing at all -- and they are the half that verifies HMACs, mints
+   * sessions, spends stakes and signs BSC transactions with a KMS key. The risk
+   * was inverted: the strictest checking was on the UI.
+   *
+   * The first run found six things, four of them in kms-signer.js, where `r` and
+   * `s` are passed to viem's serializeTransaction as plain strings when its type
+   * demands `0x${string}`. They are hex-prefixed at runtime, so nothing is
+   * broken -- but on the transaction-signing path that was being asserted by
+   * nobody.
+   *
+   * strict: false, deliberately. The goal is to catch wrong shapes and wrong
+   * arguments in code that already exists, not to relitigate every implicit
+   * `any` in a working service. Tighten once the current findings are cleared.
+   */
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ES2022",
+    "moduleResolution": "bundler",
+    "allowJs": true,
+    "checkJs": true,
+    "noEmit": true,
+    "strict": false,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "types": ["node"]
+  },
+  "include": ["src/**/*.js"]
+}
