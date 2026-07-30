@@ -33,31 +33,36 @@ variable "enable_rate_limiting" {
   default     = false
 }
 
-variable "rate_limit_requests_per_minute" {
+variable "rate_limit_requests_per_10s" {
   description = <<-EOT
-    Requests per minute per source IP to the authentication and account-creation
-    endpoints before blocking.
+    Requests per TEN SECONDS per source IP to the authentication and
+    account-creation endpoints before blocking.
 
-    Thirty, not ten, and the reason is the player base rather than the threat.
+    Ten seconds, not a minute, because the free plan is entitled to exactly one
+    period and that is it -- see the note on `period` in main.tf. The window is
+    therefore short and bursty, which makes the value below more sensitive to
+    get wrong than a per-minute figure would be.
+
+    Twenty, and the reason is the player base rather than the threat.
 
     The rule keys on ip.src. This game's players reach Telegram over Ethiopian
     mobile networks, where large numbers of subscribers share a small pool of
-    carrier-NAT addresses -- so "one IP" here is not one person. At ten per
-    minute, a busy evening on one carrier egress would start blocking players
-    who have done nothing but open the app, and the symptom is a Mini App that
-    fails to log in for some users and not others, with nothing in the origin
-    logs because Cloudflare answered first.
+    carrier-NAT addresses -- so "one IP" here is not one person. On a ten-second
+    window a low value is easy to trip by accident: five would mean a sixth
+    person opening the app in the same ten seconds behind one carrier egress
+    gets blocked. The symptom is a Mini App that fails to log in for some users
+    and not others, with nothing in the origin logs, because Cloudflare answered
+    first.
 
-    Thirty still stops a script cold: a real client calls /auth/telegram once per
-    session, so thirty is roughly thirty distinct people behind one address in
-    the same minute, and an attacker looking for volume needs orders of
-    magnitude more than that to be worth their time.
+    Twenty still caps any single address at two requests a second sustained. A
+    real client calls /auth/telegram once per session, so this is generous for
+    humans and a hard ceiling for a script.
 
     If this ever needs to be tight rather than generous, the fix is to stop
     keying on IP -- not to lower this number.
   EOT
   type        = number
-  default     = 30
+  default     = 20
 }
 
 variable "enable_cache_bypass" {

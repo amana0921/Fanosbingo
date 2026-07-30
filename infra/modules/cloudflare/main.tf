@@ -221,10 +221,25 @@ resource "cloudflare_ruleset" "rate_limit" {
     ratelimit = {
       # Per source IP. Telegram Mini App traffic arrives from real client
       # addresses, so this is the right key.
-      characteristics     = ["ip.src", "cf.colo.id"]
-      period              = 60
-      requests_per_period = var.rate_limit_requests_per_minute
-      mitigation_timeout  = 600
+      characteristics = ["ip.src", "cf.colo.id"]
+
+      # TEN SECONDS, and it is not a choice. The free plan is entitled to
+      # exactly one period. Applying with 60 fails:
+      #
+      #   400 Bad Request
+      #   "not entitled to use the period 60, can only use a period among [10]"
+      #     pointer: /rules/0/ratelimit/period
+      #
+      # Not discoverable from a plan -- the plan was clean and the entitlement is
+      # only checked when the ruleset is POSTed. Hardcoded rather than made a
+      # variable, because there is nothing to choose between.
+      period = 10
+
+      requests_per_period = var.rate_limit_requests_per_10s
+
+      # Same entitlement story. 600 is a paid-plan value; 10 is what free
+      # allows, and is valid on every plan.
+      mitigation_timeout = 10
     }
   }]
 }
