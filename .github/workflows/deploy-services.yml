@@ -109,6 +109,54 @@ jobs:
           echo "registry=$REGISTRY" >> "$GITHUB_OUTPUT"
           echo "repository=${REGISTRY}/fanosbingo-${ENVIRONMENT}/${SERVICE}" >> "$GITHUB_OUTPUT"
 
+      # Run the service's own tests BEFORE building an image from it.
+      #
+      # This gate did not exist, and neither did any pull-request check that ran
+      # them (see .github/workflows/test.yml). So a service whose test suite
+      # failed could be built, pushed, pointed at by SSM and rolled out, and
+      # nothing anywhere would have objected. For `functions` that suite is what
+      # asserts initData verification rejects a forgery, that a mainnet RPC is
+      # REFUSED when the environment is configured for testnet, and that KMS
+      # signatures recover to the address we expect -- none of which fail loudly
+      # at runtime if they regress.
+      #
+      # Seconds to run, no AWS, no secrets. There is no argument for shipping
+      # without it.
+      #
+      # Only for services that HAVE a suite. Checked with a glob rather than a
+      # hardcoded list, so a suite added to the ticker starts gating its deploys
+      # without anybody remembering to edit this.
+      # Unconditional, and there is a SECOND setup-node further down guarded by
+      # `service == 'caddy'`. That is deliberate, not a leftover: this one gives
+      # every service a Node to run its tests with, and the caddy one sets up the
+      # npm cache keyed on the ROOT lockfile for the Mini App build. setup-node
+      # is idempotent, so running it twice costs a few seconds and removing
+      # either one breaks something.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Test the service before building it
+        env:
+          SERVICE: ${{ github.event.inputs.service }}
+        run: |
+          set -euo pipefail
+
+          dir="services/${SERVICE}"
+
+          if [ ! -f "$dir/package.json" ]; then
+            echo "No package.json in $dir; nothing to test (postgrest, realtime and caddy are upstream images)."
+            exit 0
+          fi
+
+          if ! ls "$dir"/src/*.test.mjs >/dev/null 2>&1; then
+            echo "::warning::${SERVICE} has no test suite. Building unverified."
+            exit 0
+          fi
+
+          npm --prefix "$dir" ci --no-audit --no-fund
+          npm --prefix "$dir" test
+
       # QEMU so an x86 runner can build arm64. Slower than a native arm64
       # runner, but free on private repositories.
       - uses: docker/setup-qemu-action@v3

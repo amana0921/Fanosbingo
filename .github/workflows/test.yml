@@ -1,0 +1,99 @@
+name: Tests
+
+# Runs the service test suites on every pull request that touches them.
+#
+# WHY THIS EXISTS
+#
+# It did not, and that is the finding. The repository had 61 assertions across
+# four suites -- Telegram initData verification, KMS signature recovery, chain-id
+# mismatch refusal, and request-body handling -- and NOTHING ran them. `npm run
+# test:functions` was documented in the README as a local check, which means it
+# ran when somebody remembered.
+#
+# The consequence was not hypothetical. A pull request that broke initData
+# verification, or made the chain check stop refusing a mainnet RPC, or broke the
+# KMS signer, would have gone green and merged, because the only workflows
+# triggered by a pull request were db-migrate (paths db/**) and terraform (paths
+# infra/**). A change confined to services/ triggered nothing at all.
+#
+# This is the same shape as verify.yml's own reason for existing: a control that
+# exists, is well written, and is never exercised. These tests were written
+# carefully -- chain.test.mjs runs a real HTTP server rather than stubbing fetch,
+# precisely so it cannot pass against code that could not parse a real response
+# -- and then left unwired.
+#
+# NEEDS NO AWS AND NO SECRETS. There is nothing to gate, no OIDC role to assume,
+# and no reason for this not to run on every pull request from anyone.
+
+on:
+  pull_request:
+    paths:
+      - 'services/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - '.github/workflows/test.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'services/**'
+      - '.github/workflows/test.yml'
+  workflow_dispatch:
+
+# Read-only. This job builds nothing and deploys nothing.
+permissions:
+  contents: read
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  functions:
+    name: functions service
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: services/functions/package-lock.json
+
+      # `npm ci` rather than `npm install`, so a lockfile that has drifted from
+      # package.json fails here instead of resolving to something different from
+      # what the Dockerfile will install.
+      - name: Install
+        run: npm ci --no-audit --no-fund
+        working-directory: services/functions
+
+      - name: Test
+        run: npm test
+        working-directory: services/functions
+
+  ticker:
+    name: ticker service
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: services/ticker/package-lock.json
+
+      - name: Install
+        run: npm ci --no-audit --no-fund
+        working-directory: services/ticker
+
+      # The ticker has no test suite yet. This asserts the entry point at least
+      # PARSES, which is not nothing: it is the process that calls game_tick()
+      # once a second, and a syntax error in it stops the game with no HTTP
+      # endpoint failing to make it obvious.
+      #
+      # --check rather than running it, because running it would try to reach a
+      # database. When the ticker gains real tests, replace this with `npm test`.
+      - name: Parse check
+        run: node --check src/index.js
+        working-directory: services/ticker

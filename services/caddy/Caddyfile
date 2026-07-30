@@ -51,25 +51,59 @@ https://api.{$DOMAIN}:{$HTTPS_PORT:443} {
 			# traffic actually takes, and it costs no extra requests.
 			#
 			# Three failures inside 30s takes the upstream out of rotation for
-			# 10s. With one upstream that means fast 502s instead of requests
-			# piling up against a process that is not answering -- which is what
-			# turns a restarting container into a queue of stuck connections.
+			# 10s, so a restarting container gives fast failures instead of a
+			# queue of stuck connections.
+			#
+			# `unhealthy_status 5xx` was removed here for the same reason it was
+			# removed from the functions route below: with a SINGLE upstream,
+			# ejection has no peer to shed load onto, so counting application
+			# error responses as unhealthiness only widens a fault from the
+			# caller who caused it to everybody. On the functions route that was
+			# not theoretical -- three malformed bodies took auth down for all
+			# players. PostgREST answers most SQL problems with 4xx, so this was
+			# less exposed, but the reasoning does not depend on how often it
+			# fires.
+			#
+			# Connection-level failures still count, which is the case this was
+			# wanted for. Reinstate the status check at Stage 2, when a second
+			# instance makes ejection meaningful.
 			fail_duration 10s
 			max_fails 3
-			unhealthy_status 5xx
 			unhealthy_latency 10s
 		}
 	}
 
-	# Ported edge functions. Not deployed yet; returns 502 until it is, which is
-	# a clearer signal than a 404 suggesting the route does not exist.
+	# The functions service: auth, and the operations RLS cannot express.
+	#
+	# NOTE THE ABSENCE OF `unhealthy_status 5xx`, which used to be here and
+	# caused a trivially triggerable outage.
+	#
+	# MEASURED against live dev, 2026-07-30: three requests with an unparseable
+	# body -- literally `--data-binary '7'` -- returned 500 each (the body parser
+	# threw and the generic handler called it a server error). That hit
+	# max_fails 3, this upstream left rotation for fail_duration 10s, and the
+	# next request from ANY player got 503. Repeat every ten seconds and nobody
+	# can log in, from one caller, with no credentials and no volume.
+	#
+	# The 500 was fixed at the source -- a malformed body is now a 400, see
+	# services/functions/src/http-errors.js -- but the amplifier should go too,
+	# because it cannot do its job here. Taking an upstream out of rotation sheds
+	# load onto a healthy peer. There IS no peer: one instance, one container.
+	# So ejection cannot help, and converts an error affecting one caller into an
+	# outage affecting everybody.
+	#
+	# What remains still does the useful part. Caddy detects a refused connection
+	# or a dead process on its own and fails fast without being told to watch
+	# status codes, which is the case the passive check was actually wanted for.
+	#
+	# REINSTATE THIS AT STAGE 2. With two instances behind an ALB, ejecting an
+	# unhealthy one is exactly right, because then there is somewhere else to go.
 	handle_path /functions/v1/* {
 		reverse_proxy 127.0.0.1:8080 {
 			header_up X-Forwarded-Proto https
 
 			fail_duration 10s
 			max_fails 3
-			unhealthy_status 5xx
 			unhealthy_latency 10s
 		}
 	}
