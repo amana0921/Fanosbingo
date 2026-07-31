@@ -7,6 +7,7 @@ import { getCachedLayouts, setCachedLayouts } from '../utils/cardLayoutCache';
 import WalletConnect from './WalletConnect';
 import { WalletDepositModal } from './WalletDepositModal';
 import { BnbWithdrawalModal } from './BnbWithdrawalModal';
+import { BankDepositModal } from './BankDepositModal';
 import { Sun, Moon, Wallet, Timer, Hash, Trophy, Coins } from 'lucide-react';
 import { formatBnb } from '../utils/formatBalance';
 
@@ -56,8 +57,20 @@ export function Lobby({ onJoinGame, onSpectateGame, telegramUser }: LobbyProps) 
   const [isLoadingPreview, setIsLoadingPreview] = useState(false);
   const [isWalletDepositModalOpen, setIsWalletDepositModalOpen] = useState(false);
   const [isBnbWithdrawalModalOpen, setIsBnbWithdrawalModalOpen] = useState(false);
+  const [isBankDepositModalOpen, setIsBankDepositModalOpen] = useState(false);
 
-  const canPlay = !!telegramUser && !!registeredUser && isWalletConnected;
+  // A FUNDED ACCOUNT is what gates playing, not a crypto wallet.
+  //
+  // This used to end in `&& isWalletConnected`, which meant a player who had
+  // deposited by TeleBirr or CBE still could not pick a card. That made the whole
+  // bank-transfer path pointless: they would have had to install a crypto wallet
+  // to spend money they had already sent by bank.
+  //
+  // select_card_atomic still refuses a player who cannot cover the stake, so the
+  // balance check has not moved -- it has just stopped being expressed as "owns a
+  // wallet". The wallet is now required only for the crypto deposit and withdrawal
+  // paths, which genuinely need somewhere to send BNB.
+  const canPlay = !!telegramUser && !!registeredUser;
 
   const addToast = useCallback((message: string, type: 'success' | 'error' | 'info') => {
     const id = Math.random().toString(36).substr(2, 9);
@@ -819,11 +832,34 @@ export function Lobby({ onJoinGame, onSpectateGame, telegramUser }: LobbyProps) 
           </div>
         </div>
 
-        {/* Connect Wallet Prompt */}
+        {/* Money in and out.
+            Bank transfer first: it is the path players here actually use, and it
+            needs no wallet. The crypto panel below it is opt-in.
+
+            This used to be a single "Connect Your BNB Wallet to Play" prompt
+            shown to anyone without a wallet, gating deposits, withdrawals AND
+            playing behind it. */}
+        {registeredUser && (
+          <div className={`border-l-4 p-3 mb-3 rounded transition-colors duration-300 ${isDarkMode ? 'bg-sky-900/20 border-sky-600 text-sky-300' : 'bg-sky-50 border-sky-400 text-sky-800'}`}>
+            <p className="text-sm font-semibold mb-2">Deposit or withdraw by bank</p>
+            <p className="text-xs mb-2 opacity-90">TeleBirr or CBE. No wallet needed. Withdrawal by bank is coming next.</p>
+            <div className="flex gap-2">
+              <button
+                onClick={() => setIsBankDepositModalOpen(true)}
+                className="flex-1 py-2 px-4 rounded-lg font-semibold transition-colors bg-sky-600 hover:bg-sky-700 text-white"
+              >
+                Deposit
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Crypto, for players who want it. Genuinely needs a wallet: there has
+            to be somewhere to send BNB. */}
         {!isWalletConnected && (
           <div className={`border-l-4 p-3 mb-3 rounded transition-colors duration-300 ${isDarkMode ? 'bg-yellow-900/20 border-yellow-600 text-yellow-300' : 'bg-yellow-50 border-yellow-400 text-yellow-800'}`}>
-            <p className="text-sm font-semibold mb-2">Connect Your BNB Wallet to Play</p>
-            <p className="text-xs mb-2 opacity-90">A wallet connection is required to deposit, withdraw, and play games.</p>
+            <p className="text-sm font-semibold mb-2">Prefer crypto?</p>
+            <p className="text-xs mb-2 opacity-90">Connect a BNB wallet to deposit or withdraw in BNB. Not needed to play.</p>
             <WalletConnect
               telegramUserId={telegramUser?.id || 0}
               onWalletConnected={() => addToast('Wallet connected!', 'success')}
@@ -831,7 +867,6 @@ export function Lobby({ onJoinGame, onSpectateGame, telegramUser }: LobbyProps) 
           </div>
         )}
 
-        {/* Wallet connected, ready to play */}
         {isWalletConnected && registeredUser && (
           <div className={`border-l-4 p-3 mb-3 rounded transition-colors duration-300 ${isDarkMode ? 'bg-emerald-900/20 border-emerald-600 text-emerald-300' : 'bg-emerald-50 border-emerald-400 text-emerald-800'}`}>
             <p className="text-sm font-semibold mb-2">Crypto (BNB) Deposits & Withdrawals</p>
@@ -845,9 +880,9 @@ export function Lobby({ onJoinGame, onSpectateGame, telegramUser }: LobbyProps) 
               </button>
               <button
                 onClick={() => setIsBnbWithdrawalModalOpen(true)}
-                disabled={(!registeredUser.won_balance || registeredUser.won_balance === 0) && (!registeredUser.deposited_balance || registeredUser.deposited_balance === 0)}
+                disabled={!registeredUser.won_balance || registeredUser.won_balance === 0}
                 className={`flex-1 py-2 px-4 rounded-lg font-semibold transition-colors ${
-                  (registeredUser.won_balance > 0 || registeredUser.deposited_balance > 0)
+                  registeredUser.won_balance > 0
                     ? 'bg-yellow-600 hover:bg-yellow-700 text-white'
                     : isDarkMode ? 'bg-gray-700 text-gray-500 cursor-not-allowed' : 'bg-gray-200 text-gray-400 cursor-not-allowed'
                 }`}
@@ -992,6 +1027,12 @@ export function Lobby({ onJoinGame, onSpectateGame, telegramUser }: LobbyProps) 
       <ToastContainer toasts={toasts} onRemove={removeToast} />
       {telegramUser && (
         <>
+          <BankDepositModal
+            isOpen={isBankDepositModalOpen}
+            onClose={() => setIsBankDepositModalOpen(false)}
+            telegramUserId={telegramUser?.id || 0}
+          />
+
           <WalletDepositModal
             isOpen={isWalletDepositModalOpen}
             onClose={() => setIsWalletDepositModalOpen(false)}

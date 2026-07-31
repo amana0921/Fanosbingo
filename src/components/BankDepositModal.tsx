@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import { supabase } from '../lib/supabase';
+import { getAccessToken } from '../lib/auth';
 import { X, Building2, Copy, Check } from 'lucide-react';
 
 interface BankOption {
@@ -63,6 +64,49 @@ export function BankDepositModal({ isOpen, onClose, telegramUserId }: BankDeposi
       }
     } catch (error) {
       console.error('Error loading support contact:', error);
+    }
+  };
+
+  const [reference, setReference] = useState('');
+  const [claimAmount, setClaimAmount] = useState('');
+  const [claimBusy, setClaimBusy] = useState(false);
+  const [claimError, setClaimError] = useState<string | null>(null);
+  const [claimOk, setClaimOk] = useState(false);
+
+  const submitClaim = async () => {
+    if (!selectedBank) return;
+    setClaimBusy(true);
+    setClaimError(null);
+    setClaimOk(false);
+
+    try {
+      const token = await getAccessToken();
+      const res = await fetch(`${import.meta.env.VITE_SUPABASE_URL}/functions/v1/deposits/claim`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          bankOptionId: selectedBank.id,
+          referenceNumber: reference.trim(),
+          claimedAmount: Number(claimAmount),
+        }),
+      });
+
+      const body = await res.json().catch(() => ({}));
+
+      if (res.ok && body.success) {
+        setClaimOk(true);
+        setReference('');
+        setClaimAmount('');
+        return;
+      }
+
+      // 409 is the duplicate-reference case and is the one a player can act on:
+      // they have already submitted this transfer.
+      setClaimError(body.error ?? `Could not submit (${res.status})`);
+    } catch {
+      setClaimError('Could not reach the server. Check your connection and try again.');
+    } finally {
+      setClaimBusy(false);
     }
   };
 
@@ -173,10 +217,58 @@ export function BankDepositModal({ isOpen, onClose, telegramUserId }: BankDeposi
                 </div>
               )}
 
-              <div className="bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-700 rounded-lg p-4">
-                <p className="text-sm text-blue-800 dark:text-blue-300">
-                  <strong>After making the deposit:</strong> Send the bank SMS confirmation to the Telegram bot, and your account will be credited automatically.
+              {/* THE CLAIM FORM.
+                  This modal was display-only: it showed where to send money and
+                  stopped. The note it replaces told players to "send the bank SMS
+                  confirmation to the Telegram bot", which describes the upstream
+                  SMS-matching flow -- there is no bot webhook on this
+                  infrastructure, so nothing was listening and no deposit could
+                  ever be credited.
+
+                  Posts to /deposits/claim, which derives the player from the
+                  token and the bank name from our own row. The player supplies
+                  only the reference and the amount. */}
+              <div className="border border-gray-200 dark:border-gray-600 rounded-lg p-4 space-y-3">
+                <h4 className="font-semibold text-gray-900 dark:text-gray-100">After you have sent the money</h4>
+                <p className="text-sm text-gray-600 dark:text-gray-400">
+                  Enter the transaction number from your {selectedBank.bank_name} SMS. We check the
+                  account and credit you, usually within a few minutes.
                 </p>
+
+                <div className="flex gap-2">
+                  <input
+                    type="text"
+                    value={reference}
+                    onChange={(e) => setReference(e.target.value)}
+                    placeholder="Transaction number"
+                    className="flex-1 px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg text-sm dark:bg-gray-700 dark:text-gray-100"
+                  />
+                  <input
+                    type="number"
+                    inputMode="numeric"
+                    value={claimAmount}
+                    onChange={(e) => setClaimAmount(e.target.value)}
+                    placeholder="Amount"
+                    className="w-28 px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg text-sm dark:bg-gray-700 dark:text-gray-100"
+                  />
+                </div>
+
+                {claimError && (
+                  <p className="text-sm text-red-600 dark:text-red-400">{claimError}</p>
+                )}
+                {claimOk && (
+                  <p className="text-sm text-green-700 dark:text-green-400">
+                    Submitted. We will credit your account once we confirm the transfer.
+                  </p>
+                )}
+
+                <button
+                  onClick={submitClaim}
+                  disabled={claimBusy || !reference.trim() || !claimAmount.trim()}
+                  className="w-full py-2 px-4 rounded-lg font-semibold bg-blue-600 hover:bg-blue-700 text-white disabled:opacity-50"
+                >
+                  {claimBusy ? 'Submitting…' : 'I have sent the money'}
+                </button>
               </div>
             </div>
           ) : banks.length === 0 ? (
