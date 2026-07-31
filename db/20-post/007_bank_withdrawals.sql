@@ -65,6 +65,63 @@ CREATE INDEX IF NOT EXISTS withdrawal_requests_pending
   ON withdrawal_requests (requested_at) WHERE status = 'pending';
 
 -- ---------------------------------------------------------------------------
+-- Say what the read policy means, instead of being right by accident
+--
+-- The inherited policy is:
+--
+--   USING (telegram_user_id = (SELECT telegram_user_id FROM telegram_users
+--                              WHERE telegram_user_id = withdrawal_requests.telegram_user_id))
+--
+-- which compares a value to itself. As written it is a tautology, granted TO
+-- public, over a table holding amounts, bank names, account numbers and account
+-- holder names.
+--
+-- It does not currently leak, and the reason is worth knowing because it is not
+-- this policy. The subquery reads telegram_users, and db/20-post/004 scoped that
+-- to `id = auth.uid()` -- so for a row belonging to someone else the subquery
+-- finds nothing, returns NULL, the comparison is NULL, and the row is filtered.
+-- Verified: an anonymous request returns content-range */0 against a table with
+-- rows in it.
+--
+-- So the protection comes from a DIFFERENT table's policy. Loosen 004 and this
+-- silently becomes a public list of every player's bank account. Replaced with
+-- the condition it was always meant to express.
+DROP POLICY IF EXISTS "Users can read own withdrawal requests" ON withdrawal_requests;
+DROP POLICY IF EXISTS "Users can view own withdrawal requests" ON withdrawal_requests;
+-- And this file's own policy, so a second run replaces it rather than failing on
+-- "already exists". These files are repeatable; the migration test applies them
+-- twice for exactly this reason, and caught this omission.
+DROP POLICY IF EXISTS "Players read their own withdrawal requests" ON withdrawal_requests;
+
+CREATE POLICY "Players read their own withdrawal requests"
+  ON withdrawal_requests FOR SELECT TO authenticated
+  USING (telegram_user_id = (SELECT telegram_user_id FROM telegram_users WHERE id = auth.uid()));
+
+-- No INSERT policy, deliberately. src/components/BankWithdrawalModal.tsx inserts
+-- into this table directly from the browser, which fails on RLS today and should
+-- keep failing: a client-side insert would set telegram_user_id and amount with
+-- no balance check and no serialisation, so a player could file withdrawals
+-- against someone else, or ten against their own balance at once. Requests go
+-- through request_bank_withdrawal(), below.
+
+DO $$
+DECLARE v_bad text;
+BEGIN
+  SELECT string_agg(policyname, '; ') INTO v_bad
+  FROM pg_policies
+  WHERE tablename = 'withdrawal_requests'
+    AND cmd IN ('INSERT', 'UPDATE', 'ALL')
+    AND NOT ('service_role' = ANY(roles));
+
+  IF v_bad IS NOT NULL THEN
+    RAISE EXCEPTION
+      'withdrawal_requests has a non-service_role write policy: %. A player could file or alter a payout directly.',
+      v_bad;
+  END IF;
+  RAISE NOTICE 'withdrawal_requests: reads are owner-scoped, writes are service_role only';
+END $$;
+
+-- ---------------------------------------------------------------------------
 -- A decided request is immutable, exactly as in 006
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION withdrawal_requests_freeze_decided()
