@@ -194,6 +194,34 @@ permissions moves failures from "never happens" to "happens the first time you
 actually use it", which is why exercising each path once matters more than the
 configuration being valid.
 
+### Live dev state at handover, 2026-07-31
+
+Facts a new reader will otherwise waste time rediscovering:
+
+| | |
+|---|---|
+| players | **1** — the owner's own Telegram account |
+| admins | **0** — nobody has run the bootstrap yet, so `/admin` shows the login and the deposit queue is unreachable |
+| `bank_options` | **2 active** — Telebirr and CBE, seeded with the owner's real accounts |
+| `deposit_requests` | **1**, reference `SMOKE-1`, status `pending`. **No money was sent.** It was created by an end-to-end check of `/deposits/claim` and is deliberately left as the first thing to reject once an admin exists |
+| `withdrawal_requests` | 0 |
+| contract | not deployed, wallet has 0 on both testnet and mainnet |
+
+**Bootstrapping the first admin** — the step everything else waits on:
+
+```bash
+# 1. open the Mini App in @BingoNovaaBot so the identity exists
+# 2. get the key
+aws ssm get-parameter --name /fanosbingo-dev/app/admin_bootstrap_key \
+  --with-decryption --query Parameter.Value --output text --region us-east-1
+# 3. go to app.<domain>/admin and paste it
+```
+
+It promotes **only the caller** and works **only while zero admins exist**, then
+disarms. Every admin after the first is `UPDATE telegram_users SET is_admin =
+true` through the SSM tunnel — deliberately inconvenient, because granting the
+ability to credit balances should need the same access as changing the schema.
+
 ### The manual money path, end to end
 
 Built 2026-07-31. The player transfers to the house TeleBirr/CBE account, the

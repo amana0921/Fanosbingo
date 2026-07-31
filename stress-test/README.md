@@ -358,3 +358,37 @@ After successful stress testing:
 4. **Implement Caching:** Add Redis for frequently accessed data
 5. **Rate Limiting:** Protect against abuse
 6. **Monitor Production:** Set up alerts for performance degradation
+
+---
+
+## What these scripts can and cannot measure
+
+Added 2026-07-31, after the auth model changed underneath them.
+
+**`k6` is NOT installed by `npm install`.** The `k6: ^0.0.0` entry in the root
+`package.json` is the official autocomplete **stub** — its own description reads
+*"Dummy package for autocompleting k6 scripts"*. It gives you type hints and no
+binary, which is why `npm run stress:spike` has always failed with
+`k6: command not found`. Use the install instructions above. `run-test.sh` now
+checks and says this rather than failing obscurely.
+
+**The card-selection leg will 401 on every request.** These scripts post to
+`/functions/v1/select-card` with `VITE_SUPABASE_ANON_KEY`. That route now requires
+a player JWT and derives the identity, the display name and the card layout from
+it, so the anon key is correctly rejected.
+
+The run is still worth doing — the lobby leg exercises the read path, which is
+most of a lobby's traffic — but read the right metric:
+
+> the scripts record selection **duration before checking status**, and a 401 is
+> fast. So `card_selection_duration` stays green while `card_selection_errors`
+> breaches its threshold. **Read the error rate, not the latency**, until a token
+> is wired in.
+
+To measure the write path properly, mint a player token the way
+`services/functions/src/auth.js` does and send it as the bearer. `scripts/mint-anon-key.mjs`
+is the pattern for reading the signing secret out of SSM.
+
+**There is still no capacity data for this system.** `k6-spike-test.js` targets
+400 concurrent and has never been run at that target, so `t4g.small` is
+unvalidated under load.
