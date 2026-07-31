@@ -1345,6 +1345,34 @@ hot-wallet key is a **non-exportable KMS `ECC_SECG_P256K1` key** — there is no
 plaintext copy anywhere, which is the structural fix for how the original key
 leaked.
 
+### House deposit accounts live in the database, not in git
+
+`bank_options` holds the TeleBirr / CBE accounts players transfer to. They are
+added with `scripts/seed-bank-options.sh`, through the SSM tunnel:
+
+```bash
+source scripts/db-tunnel.sh dev
+./scripts/seed-bank-options.sh          # prompts; nothing lands in shell history
+```
+
+**Not a migration, and the reason is this repository is PUBLIC.** These are a real
+phone number, a real bank account and a real person's name. In a migration they
+would be in git history permanently — harvestable, indexed, and still attached to
+a name long after the account is closed. They are not secret; every depositor has
+to see them. But "not secret" and "should be published in a public git repository
+forever" are different claims and only the first is true.
+
+Use the form a customer recognises: TeleBirr as the local `09…` number rather than
+`+251…`, CBE as the 13-digit account. The instructions field renders under the
+account details and Amharic is fine — the upstream seed data is written that way.
+
+Deactivate rather than delete, so decided deposit requests still resolve the
+account they were about:
+
+```sql
+UPDATE bank_options SET is_active = false WHERE bank_name = '<name>';
+```
+
 ### Deploying the contract needs a `caddy` redeploy
 
 `scripts/deploy-contract.mjs` publishes the address to
