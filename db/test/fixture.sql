@@ -67,6 +67,7 @@ CREATE TABLE telegram_users (
   total_deposited integer DEFAULT 0,
   total_spent integer DEFAULT 0,
   total_won integer DEFAULT 0,
+  total_withdrawn numeric DEFAULT 0,
   referral_code text,
   total_referrals integer DEFAULT 0,
   wallet_address text UNIQUE,
@@ -129,6 +130,30 @@ CREATE TABLE bank_options (
   instructions text NOT NULL, is_active boolean DEFAULT true, display_order integer DEFAULT 0,
   created_at timestamptz DEFAULT now(), updated_at timestamptz DEFAULT now()
 );
+
+
+CREATE TABLE withdrawal_requests (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  telegram_user_id bigint NOT NULL REFERENCES telegram_users(telegram_user_id) ON DELETE CASCADE,
+  amount numeric(10,2) NOT NULL CHECK (amount > 0),
+  status text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','processing','completed','rejected')),
+  requested_at timestamptz DEFAULT now() NOT NULL,
+  processed_at timestamptz, processed_by_admin text, rejection_reason text,
+  bank_name text NOT NULL, account_number text NOT NULL, account_name text NOT NULL,
+  admin_notes text
+);
+ALTER TABLE withdrawal_requests ENABLE ROW LEVEL SECURITY;
+
+CREATE FUNCTION get_available_balance(user_telegram_id bigint) RETURNS numeric
+LANGUAGE plpgsql SECURITY DEFINER SET search_path=public AS $fn$
+DECLARE w numeric; p numeric;
+BEGIN
+  SELECT won_balance INTO w FROM telegram_users WHERE telegram_user_id=user_telegram_id;
+  IF w IS NULL THEN RETURN 0; END IF;
+  SELECT COALESCE(sum(amount),0) INTO p FROM withdrawal_requests
+    WHERE telegram_user_id=user_telegram_id AND status IN ('pending','processing');
+  RETURN w - p;
+END $fn$;
 
 CREATE TABLE card_layouts (
   card_number integer PRIMARY KEY,
