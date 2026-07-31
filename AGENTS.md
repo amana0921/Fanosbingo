@@ -1312,6 +1312,82 @@ hot-wallet key is a **non-exportable KMS `ECC_SECG_P256K1` key** — there is no
 plaintext copy anywhere, which is the structural fix for how the original key
 leaked.
 
+### Rotating `app/jwt_secret` — read this before you need to
+
+There is no way to do this without an auth outage. That is a property of the
+design, not of the procedure, and it is better known now than discovered during
+an incident.
+
+**Who holds it.** One SSM parameter, `/{env}/app/jwt_secret`, injected into
+**three** containers at start:
+
+| Service | Variable | What breaks if it disagrees |
+|---|---|---|
+| functions | `JWT_SECRET` | mints tokens nobody else accepts |
+| postgrest | `PGRST_JWT_SECRET` | rejects every authenticated query — RLS sees `anon` |
+| realtime | `API_JWT_SECRET` | websocket refuses the same token the API accepted |
+
+And a fourth consumer that is not a container: the **anon key is minted from this
+same secret** (`scripts/mint-anon-key.mjs`) and **baked into the SPA bundle** at
+build time, as the `SPA_ANON_KEY` GitHub variable. A rotation that forgets it
+leaves every served bundle carrying a key signed with the old secret.
+
+**Why there is no zero-downtime path.** HS256 with a single shared secret cannot
+accept two secrets at once. None of the three components is configured for
+key-id-based rotation, so there is no window in which both old and new tokens
+verify. Any rotation is therefore: old tokens stop working, everywhere, at once.
+
+**Writing the new secret to SSM changes nothing on its own** — containers read it
+at start, so running tasks keep using the value they were given. The disruption
+window is between the FIRST service restarting and the LAST, and both orderings
+break something:
+
+- functions first → it mints new-secret tokens, postgrest still on the old one
+  rejects them. New logins fail.
+- postgrest first → it accepts only new tokens, functions still minting old ones.
+  All logins fail.
+
+So restart all three as close together as possible and accept a few minutes.
+
+```bash
+# 1. new secret into SSM (nothing changes yet)
+gh workflow run sync-secrets.yml -f environment=dev
+
+# 2. re-mint the anon key FROM THE NEW SECRET and update the GitHub variable,
+#    or the next SPA build ships a key the API will reject
+node scripts/mint-anon-key.mjs dev
+gh variable set SPA_ANON_KEY --body "<the minted key>"
+
+# 3. restart the three consumers, back to back
+for s in functions postgrest realtime; do
+  gh workflow run deploy-services.yml -f service=$s -f environment=dev
+done
+
+# 4. rebuild the SPA so the served bundle carries the new anon key
+gh workflow run deploy-services.yml -f service=caddy -f environment=dev
+```
+
+**What players see.** Every existing session is invalidated. In the Mini App that
+is mostly invisible — the client re-sends `initData` and gets a new token — but
+anyone mid-game loses their subscription until it reconnects. Do not do this
+while a game is in `playing`.
+
+**Verify afterwards**, because a half-rotation is quiet:
+
+```bash
+curl -X POST https://api.<domain>/functions/v1/auth/telegram \
+  -H 'content-type: application/json' -d '{}'          # 400, not 500
+./scripts/probe-public-access.sh https://api.<domain>  # anon still fenced
+```
+Then confirm a real client can log in and that the lobby's realtime channel
+reconnects. If the API works and realtime does not, `API_JWT_SECRET` missed the
+rotation.
+
+**If this ever needs to be routine**, the fix is not a better runbook — it is
+supporting two valid secrets during a window. That means a `kid` header on the
+tokens and all three components able to verify against a set. PostgREST supports a
+JWKS via `PGRST_JWT_SECRET` as a JWK set, which is the thread to pull.
+
 ---
 
 ## 9. If you change one thing, understand this first
