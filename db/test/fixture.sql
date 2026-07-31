@@ -37,6 +37,9 @@ CREATE ROLE authenticator LOGIN NOINHERIT PASSWORD 'fixture';
 CREATE ROLE app_service LOGIN INHERIT PASSWORD 'fixture';
 GRANT anon, authenticated, service_role TO authenticator;
 GRANT service_role TO app_service;
+-- The attribute, which membership does not carry. Without this line the
+-- assertion in 004 correctly fails, which is how the real bug was found.
+ALTER ROLE app_service BYPASSRLS;
 
 CREATE SCHEMA IF NOT EXISTS auth;
 GRANT USAGE ON SCHEMA auth TO anon, authenticated, service_role;

@@ -34,11 +34,19 @@
   # Cognito with TOTP, and this does not close that item. It removes a bypass and
   # gives the audit trail somewhere to point.
   #
-  # ENFORCEMENT IS IN THE ROUTE, NOT IN RLS, on purpose. The admin routes run as
-  # app_service, which inherits service_role and therefore BYPASSES RLS -- the same
-  # shape as /select-card and /claim-bingo, where the check is in the handler
-  # because the operation is not expressible as "which rows may this player see".
-  # A policy referencing is_admin would be a second, weaker copy of the same rule.
+  # ENFORCEMENT IS IN THE ROUTE, NOT IN RLS, on purpose. The admin routes connect
+  # as app_service and the check is in the handler, because "may this person
+  # approve deposits" is not expressible as "which rows may this player see". A
+  # policy referencing is_admin would be a second, weaker copy of the same rule.
+  #
+  # An earlier version of this comment said app_service "inherits service_role and
+  # therefore BYPASSES RLS". That was WRONG. BYPASSRLS is a role ATTRIBUTE and
+  # attributes are not inherited through membership -- app_service was a member of
+  # service_role with rolbypassrls = false. It appeared to work only because every
+  # table it touched happened to carry a `TO service_role` POLICY, which membership
+  # DOES satisfy. bank_options did not, and the deposit route read zero rows from a
+  # table whose contents were plainly there. db/00-bootstrap/001 now sets the
+  # attribute explicitly.
   #
   # REPEATABLE migration: idempotent, re-applied whenever it changes.
 */

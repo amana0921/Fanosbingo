@@ -102,6 +102,37 @@ SELECT format('ALTER ROLE app_service WITH LOGIN INHERIT PASSWORD %L', :'app_pas
 
 GRANT service_role TO app_service;
 
+-- AND THE ATTRIBUTE, SEPARATELY, because membership does not carry it.
+--
+-- BYPASSRLS is a role ATTRIBUTE, not a privilege. `GRANT service_role TO
+-- app_service` with INHERIT passes on service_role's table privileges and makes
+-- app_service match `TO service_role` POLICIES -- but it does not pass on
+-- BYPASSRLS, SUPERUSER, CREATEDB or any other attribute. Those follow the role
+-- you actually are, not the roles you are a member of.
+--
+-- The gap was invisible for months because it only bites on a table with no
+-- service_role policy. telegram_users has two, so every query the ticker and the
+-- functions service made against it worked, and the comment above claiming
+-- app_service "needs privileged access from the moment it connects" read as true.
+--
+-- bank_options has only an `authenticated` policy. So when the deposit route
+-- looked up which house account a claim named, it matched no policy, read zero
+-- rows, and answered "unknown or inactive bank option" for an account that was
+-- plainly there. Diagnosed by comparing pg_roles.rolbypassrls against
+-- pg_has_role() -- the membership was true and the attribute was false.
+--
+-- Fixed here rather than by adding a service_role policy to bank_options,
+-- because the policy route has to be repeated for every table anyone ever adds
+-- and this failure is silent: a missing policy reads as an empty table, not as
+-- an error. The stated intent has always been that these containers are trusted
+-- server-side code.
+--
+-- THE TRADE, stated: a leaked app_service password plus network access to RDS
+-- reads everything. RDS has no public endpoint and the password lives in SSM,
+-- and this was already effectively true through the service_role policies on
+-- telegram_users -- but it is now true uniformly rather than by accident.
+ALTER ROLE app_service BYPASSRLS;
+
 -- ---------------------------------------------------------------------------
 -- 2. auth schema shim
 --
