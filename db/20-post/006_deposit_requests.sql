@@ -87,8 +87,12 @@ CREATE INDEX IF NOT EXISTS deposit_requests_by_player
 ALTER TABLE deposit_requests ENABLE ROW LEVEL SECURITY;
 
 -- A player sees their own claims and nothing else. The operator's queue is read
--- through the admin API, which runs as app_service and bypasses RLS -- the same
--- shape as every other admin operation here.
+-- through the admin API, which connects as app_service.
+--
+-- app_service bypasses RLS because db/00-bootstrap/001 sets BYPASSRLS on the role
+-- ITSELF. Membership of service_role is not enough and never was: BYPASSRLS is an
+-- attribute, not a privilege, so it does not travel through GRANT. See that file
+-- -- the distinction cost a working deposit route reading an empty bank_options.
 DROP POLICY IF EXISTS "Players read their own deposit requests" ON deposit_requests;
 CREATE POLICY "Players read their own deposit requests"
   ON deposit_requests FOR SELECT TO authenticated

@@ -694,6 +694,30 @@ BEGIN
   RAISE NOTICE 'get_lobby_data_instant: one signature, identity taken from the token';
 END $$;
 
+-- 4f. app_service actually bypasses RLS.
+--
+--     Every server-side route -- the ticker's game loop, /select-card,
+--     /claim-bingo, the admin queue -- reads tables as app_service and assumes it
+--     sees everything. It did not. BYPASSRLS is a role ATTRIBUTE and attributes do
+--     not travel through GRANT, so `GRANT service_role TO app_service` made it a
+--     MEMBER with rolbypassrls = false.
+--
+--     That is invisible until a table has no `TO service_role` policy, because
+--     membership satisfies a policy even when the attribute is absent. Every table
+--     the game touches had one; bank_options did not, and the deposit route read
+--     zero rows from it and reported the account as unknown.
+--
+--     A missing policy reads as an empty table rather than as an error, which is
+--     why this is asserted rather than left to be noticed.
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_service' AND rolbypassrls) THEN
+    RAISE EXCEPTION
+      'app_service does not have BYPASSRLS. Membership of service_role does not confer it -- attributes are not inherited. Server-side reads will silently return zero rows on any table without a service_role policy.';
+  END IF;
+  RAISE NOTICE 'app_service: BYPASSRLS set on the role itself';
+END $$;
+
 -- 4d. A function created by the NEXT migration is not anon-callable the moment
 --     it exists.
 --
