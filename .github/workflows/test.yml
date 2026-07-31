@@ -183,8 +183,26 @@ jobs:
   migrations:
     name: migration contract
     runs-on: ubuntu-latest
+
+    # A real PostgreSQL, so the migrations can be executed rather than described.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: fixture
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install psql
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client
 
       - uses: actions/setup-node@v4
         with:
@@ -209,6 +227,28 @@ jobs:
       # that touches a migration.
       - name: No function ends up with two signatures
         run: node scripts/check-migrations.mjs
+
+      # ACTUALLY RUNS THE SQL, which nothing did until now.
+      #
+      # db-migrate.yml's pull-request job runs `db-migrate.sh --dry-run`, which
+      # prints filenames and continues -- it never executes them -- and the static
+      # check above only reads CREATE/DROP statements. Both reported success on a
+      # pull request adding two migrations without either being run. A syntax
+      # error, an unsatisfiable constraint or a failing assertion would have
+      # merged green, and the only thing standing in the way was somebody
+      # remembering to run psql by hand.
+      #
+      # Applies db/20-post/003 onwards against db/test/fixture.sql, TWICE --
+      # these files are repeatable, so one that only works against a clean
+      # database is broken in a way a single pass cannot see.
+      #
+      # Does NOT cover db/00-bootstrap or the 104 inherited migrations: the
+      # bootstrap asserts wal_level=logical and pg_cron in
+      # shared_preload_libraries, and neither is available in a stock image.
+      - name: Migrations actually apply
+        env:
+          DATABASE_URL: postgresql://postgres:fixture@127.0.0.1:5432/postgres
+        run: ./scripts/test-migrations.sh
 
   scripts:
     name: shell scripts
