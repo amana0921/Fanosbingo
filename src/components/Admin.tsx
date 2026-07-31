@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import { getAccessToken } from '../lib/auth';
+import { BankDepositQueue } from './BankDepositQueue';
 import { supabase, Game, Player } from '../lib/supabase';
 import { Shield, XCircle, Users, Clock, Trophy, Settings, DollarSign, TrendingUp, CircleUser as UserCircle, Wallet, ArrowDownToLine } from 'lucide-react';
 import { DepositManagement } from './DepositManagement';
@@ -763,7 +764,14 @@ export function Admin() {
                 </button>
               </div>
             </div>
-            <DepositManagement adminKey={accessKey} />
+            {/* Bank transfers first: this is the path players actually use
+                today. DepositManagement below it is the on-chain BNB view, whose
+                routes are still unimplemented. */}
+            <BankDepositQueue />
+
+            <div className="mt-6">
+              <DepositManagement adminKey={accessKey} />
+            </div>
           </>
         )}
 
