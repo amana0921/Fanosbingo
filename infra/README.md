@@ -477,3 +477,49 @@ cleartext.
   could be peered later.
 - The GitHub OIDC provider is account-wide. Whichever environment you apply
   first sets `create_github_oidc_provider = true`; the other sets it false.
+
+---
+
+## Application state, as of 2026-07-31
+
+The infrastructure documented above is unchanged. What runs on it has moved, and
+two things in this file's assumptions are worth restating.
+
+**A manual money path now exists that needs no smart contract.** Players deposit
+by TeleBirr or CBE, an operator approves against their own bank statement, and
+the balance is credited. So the undeployed contract no longer blocks players from
+funding an account — it blocks only the on-chain deposit and withdrawal routes.
+See AGENTS.md §0.
+
+**`app_service` now carries the `BYPASSRLS` attribute.** It always needed it; it
+never had it. `GRANT service_role TO app_service` makes it a member, and
+membership does not confer role ATTRIBUTES — only privileges and policy matching.
+Every server-side read appeared to work because the tables involved happened to
+carry `TO service_role` policies. `bank_options` did not, and the deposit route
+read zero rows from a table with data in it.
+
+If you add a table that server-side code reads, this is now handled by the role
+rather than by remembering a policy. `db/20-post/004` asserts the attribute.
+
+**CI executes migrations now.** `db-migrate.yml`'s pull-request job runs
+`--dry-run`, which prints filenames and executes nothing. The `migrations` job in
+`test.yml` starts a `postgres:16` service and applies `db/20-post/003` onwards
+against `db/test/fixture.sql`, **twice**, because these files are repeatable and
+one that only works against a clean database is broken in a way a single pass
+cannot see.
+
+It does not cover `db/00-bootstrap` or the 104 inherited migrations: the bootstrap
+asserts `wal_level=logical` and `pg_cron`, neither available in a stock image.
+Closing that needs a custom image.
+
+**The Cloudflare rate-limit rule is applied and does not enforce.** Measured:
+160 requests from one IP to a covered path, zero blocked, and a deliberately
+excluded path behaving identically. Treat it as absent until somebody reads the
+dashboard's rate-limiting analytics. `/auth/telegram` has a per-player limiter in
+the functions service underneath it.
+
+**IMDS hop limit is 1.** Containers can no longer reach the instance metadata
+service; task credentials come from the ECS agent at `169.254.170.2` and are
+unaffected. Changing it again requires an explicit
+`aws autoscaling start-instance-refresh` — Terraform will not trigger one,
+because the ASG references `version = "$Latest"` and therefore shows no diff.
