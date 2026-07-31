@@ -407,6 +407,12 @@ module "functions" {
     JWT_SECRET              = "/${var.name_prefix}/app/jwt_secret"
     TELEGRAM_BOT_TOKEN      = "/${var.name_prefix}/telegram/bot_token"
     TELEGRAM_WEBHOOK_SECRET = "/${var.name_prefix}/telegram/webhook_secret"
+
+    # Promotes the FIRST admin and nothing else: the route it backs works only
+    # while zero admins exist and only ever promotes its own caller, so this key
+    # becomes worthless the moment it is used once. Every admin after the first is
+    # added with database access, through the SSM tunnel.
+    ADMIN_BOOTSTRAP_KEY = "/${var.name_prefix}/app/admin_bootstrap_key"
   }
 }
 
