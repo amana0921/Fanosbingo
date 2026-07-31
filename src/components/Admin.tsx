@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react';
+import { getAccessToken } from '../lib/auth';
 import { supabase, Game, Player } from '../lib/supabase';
 import { Shield, XCircle, Users, Clock, Trophy, Settings, DollarSign, TrendingUp, CircleUser as UserCircle, Wallet, ArrowDownToLine } from 'lucide-react';
 import { DepositManagement } from './DepositManagement';
@@ -403,38 +404,70 @@ export function Admin() {
 
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!accessKey.trim()) {
-      alert('Please enter an access key');
-      return;
-    }
 
+    // ASKS THE SERVER, and believes only a positive answer.
+    //
+    // This used to POST to /functions/v1/update-settings and treat anything that
+    // was not 401 as success. That route answers 404 -- it is one of the
+    // inherited Deno names the rebuilt service never implemented -- so 404 took
+    // the else branch and ANY string logged you in. Visiting /admin and typing
+    // one character was enough.
+    //
+    // The access key is no longer a credential. An admin is a flag on the
+    // Telegram identity this system already verified, so the only question is
+    // whether the CURRENT player is one. The field remains for bootstrapping the
+    // very first admin, which is the one case where a key is still needed.
+    //
+    // This gate is a CONVENIENCE. Every admin route enforces requireAdmin
+    // server-side, so a client that skipped this check would still be refused.
     try {
-      const response = await fetch(
-        `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/update-settings`,
-        {
-          method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${import.meta.env.VITE_SUPABASE_ANON_KEY}`,
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            key: 'test',
-            value: 'test',
-            adminKey: accessKey,
-          }),
-        }
+      const token = await getAccessToken();
+
+      const whoami = await fetch(
+        `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/admin/whoami`,
+        { headers: { Authorization: `Bearer ${token}` } },
       );
 
-      if (response.status === 401) {
-        alert('Invalid access key');
-      } else {
-        setIsAuthenticated(true);
+      if (whoami.ok) {
+        const { is_admin } = await whoami.json();
+        if (is_admin) {
+          setIsAuthenticated(true);
+          return;
+        }
       }
+
+      // Not an admin yet. If a key was supplied, try the one-time bootstrap --
+      // it promotes only this caller, and only while no admin exists at all.
+      if (accessKey.trim()) {
+        const boot = await fetch(
+          `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/admin/bootstrap`,
+          {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${token}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ key: accessKey }),
+          },
+        );
+
+        if (boot.ok) {
+          setIsAuthenticated(true);
+          return;
+        }
+
+        const { error } = await boot.json().catch(() => ({ error: 'request failed' }));
+        alert(error ?? 'Not authorised');
+        return;
+      }
+
+      alert('This Telegram account is not an admin.');
     } catch (error) {
-      alert('Failed to verify access key. Please try again.');
+      alert('Could not reach the API to verify admin access.');
       console.error(error);
     }
   };
+
 
   const handleEndGame = async (gameId: string) => {
     if (!confirm('Are you sure you want to end this game?')) return;

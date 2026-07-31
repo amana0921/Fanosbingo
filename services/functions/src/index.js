@@ -59,6 +59,7 @@ import { bodyParserErrorHandler } from './http-errors.js';
 import { createRateLimiter } from './rate-limit.js';
 import { createSelectCardHandler } from './select-card.js';
 import { createClaimBingoHandler } from './claim-bingo.js';
+import { requireAdmin, createAdminWhoamiHandler, createAdminBootstrapHandler } from './admin.js';
 
 const {
   PORT = '8080',
@@ -70,6 +71,7 @@ const {
   PGSSLMODE = 'verify-full',
   BSC_CHAIN_ID,
   BSC_RPC_PRIMARY,
+  ADMIN_BOOTSTRAP_KEY,
 } = process.env;
 
 /** Structured JSON, so CloudWatch Logs Insights can query the fields. */
@@ -304,6 +306,34 @@ app.post('/select-card', requireAuth(JWT_SECRET), createSelectCardHandler(pool))
  * else's behalf would let you do to them.
  */
 app.post('/claim-bingo', requireAuth(JWT_SECRET), createClaimBingoHandler(pool));
+
+/**
+ * Admin.
+ *
+ * src/components/Admin.tsx validated its access key by POSTing to
+ * /functions/v1/update-settings and treating anything that was not 401 as
+ * success. That route answers 404, so ANY string logged you in. See
+ * src/admin.js.
+ *
+ * An admin is now a flag on an identity Telegram already signed for, checked
+ * server-side on every request. requireAdmin is chained AFTER requireAuth
+ * because it needs the proven uid.
+ */
+app.get('/admin/whoami', requireAuth(JWT_SECRET), createAdminWhoamiHandler(pool));
+
+// Promotes ONLY the caller, and ONLY while no admin exists -- so it disarms
+// itself on first use and cannot grant admin to anybody else. Safe to leave
+// deployed; see the header in src/admin.js for why all three properties matter.
+app.post(
+  '/admin/bootstrap',
+  requireAuth(JWT_SECRET),
+  createAdminBootstrapHandler(pool, ADMIN_BOOTSTRAP_KEY),
+);
+
+// The gate itself, proven to work before anything is put behind it.
+app.get('/admin/ping', requireAuth(JWT_SECRET), requireAdmin(pool), (_req, res) =>
+  res.json({ ok: true }),
+);
 
 app.use((req, res) => res.status(404).json({ error: 'not found', path: req.path }));
 
