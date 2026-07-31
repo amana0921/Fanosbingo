@@ -35,12 +35,13 @@ countdown ticks — driven by a server-side game loop, not by a browser tab.
 | Layer | State |
 |---|---|
 | Infrastructure (VPC, RDS, ECS, KMS, CloudTrail) | live in **dev**, Terraform, applied through CI |
-| Database | PostgreSQL 16 on RDS, 109 migrations, PITR, restore drilled monthly |
+| Database | PostgreSQL 16 on RDS, 110 migrations, PITR, restore drilled monthly |
 | API (PostgREST) · realtime · game loop · TLS | running |
 | Auth service | running — Telegram `initData` verified, JWT enforced by RLS |
 | Mini App | served from Caddy at `app.<domain>`, built into the image |
-| Some API routes | **404** — inherited function names the rebuilt service never implemented |
-| Database authorization | **fix written, not applied** — `db/20-post/004`. Until it runs, an anonymous caller can read player balances and execute the money-moving functions |
+| Joining and claiming | **working** — `/select-card` and `/claim-bingo`, identity and card layout derived server-side |
+| Three API routes | **404** — `submit-deposit`, `record-withdrawal`, `manage-bnb-withdrawal`. All deposit/withdrawal, all need the contract |
+| Database authorization | **enforced** — EXECUTE is an allowlist, `telegram_users` is owner-scoped, verified by `probe-public-access.sh` |
 | Smart contract | **not deployed** — blocked on a free faucet visit |
 | Production | Terraform written, plans cleanly, never applied |
 
@@ -63,13 +64,16 @@ query runs under row-level security as that player. The hot wallet is a
 IAM role may ask it to sign, with a CloudTrail alarm on anything else. The origin
 accepts traffic only from Cloudflare's published ranges.
 
-That describes the HTTP layer, which was rebuilt, and it is true of it. It was
-**not** true of the database underneath until `db/20-post/004`, which is written
-and not yet applied: the SQL migrations were inherited wholesale from a Supabase
-deployment where the edge functions used the service-role key and RLS was
-decorative, so a permissive policy and a blanket `GRANT EXECUTE` survived into a
-system that depends on neither being there. Both were found by `curl`, not by
-review. See [AGENTS.md](AGENTS.md) §0.
+That was true of the HTTP layer, which was rebuilt, and **not** of the database
+underneath it until `db/20-post/004` — the SQL migrations were inherited wholesale
+from a Supabase deployment where the edge functions used the service-role key and
+RLS was decorative, so a permissive policy and a blanket `GRANT EXECUTE` survived
+into a system that depends on neither being there. Both were found by `curl`, not
+by review.
+
+`004` is applied and `scripts/probe-public-access.sh` reports no exposures.
+EXECUTE is now an allowlist rather than a blanket grant, so a function added in
+future is not reachable by omission.
 
 ---
 
@@ -97,7 +101,7 @@ Local checks that need no AWS:
 
 ```bash
 npm --prefix services/functions install
-npm run test:functions        # 47 assertions
+npm run test:functions        # 137 assertions, 7 suites
 terraform fmt -check -recursive infra/
 ```
 
@@ -107,24 +111,26 @@ terraform fmt -check -recursive infra/
 
 Ordered by what unblocks the most.
 
-**1. Apply the authorization fix.** `db/20-post/004` closes two live exposures
-on the dev API: `telegram_users` is readable by anyone, and the `SECURITY
-DEFINER` functions that move money are executable by anyone. Both were found by
-`curl` against the running system; both are described in full at the top of
-[AGENTS.md](AGENTS.md).
+**1. Fund the wallet from the testnet faucet.** Free, one minute, and the only
+thing between this and a playable game.
+
+`/select-card` and `/claim-bingo` both work now — they 404'd until 2026-07-30 —
+but the stake is 10 and every balance is 0, so every join is correctly refused
+with `INSUFFICIENT_BALANCE`. The three remaining 404s are all deposit/withdrawal
+routes that need the contract to mean anything. And no load test can measure a
+successful join while no balance covers a stake.
 
 ```bash
-gh workflow run db-migrate.yml -f environment=dev -f dry_run=true
-gh workflow run db-migrate.yml -f environment=dev
-./scripts/probe-public-access.sh https://api.yisakmesifin.org
+# https://testnet.bnbchain.org/faucet-smart
+node scripts/deploy-contract.mjs dev              # dry run
+node scripts/deploy-contract.mjs dev --broadcast  # deploys, verifies owner()
 ```
 
-Do this before deploying the contract. Funding the money path while an
-unauthenticated transfer route is open turns an exposure into a loss.
-
-**2. Serve the routes the app calls.** The Mini App calls
-`/functions/v1/get-card-layouts` and others that 404 — inherited Deno function
-names the rebuilt service never implemented. Get the real list from the app:
+**2. Serve the three routes that remain.** `submit-deposit`,
+`record-withdrawal` and `manage-bnb-withdrawal`. Four others are already resolved:
+two built (`select-card`, `claim-bingo`), one moved to an RPC that already existed
+(`get-card-layouts`), and one deleted because `game_tick` already owned it
+(`force-finish-game`). Get the current list from the app rather than this file:
 
 ```bash
 grep -rnoE "functions\.invoke\(['\"][a-z-]+|functions/v1/[a-z-]+" src/ \
@@ -134,17 +140,12 @@ grep -rnoE "functions\.invoke\(['\"][a-z-]+|functions/v1/[a-z-]+" src/ \
 For each, ask **"why can RLS not do this?"** Most are plain data access and
 belong in PostgREST as `supabase.from()` calls, not as routes.
 
-**3. Deploy the smart contract.** Free, and the last blocker on the money path
-once (1) has landed.
-Fund the wallet from the BSC testnet faucet, then:
-
-```bash
-node scripts/deploy-contract.mjs dev              # dry run — checks everything
-node scripts/deploy-contract.mjs dev --broadcast  # deploys, verifies owner()
-```
-
-The deploying wallet becomes the contract owner **permanently**, so this must be
-signed by the KMS key. The script does that and reads `owner()` back to prove it.
+**3. Wire the deposit path.** Once the contract is deployed, `submit-deposit` and
+`monitor-deposits` credit balances, and that is what makes (1) produce a playable
+game rather than a joinable one. `POST /deposits/confirm` must credit only
+`req.auth.uid` and never an id from the body — the requirement is recorded in
+`services/functions/src/index.js`, and `select-card` is the worked example of
+deriving identity from the token instead.
 
 **4. Finish the API surface.** `POST /telegram/webhook` (verify the secret
 strictly), `POST /wins/credit` (needs the contract), `POST /deposits/confirm`.
@@ -159,8 +160,15 @@ Run the restore drill against prod once — dev's 8–11 minute figure is not pr
 
 **Known gaps, deliberately accepted:** single instance in a single AZ (~3–5 min
 MTTR); the SPA is served from that same instance, so a replacement blanks it for
-anyone who misses Cloudflare's cache; no load test yet at the 400-concurrent
-target, so `t4g.small` is unvalidated under load; runbooks unwritten.
+anyone who misses Cloudflare's cache; **no capacity data at all** — the spike test
+targets 400 concurrent and has never run, and `k6` is not installed (the npm entry
+is an autocomplete stub, not the binary).
+
+**Known and not accepted:** the Cloudflare rate-limit rule applies cleanly,
+reports `enabled: true`, and does **not enforce** — 160 requests from one IP,
+zero blocked. `/auth/telegram` has a per-player limiter underneath it, so this is
+not unprotected, but the edge rule should not be counted as a control until
+someone reads the dashboard's rate-limiting analytics.
 
 ---
 
