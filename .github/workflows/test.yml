@@ -30,6 +30,7 @@ on:
     paths:
       - 'services/**'
       - 'scripts/**'
+      - 'stress-test/**'
       - 'src/**'
       - 'db/**'
       - 'supabase/migrations/**'
@@ -42,6 +43,7 @@ on:
     paths:
       - 'services/**'
       - 'scripts/**'
+      - 'stress-test/**'
       - 'src/**'
       - 'db/**'
       - 'supabase/migrations/**'
