@@ -52,33 +52,43 @@ top to bottom once, then used as reference.
 
 ### The next task, in one line
 
-**Visit the BSC testnet faucet.** It is free, it takes a minute, and it is the
-only thing standing between this and a game that can actually be played.
+**Build the bank withdrawal routes and UI.** `db/20-post/007` added the
+correctness layer and it is verified; nothing calls it. The player-facing button
+is deliberately absent rather than 404ing, so the feature is invisible until the
+routes exist.
 
-Everything downstream is already built and waiting on it:
+Mirror `services/functions/src/deposits.js`, which is the worked example:
 
-- **The game is joinable but not playable.** `/select-card` and `/claim-bingo`
-  both work now (they answered 404 until 2026-07-30). But the stake is 10 and
-  every balance is 0, so every join is correctly refused with
-  `INSUFFICIENT_BALANCE`. Verified end to end against the live API — the whole
-  chain runs, the money check stops it.
-- **Three routes cannot be built without it.** `submit-deposit`,
-  `record-withdrawal` and `manage-bnb-withdrawal` are the remaining 404s, and all
-  three are deposit/withdrawal paths that need a deployed contract to be
-  meaningful.
-- **There is still no capacity data.** `k6-spike-test.js` has never run at its
-  400-concurrent target, and a successful join cannot be load-tested while no
-  balance can cover a stake.
-
-```bash
-# fund it: https://testnet.bnbchain.org/faucet-smart
-#          0xE509727904C1B057E58BCe7f4eC5bFb120D5adDF
-node scripts/deploy-contract.mjs dev              # dry run — checks everything
-node scripts/deploy-contract.mjs dev --broadcast  # deploys, verifies owner()
+```
+POST /withdrawals/request              requireAuth -> request_bank_withdrawal()
+GET  /admin/withdrawals?status=pending requireAuth + requireAdmin
+POST /admin/withdrawals/:id/complete   ... -> complete_bank_withdrawal()
+POST /admin/withdrawals/:id/reject     ... -> reject_bank_withdrawal()
 ```
 
-The deploying wallet becomes the contract owner **permanently**, so it must be
-signed by the KMS key. The script does that and reads `owner()` back to prove it.
+Then a player modal (amount + their own bank/account/name) and an operator queue
+alongside `BankDepositQueue.tsx`.
+
+**Two things to carry over from the deposit side, because they are the whole
+point:**
+
+- The operator types the amount THEY SENT, not what was requested. On withdrawal
+  the request amount is authoritative, so this is simpler — but the payout
+  reference (their own transfer receipt) is what makes "did we pay this"
+  answerable later.
+- `complete_bank_withdrawal` deducts the balance. A payout recorded twice costs
+  real money out of a real bank account, and a TeleBirr transfer does not come
+  back. The `UPDATE ... WHERE status IN ('pending','processing')` is the lock;
+  do not replace it with a read-then-write.
+
+### Then: the money path the contract blocks
+
+`submit-deposit`, `record-withdrawal` and `manage-bnb-withdrawal` still 404. All
+three are on-chain paths and all three need the contract deployed, which needs the
+BSC testnet faucet, which now requires ≥0.002 BNB on **mainnet** as an anti-abuse
+gate. The dev wallet has 0.000000 on both networks.
+
+Nothing else is blocked on it: bank deposit works today without any contract.
 
 ### What was the next task, and is now done
 
@@ -184,37 +194,109 @@ permissions moves failures from "never happens" to "happens the first time you
 actually use it", which is why exercising each path once matters more than the
 configuration being valid.
 
+### The manual money path, end to end
+
+Built 2026-07-31. The player transfers to the house TeleBirr/CBE account, the
+operator reads their own bank statement, and credits by hand. **No smart contract
+and no crypto wallet anywhere in it** — which is the point, because the players
+are in Ethiopia and the contract is still undeployed.
+
+```
+player                          operator
+------                          --------
+opens Mini App, picks TeleBirr
+sends money from their phone
+                                bank SMS arrives on THEIR phone (outside this system)
+submits reference + amount
+                                /admin -> Deposits -> queue
+                                checks the real statement
+                                types the amount THEY SEE, approves
+balance credited, can play
+```
+
+| Piece | Where |
+|---|---|
+| house accounts | `bank_options`, seeded by `scripts/seed-bank-options.sh` |
+| player claim | `POST /deposits/claim` → `deposit_requests` |
+| operator queue | `GET /admin/deposits`, `BankDepositQueue.tsx` |
+| the credit | `approve_deposit_request()` in `db/20-post/006` |
+
+**The risk is not forgery, it is double crediting.** A player cannot invent money
+when the operator is reading the real statement. What can go wrong is one real
+transfer credited twice — two claims for one reference, a double-clicked button,
+two operators in the queue. Every constraint in 006 is aimed at that:
+
+- `unique (bank_name, lower(reference_number))` — one transaction, one claim
+- `UPDATE ... WHERE status = 'pending'` — the WHERE clause **is** the lock
+- a trigger freezing decided rows — the row is the audit record
+- `credited_amount` separate from `claimed_amount` — the operator types what the
+  statement shows, and the UI deliberately does **not** prefill it
+
+Withdrawal (`007`) mirrors it with one extra problem that has no deposit-side
+equivalent: **overdraft**. A player with 100 winnings can file ten requests for
+100 before anyone looks. `request_bank_withdrawal()` takes `FOR UPDATE` on the
+player row so requests serialise, and `get_available_balance()` subtracts what is
+already pending.
+
+**Deposits are never withdrawable** — only `won_balance` is. Preserve that. It is
+what stops deposit-and-cash-out being a laundering route, and it predates this
+work (`20251217172433`).
+
 ### What is NOT done
 
-- **Three routes still 404**: `submit-deposit`, `record-withdrawal`,
-  `manage-bnb-withdrawal`. All deposit/withdrawal, all needing the contract.
-  Four others are resolved — `select-card` and `claim-bingo` built,
-  `get-card-layouts` moved to an RPC that already existed, and
-  `force-finish-game` deleted because `game_tick` already owned it.
-- **The game is joinable, not playable.** Stake is 10, every balance is 0, so
-  every join is correctly refused with `INSUFFICIENT_BALANCE`. Needs the faucet.
-- **No capacity data.** `k6` is not installed — the npm entry is an autocomplete
-  stub, not the binary — and `run-test.sh` now says so rather than failing with
-  "command not found".
-- **The Cloudflare rate-limit rule does not enforce.** Applies cleanly, reports
-  `enabled: true`, 160 requests from one IP blocked nothing. `/auth/telegram` has
-  a per-player limiter underneath it, so the endpoint is not unprotected — but
-  the edge rule is not a control until someone reads the dashboard analytics.
-- **Wallet login proves nothing.** `get_or_create_wallet_user` and the wallet
-  branch of `get_lobby_data_instant` trust a caller-supplied address: connecting
-  a wallet is not a signature. Left working deliberately rather than breaking
-  the flow, and it needs a sign-in-with-Ethereum challenge before mainnet. The
-  Telegram path is now proven end to end.
-- **The admin count.** `Admin.tsx:206` counts all of `telegram_users` and will
-  return 0 once 004 lands. It only worked because the table was world-readable;
-  it should come back as an explicit admin policy.
-- **The bot webhook.** Requirements in `services/functions/src/index.js`.
-- **The contract.** Written, deployable, blocked on a free faucet visit.
-- **Prod.** Terraform is complete and plans cleanly; it has never been applied.
-- **The admin surface.** Still a shared string compared with `!==`. No admin path
-  should be built on the new service until that is replaced.
-- **A load test.** `stress-test/k6-spike-test.js` has never run at its
-  400-concurrent target, so `t4g.small` is unvalidated under load.
+Ordered by what blocks the most.
+
+1. **Bank withdrawal routes and UI.** `db/20-post/007` is applied and verified;
+   nothing calls it. See the top of this section.
+2. **Three on-chain routes** — `submit-deposit`, `record-withdrawal`,
+   `manage-bnb-withdrawal`. All blocked on the contract, which is blocked on the
+   faucet, which now wants ≥0.002 mainnet BNB.
+3. **The bot never replies.** `POST /telegram/webhook` was never built.
+   `/start` and `/admin` sent to @BingoNovaaBot do nothing. The Mini App works
+   because it launches from the menu button, not because the bot listens.
+4. **`settings.telegram_bot_username` is wrong** — says `Habeshabingo91bot`,
+   the real bot is `@BingoNovaaBot`. Inherited. Nothing reads it today, which is
+   why it went unnoticed; fix it before anything does.
+5. **No capacity data at all.** `k6-spike-test.js` targets 400 concurrent and has
+   never run. `k6` is not installed — the npm entry is an autocomplete stub, not
+   the binary. `run-test.sh` now says so.
+6. **The Cloudflare rate-limit rule does not enforce.** Applies cleanly, reports
+   `enabled: true`, 160 requests from one IP blocked nothing. `/auth/telegram`
+   has a per-player limiter underneath it so the endpoint is not unprotected, but
+   **do not count the edge rule as a control** until someone reads the
+   dashboard's rate-limiting analytics.
+7. **Admin auth is single factor.** Whoever holds the Telegram account holds the
+   admin API. The recommendation is TOTP on `telegram_users` — roughly 100 lines
+   with `otplib`, no new AWS service — and to put the second factor on the
+   ACTION, not the login. A session left open otherwise credits freely. The
+   README still says "Cognito with TOTP"; that was considered and rejected as a
+   whole second identity system for one feature of it.
+8. **Prod has never been applied.** Terraform is complete and plans cleanly.
+9. **13 SPA typecheck findings**, triaged below. They are a to-do list, not lint.
+
+### Things that will bite you, learned expensively
+
+- **`CREATE OR REPLACE FUNCTION` only replaces a MATCHING signature.** Change the
+  parameter list and you have created an overload with the old body still live.
+  This has cost three incidents here. `scripts/check-migrations.mjs` gates it.
+- **`BYPASSRLS` is a role ATTRIBUTE, not a privilege.** It does not travel through
+  `GRANT`. `app_service` was a member of `service_role` with `rolbypassrls =
+  false` for months; it only worked because the tables it touched happened to
+  carry `TO service_role` policies. A missing policy reads as an **empty table**,
+  not an error.
+- **An RLS assertion that counts rows proves nothing on an empty table.** The
+  original `003` passed for weeks while balances were world-readable. Assert
+  against `pg_policies` and `has_function_privilege`.
+- **`db-migrate.sh --dry-run` executes nothing.** It prints filenames. Before
+  2026-07-31 that was the only migration "test" in CI.
+- **`db/20-post/*` files are REPEATABLE and must be idempotent.** A `CREATE
+  POLICY` without a `DROP` before it applies once and fails the next run — for
+  somebody else's unrelated change. `scripts/test-migrations.sh` applies
+  everything twice for this reason and has already caught it.
+- **Verify against the running system, not the code.** Almost every real finding
+  this session came from `curl`, a screenshot, or a psql session — not from
+  reading. The infrastructure is well built; the failures were things that
+  existed, looked right, and were connected to nothing.
 
 ---
 
@@ -463,7 +545,8 @@ podman run -e HTTPS_PORT=8443 ...
 
 ```bash
 npm --prefix services/functions install    # once
-npm run test:functions                     # 137 assertions, no AWS or network
+npm run test:functions                     # 189 assertions, no AWS or network
+./scripts/test-migrations.sh               # applies db/20-post to a throwaway postgres, TWICE
 ```
 
 They need no credentials. The signer tests generate their own secp256k1 key and
@@ -1296,7 +1379,7 @@ services/
     src/telegram-auth.js      HMAC verification. PLAIN JS so the test imports it
     src/kms-signer.js         DER -> (r,s,v), EIP-2, recovery by checking
     src/chain.js              refuses to run if the RPC serves another chain
-    src/*.test.mjs            137 assertions across 7 suites, no AWS, no network
+    src/*.test.mjs            189 assertions across 8 suites, no AWS, no network
 scripts/
   bootstrap-aws.sh            One-time. Idempotent. State bucket, OIDC, both roles
   bootstrap-github.sh         One-time. Idempotent. Variables, environments,

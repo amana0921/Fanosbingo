@@ -35,11 +35,14 @@ countdown ticks — driven by a server-side game loop, not by a browser tab.
 | Layer | State |
 |---|---|
 | Infrastructure (VPC, RDS, ECS, KMS, CloudTrail) | live in **dev**, Terraform, applied through CI |
-| Database | PostgreSQL 16 on RDS, 110 migrations, PITR, restore drilled monthly |
+| Database | PostgreSQL 16 on RDS, 114 migrations, PITR, restore drilled monthly |
 | API (PostgREST) · realtime · game loop · TLS | running |
 | Auth service | running — Telegram `initData` verified, JWT enforced by RLS |
 | Mini App | served from Caddy at `app.<domain>`, built into the image |
 | Joining and claiming | **working** — `/select-card` and `/claim-bingo`, identity and card layout derived server-side |
+| Bank deposit (TeleBirr / CBE) | **working** — player claims, operator approves against their own statement. No wallet, no contract |
+| Bank withdrawal | **half** — correctness layer in `db/20-post/007`, routes and UI not built |
+| Admin | Telegram identity + `is_admin`, single factor. Bootstrap route promotes only the first admin, then disarms |
 | Three API routes | **404** — `submit-deposit`, `record-withdrawal`, `manage-bnb-withdrawal`. All deposit/withdrawal, all need the contract |
 | Database authorization | **enforced** — EXECUTE is an allowlist, `telegram_users` is owner-scoped, verified by `probe-public-access.sh` |
 | Smart contract | **not deployed** — blocked on a free faucet visit |
@@ -101,7 +104,9 @@ Local checks that need no AWS:
 
 ```bash
 npm --prefix services/functions install
-npm run test:functions        # 137 assertions, 7 suites
+npm run test:functions        # 189 assertions, 8 suites
+./scripts/test-migrations.sh   # applies db/20-post to a throwaway postgres, twice
+node scripts/check-migrations.mjs
 terraform fmt -check -recursive infra/
 ```
 
@@ -109,66 +114,42 @@ terraform fmt -check -recursive infra/
 
 ## What is left
 
-Ordered by what unblocks the most.
+Ordered by what unblocks the most. Engineering detail for every item is in
+**[AGENTS.md](AGENTS.md)** §0.
 
-**1. Fund the wallet from the testnet faucet.** Free, one minute, and the only
-thing between this and a playable game.
+**1. Bank withdrawal routes and UI.** `db/20-post/007` has the correctness layer —
+overdraft prevention, one payout per request, decided rows frozen — and nothing
+calls it. `services/functions/src/deposits.js` is the worked example to mirror.
+The player-facing button is deliberately absent rather than 404ing.
 
-`/select-card` and `/claim-bingo` both work now — they 404'd until 2026-07-30 —
-but the stake is 10 and every balance is 0, so every join is correctly refused
-with `INSUFFICIENT_BALANCE`. The three remaining 404s are all deposit/withdrawal
-routes that need the contract to mean anything. And no load test can measure a
-successful join while no balance covers a stake.
+**2. Fund the wallet from the testnet faucet.** Free, and the only thing blocking
+the three on-chain routes (`submit-deposit`, `record-withdrawal`,
+`manage-bnb-withdrawal`). Note the faucet now wants ≥0.002 BNB on **mainnet** as
+an anti-abuse gate, and the dev wallet has nothing on either network.
 
-```bash
-# https://testnet.bnbchain.org/faucet-smart
-node scripts/deploy-contract.mjs dev              # dry run
-node scripts/deploy-contract.mjs dev --broadcast  # deploys, verifies owner()
-```
+Bank deposits work today without it, so this no longer blocks players.
 
-**2. Serve the three routes that remain.** `submit-deposit`,
-`record-withdrawal` and `manage-bnb-withdrawal`. Four others are already resolved:
-two built (`select-card`, `claim-bingo`), one moved to an RPC that already existed
-(`get-card-layouts`), and one deleted because `game_tick` already owned it
-(`force-finish-game`). Get the current list from the app rather than this file:
+**3. Build the bot webhook.** `POST /telegram/webhook` was never ported.
+`/start` to @BingoNovaaBot does nothing. Requirements are recorded in
+`services/functions/src/index.js` — verify the secret token strictly, and
+re-register with `secret_token` BEFORE deploying the check or the bot goes silent.
 
-```bash
-grep -rnoE "functions\.invoke\(['\"][a-z-]+|functions/v1/[a-z-]+" src/ \
-  | sed -E "s/.*(invoke\(['\"]|v1\/)//" | sort -u
-```
+**4. Replace single-factor admin auth.** TOTP on `telegram_users`, and put the
+second factor on the **action** rather than the login — a session left open
+otherwise credits freely.
 
-For each, ask **"why can RLS not do this?"** Most are plain data access and
-belong in PostgREST as `supabase.from()` calls, not as routes.
+**5. Production.** Terraform is written and plans cleanly, never applied. Needs
+mainnet values and a funded wallet. Run the restore drill against prod once —
+dev's 8–11 minute figure is not prod's.
 
-**3. Wire the deposit path.** Once the contract is deployed, `submit-deposit` and
-`monitor-deposits` credit balances, and that is what makes (1) produce a playable
-game rather than a joinable one. `POST /deposits/confirm` must credit only
-`req.auth.uid` and never an id from the body — the requirement is recorded in
-`services/functions/src/index.js`, and `select-card` is the worked example of
-deriving identity from the token instead.
+**Known and not accepted:** no capacity data at all (the spike test has never run,
+and `k6` is not installed — the npm entry is an autocomplete stub); the Cloudflare
+rate-limit rule applies cleanly and **does not enforce**, so it is not a control
+until somebody reads the dashboard analytics.
 
-**4. Finish the API surface.** `POST /telegram/webhook` (verify the secret
-strictly), `POST /wins/credit` (needs the contract), `POST /deposits/confirm`.
-Requirements for each are recorded in `services/functions/src/index.js`.
-
-**5. Replace the admin key.** A shared string compared with `!==` in browser
-state. Cognito with TOTP, and an audit log on every privileged mutation.
-
-**6. Production.** Terraform is written and plans cleanly, but has never been
-applied. Needs mainnet values, a funded wallet, and `PROD_APPLY_ENABLED=true`.
-Run the restore drill against prod once — dev's 8–11 minute figure is not prod's.
-
-**Known gaps, deliberately accepted:** single instance in a single AZ (~3–5 min
-MTTR); the SPA is served from that same instance, so a replacement blanks it for
-anyone who misses Cloudflare's cache; **no capacity data at all** — the spike test
-targets 400 concurrent and has never run, and `k6` is not installed (the npm entry
-is an autocomplete stub, not the binary).
-
-**Known and not accepted:** the Cloudflare rate-limit rule applies cleanly,
-reports `enabled: true`, and does **not enforce** — 160 requests from one IP,
-zero blocked. `/auth/telegram` has a per-player limiter underneath it, so this is
-not unprotected, but the edge rule should not be counted as a control until
-someone reads the dashboard's rate-limiting analytics.
+**Known and accepted:** single instance in a single AZ (~3–5 min MTTR); the SPA is
+served from that instance, so a replacement blanks it for anyone who misses
+Cloudflare's cache.
 
 ---
 
@@ -185,7 +166,8 @@ The game runs entirely inside Telegram as a Mini App, making it accessible to mi
 ### Player Journey
 
 1. Open the Fanos Bingo Telegram Mini App
-2. Connect a crypto wallet (MetaMask, Trust Wallet, or any WalletConnect-compatible wallet)
+2. Fund the account — **by bank transfer (TeleBirr or CBE), or with BNB**. A crypto
+   wallet is needed only for the BNB path; bank deposits and playing need none
 3. Deposit BNB to receive in-game credits (1 BNB = 100,000 credits by default)
 4. Enter the lobby and pick a card number (1-99)
 5. Wait for the round to start and play in real-time
