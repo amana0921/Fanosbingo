@@ -188,6 +188,39 @@ jobs:
         run: |
           set -euo pipefail
 
+          # THE CHAIN THIS BUNDLE WILL TALK TO, read from the SAME SSM parameter
+          # Terraform writes and the functions service verifies against the RPC at
+          # boot. Not a GitHub variable, which would be a fourth place to disagree.
+          #
+          # src/lib/walletConfig.ts used to hardcode viem's `bsc` -- chain 56,
+          # MAINNET -- in every build including dev, while everything server-side
+          # in dev is testnet 97. Deploying the contract to 97 and handing a
+          # mainnet-connected wallet its address would have sent real BNB to an
+          # address that holds no code and whose key nobody has.
+          VITE_BSC_CHAIN_ID="$(aws ssm get-parameter \
+            --name "/fanosbingo-${ENVIRONMENT}/bsc/chain_id" \
+            --query 'Parameter.Value' --output text)"
+          export VITE_BSC_CHAIN_ID
+
+          case "${VITE_BSC_CHAIN_ID}" in
+            56|97) : ;;
+            *)
+              echo "::error::/fanosbingo-${ENVIRONMENT}/bsc/chain_id is '${VITE_BSC_CHAIN_ID}', expected 56 or 97."
+              exit 1
+              ;;
+          esac
+
+          # Refuse to build a MAINNET bundle for dev by accident. dev is testnet by
+          # construction -- AGENTS.md states nothing there should ever touch
+          # mainnet funds -- so this combination is a misconfiguration, not a
+          # choice.
+          if [ "${ENVIRONMENT}" = "dev" ] && [ "${VITE_BSC_CHAIN_ID}" = "56" ]; then
+            echo "::error::dev is configured for BSC MAINNET (56). Refusing to build."
+            exit 1
+          fi
+
+          echo "Building for BSC chain ${VITE_BSC_CHAIN_ID} ($([ "${VITE_BSC_CHAIN_ID}" = "56" ] && echo mainnet || echo testnet))"
+
           # Check the SHAPE, not just emptiness.
           #
           # "is it set" passes for a value like "<the token it printed>", which
