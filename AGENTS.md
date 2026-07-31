@@ -52,45 +52,45 @@ top to bottom once, then used as reference.
 
 ### The next task, in one line
 
-**Apply `db/20-post/004`.** It is written, tested and unapplied, and until it
-lands the live dev API lets an unauthenticated caller read every player's
-balance and execute the functions that move money. Two findings, both found by
-`curl` against the running system rather than by reading policies:
+**Visit the BSC testnet faucet.** It is free, it takes a minute, and it is the
+only thing standing between this and a game that can actually be played.
+
+Everything downstream is already built and waiting on it:
+
+- **The game is joinable but not playable.** `/select-card` and `/claim-bingo`
+  both work now (they answered 404 until 2026-07-30). But the stake is 10 and
+  every balance is 0, so every join is correctly refused with
+  `INSUFFICIENT_BALANCE`. Verified end to end against the live API — the whole
+  chain runs, the money check stops it.
+- **Three routes cannot be built without it.** `submit-deposit`,
+  `record-withdrawal` and `manage-bnb-withdrawal` are the remaining 404s, and all
+  three are deposit/withdrawal paths that need a deployed contract to be
+  meaningful.
+- **There is still no capacity data.** `k6-spike-test.js` has never run at its
+  400-concurrent target, and a successful join cannot be load-tested while no
+  balance can cover a stake.
 
 ```bash
-# returns telegram_user_id, username, balance, won_balance, wallet_address
-curl https://api.yisakmesifin.org/rest/v1/telegram_users?select=*
-
-# no token, no apikey -- and it EXECUTES
-curl -X POST https://api.yisakmesifin.org/rest/v1/rpc/transfer_balance \
-  -H 'content-type: application/json' \
-  -d '{"from_telegram_id":<a real player>,"transfer_amount":999999999,"to_telegram_id":<attacker>}'
-# {"success": false, "error": "Insufficient won balance"}
+# fund it: https://testnet.bnbchain.org/faucet-smart
+#          0xE509727904C1B057E58BCe7f4eC5bFb120D5adDF
+node scripts/deploy-contract.mjs dev              # dry run — checks everything
+node scripts/deploy-contract.mjs dev --broadcast  # deploys, verifies owner()
 ```
 
-That second response is a **business-logic** rejection, not an authorization
-one. The amount was chosen to exceed the balance so the probe returned before
-any write; with an amount the balance covered, the transfer would have
-completed. The first finding supplies the `telegram_user_id` the second needs.
+The deploying wallet becomes the contract owner **permanently**, so it must be
+signed by the KMS key. The script does that and reads `owner()` back to prove it.
 
-Causes, and why nothing caught them: an inherited policy
-(`20251229180739_fix_telegram_users_rls_for_lobby.sql`) grants `anon` a
-`USING (true)` read and is never dropped; `db/20-post/001` granted `EXECUTE ON
-ALL FUNCTIONS` to `anon`, and 30 of the 58 functions in `public` are
-`SECURITY DEFINER` with eight taking the caller's identity as an unchecked
-parameter. The guard in `003` asserted exactly this and passed, because it
-counted **rows** on a table that was empty every time migrations ran. See §6.
+### What was the next task, and is now done
 
-```bash
-gh workflow run db-migrate.yml -f environment=dev -f dry_run=true
-gh workflow run db-migrate.yml -f environment=dev
-./scripts/probe-public-access.sh https://api.yisakmesifin.org   # must be green after
-```
+`db/20-post/004` is **applied**. `scripts/probe-public-access.sh` reports "No
+exposures found" against live dev, and the two findings it closed are recorded in
+that file's header rather than here — briefly: `telegram_users` was readable by
+any anonymous caller, and `transfer_balance` executed for one. Both were found by
+`curl` against the running system, not by reading policies.
 
-`scripts/probe-public-access.sh` now fails on both, so this cannot regress
-silently. **Do not deploy the contract before this is applied** — funding the
-money path while an unauthenticated transfer route is open converts an exposure
-into a loss.
+Read that header before touching authorization. It is the most expensive thing
+learned in this repository so far, and it explains why EXECUTE is now an
+allowlist.
 
 ### Then: port the routes the app still calls but the API does not serve
 
@@ -186,11 +186,20 @@ configuration being valid.
 
 ### What is NOT done
 
-- **`db/20-post/004` is not applied.** Written and tested against PostgreSQL
-  16.14; the live dev database is still exposed until it runs. See the top of
-  this section.
-- **The routes the app still calls.** `get-card-layouts` and friends are
-  inherited Deno names the rebuilt service never implemented. They 404 today.
+- **Three routes still 404**: `submit-deposit`, `record-withdrawal`,
+  `manage-bnb-withdrawal`. All deposit/withdrawal, all needing the contract.
+  Four others are resolved — `select-card` and `claim-bingo` built,
+  `get-card-layouts` moved to an RPC that already existed, and
+  `force-finish-game` deleted because `game_tick` already owned it.
+- **The game is joinable, not playable.** Stake is 10, every balance is 0, so
+  every join is correctly refused with `INSUFFICIENT_BALANCE`. Needs the faucet.
+- **No capacity data.** `k6` is not installed — the npm entry is an autocomplete
+  stub, not the binary — and `run-test.sh` now says so rather than failing with
+  "command not found".
+- **The Cloudflare rate-limit rule does not enforce.** Applies cleanly, reports
+  `enabled: true`, 160 requests from one IP blocked nothing. `/auth/telegram` has
+  a per-player limiter underneath it, so the endpoint is not unprotected — but
+  the edge rule is not a control until someone reads the dashboard analytics.
 - **Wallet login proves nothing.** `get_or_create_wallet_user` and the wallet
   branch of `get_lobby_data_instant` trust a caller-supplied address: connecting
   a wallet is not a signature. Left working deliberately rather than breaking
@@ -454,7 +463,7 @@ podman run -e HTTPS_PORT=8443 ...
 
 ```bash
 npm --prefix services/functions install    # once
-npm run test:functions                     # 47 assertions, no AWS or network
+npm run test:functions                     # 137 assertions, no AWS or network
 ```
 
 They need no credentials. The signer tests generate their own secp256k1 key and
@@ -1287,7 +1296,7 @@ services/
     src/telegram-auth.js      HMAC verification. PLAIN JS so the test imports it
     src/kms-signer.js         DER -> (r,s,v), EIP-2, recovery by checking
     src/chain.js              refuses to run if the RPC serves another chain
-    src/*.test.mjs            47 assertions, no AWS, no network
+    src/*.test.mjs            137 assertions across 7 suites, no AWS, no network
 scripts/
   bootstrap-aws.sh            One-time. Idempotent. State bucket, OIDC, both roles
   bootstrap-github.sh         One-time. Idempotent. Variables, environments,
