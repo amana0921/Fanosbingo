@@ -212,16 +212,12 @@ export function BnbWithdrawalModal({
   };
 
   const loadContractAddress = async () => {
-    try {
-      const { data } = await supabase
-        .from('settings')
-        .select('value')
-        .eq('id', 'deposit_contract_address')
-        .maybeSingle();
-      if (data?.value) setContractAddress(data.value);
-    } catch (err) {
-      console.error('Error loading contract address:', err);
-    }
+    // Build-time, from SSM. Same reasoning as WalletDepositModal: nothing writes
+    // settings.deposit_contract_address, so reading it at runtime meant the
+    // withdrawal path pointed at whatever a human had last typed into the
+    // database -- or, after a fresh deploy, at nothing.
+    const address = import.meta.env.VITE_DEPOSIT_CONTRACT_ADDRESS ?? '';
+    if (/^0x[0-9a-fA-F]{40}$/.test(address)) setContractAddress(address);
   };
 
   const loadConversionRate = async () => {

@@ -110,28 +110,34 @@ export function WalletDepositModal({ isOpen, onClose, telegramUserId, onSuccess 
   };
 
   const loadContractAddress = async () => {
-    try {
-      setIsLoading(true);
-      const response = await fetch(
-        `${import.meta.env.VITE_SUPABASE_URL}/rest/v1/settings?id=eq.deposit_contract_address&select=value`,
-        {
-          headers: {
-            'apikey': import.meta.env.VITE_SUPABASE_ANON_KEY,
-            'Content-Type': 'application/json',
-          },
-        }
-      );
-      const data = await response.json();
-      if (data && data.length > 0) {
-        setContractAddress(data[0].value);
-      }
-    } catch (err) {
-      console.error('Error loading contract address:', err);
-      setError('Failed to load contract address');
-    } finally {
+    // FROM THE BUILD, not from the settings table.
+    //
+    // This used to fetch settings.deposit_contract_address at runtime. Nothing
+    // writes that row: scripts/deploy-contract.mjs publishes the address to SSM
+    // and says in its own output that settings still holds the old value, only
+    // service_role has a write policy on settings, and /functions/v1/update-settings
+    // is a 404. So the address shown here could only ever be changed by hand in
+    // the database, by someone who knew to -- and after a deployment it would
+    // simply have stayed empty.
+    //
+    // The deploy workflow now reads the same SSM parameter at build time, which is
+    // where the chain id comes from too, so the app cannot disagree with the
+    // contract it is pointing at.
+    //
+    // Empty is a legitimate state: no contract deployed yet. Fail closed and say
+    // so, rather than rendering a deposit form with nowhere to send funds.
+    const address = import.meta.env.VITE_DEPOSIT_CONTRACT_ADDRESS ?? '';
+
+    if (!/^0x[0-9a-fA-F]{40}$/.test(address)) {
+      setError('Deposits are not available yet — no contract has been deployed.');
       setIsLoading(false);
+      return;
     }
+
+    setContractAddress(address);
+    setIsLoading(false);
   };
+
 
   const handleDeposit = async () => {
     setError('');

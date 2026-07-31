@@ -1345,6 +1345,31 @@ hot-wallet key is a **non-exportable KMS `ECC_SECG_P256K1` key** — there is no
 plaintext copy anywhere, which is the structural fix for how the original key
 leaked.
 
+### Deploying the contract needs a `caddy` redeploy
+
+`scripts/deploy-contract.mjs` publishes the address to
+`/{env}/bsc/deposit_contract_address` in SSM. The Mini App reads it **at build
+time**, so the running bundle does not learn about a newly deployed contract until
+it is rebuilt:
+
+```bash
+node scripts/deploy-contract.mjs dev --broadcast
+gh workflow run deploy-services.yml -f service=caddy -f environment=dev
+```
+
+Forget the second command and deposits stay disabled with "no contract has been
+deployed", which is the correct message for a bundle that genuinely does not know
+about one.
+
+It reads that way rather than at runtime because nothing writes the alternative.
+The modals used to fetch `settings.deposit_contract_address`; `deploy-contract.mjs`
+does not write that row and says so in its own output, only `service_role` has a
+write policy on `settings`, and `/functions/v1/update-settings` is a 404. The
+address shown to players could therefore only ever be changed by hand in the
+database. Build time also means the address and the chain id come from the same
+two SSM parameters, so the app cannot point at a contract on a chain it is not
+connected to — see `src/lib/walletConfig.ts` for what that cost would have been.
+
 ### Rotating `app/jwt_secret` — read this before you need to
 
 There is no way to do this without an auth outage. That is a property of the

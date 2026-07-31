@@ -221,6 +221,38 @@ jobs:
 
           echo "Building for BSC chain ${VITE_BSC_CHAIN_ID} ($([ "${VITE_BSC_CHAIN_ID}" = "56" ] && echo mainnet || echo testnet))"
 
+          # THE DEPOSIT CONTRACT, from the same place: SSM, written by
+          # scripts/deploy-contract.mjs when it deploys.
+          #
+          # The modals used to read settings.deposit_contract_address at runtime,
+          # which deploy-contract.mjs does NOT write -- it says so in its own
+          # output ("settings.deposit_contract_address still holds the OLD
+          # value"). And nothing else can write it either: only service_role has a
+          # write policy on settings, and /functions/v1/update-settings is a 404.
+          # So the address the app showed could only ever be changed by hand, in
+          # the database, by someone who knew to.
+          #
+          # Absent is normal and not an error -- the contract is not deployed yet.
+          # The bundle then carries an empty address and the modals refuse to
+          # start a deposit, which is the correct behaviour for "there is nowhere
+          # to deposit to".
+          VITE_DEPOSIT_CONTRACT_ADDRESS="$(aws ssm get-parameter \
+            --name "/fanosbingo-${ENVIRONMENT}/bsc/deposit_contract_address" \
+            --query 'Parameter.Value' --output text 2>/dev/null || echo '')"
+          export VITE_DEPOSIT_CONTRACT_ADDRESS
+
+          if [ -n "${VITE_DEPOSIT_CONTRACT_ADDRESS}" ] && \
+             ! printf '%s' "${VITE_DEPOSIT_CONTRACT_ADDRESS}" | grep -qE '^0x[0-9a-fA-F]{40}$'; then
+            echo "::error::deposit_contract_address is not an address: ${VITE_DEPOSIT_CONTRACT_ADDRESS}"
+            exit 1
+          fi
+
+          if [ -z "${VITE_DEPOSIT_CONTRACT_ADDRESS}" ]; then
+            echo "::warning::No deposit contract published yet. Deposits will be disabled in this build."
+          else
+            echo "Deposit contract: ${VITE_DEPOSIT_CONTRACT_ADDRESS}"
+          fi
+
           # Check the SHAPE, not just emptiness.
           #
           # "is it set" passes for a value like "<the token it printed>", which
