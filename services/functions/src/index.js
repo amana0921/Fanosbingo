@@ -60,6 +60,12 @@ import { createRateLimiter } from './rate-limit.js';
 import { createSelectCardHandler } from './select-card.js';
 import { createClaimBingoHandler } from './claim-bingo.js';
 import { requireAdmin, createAdminWhoamiHandler, createAdminBootstrapHandler } from './admin.js';
+import {
+  createDepositClaimHandler,
+  createListDepositsHandler,
+  createApproveDepositHandler,
+  createRejectDepositHandler,
+} from './deposits.js';
 
 const {
   PORT = '8080',
@@ -333,6 +339,41 @@ app.post(
 // The gate itself, proven to work before anything is put behind it.
 app.get('/admin/ping', requireAuth(JWT_SECRET), requireAdmin(pool), (_req, res) =>
   res.json({ ok: true }),
+);
+
+/**
+ * Deposits.
+ *
+ * The player transfers to the house account themselves and files a claim; the
+ * operator reads their own bank statement and decides. There is no automated
+ * verification here on purpose -- see db/20-post/006 for why the inherited
+ * SMS-matching pipeline is not used.
+ *
+ * Reading your OWN claims is deliberately not a route: 006 gives `authenticated`
+ * a SELECT policy scoped to player_id = auth.uid(), so the Mini App fetches its
+ * history straight from PostgREST.
+ */
+app.post('/deposits/claim', requireAuth(JWT_SECRET), createDepositClaimHandler(pool));
+
+app.get(
+  '/admin/deposits',
+  requireAuth(JWT_SECRET),
+  requireAdmin(pool),
+  createListDepositsHandler(pool),
+);
+
+app.post(
+  '/admin/deposits/:id/approve',
+  requireAuth(JWT_SECRET),
+  requireAdmin(pool),
+  createApproveDepositHandler(pool),
+);
+
+app.post(
+  '/admin/deposits/:id/reject',
+  requireAuth(JWT_SECRET),
+  requireAdmin(pool),
+  createRejectDepositHandler(pool),
 );
 
 app.use((req, res) => res.status(404).json({ error: 'not found', path: req.path }));
