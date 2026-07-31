@@ -1,5 +1,4 @@
 import { useState, useEffect } from 'react';
-import { DollarSign, RefreshCw, ExternalLink, TrendingUp, CheckCircle, Clock, XCircle, AlertCircle } from 'lucide-react';
 import { supabase } from '../lib/supabase';
 
 interface DepositTransaction {

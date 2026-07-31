@@ -1,5 +1,5 @@
 import { useNetworkQuality } from '../hooks/useNetworkQuality';
-import { Wifi, WifiOff, Signal, SignalLow, SignalMedium, SignalHigh } from 'lucide-react';
+import { Wifi, WifiOff, SignalLow, SignalMedium, SignalHigh } from 'lucide-react';
 
 interface NetworkQualityIndicatorProps {
   compact?: boolean;
