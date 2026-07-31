@@ -1026,6 +1026,30 @@ Still outstanding:
 
 ---
 
+### The SPA typecheck findings, triaged — a to-do list, not lint
+
+`npm run typecheck` reports 13 findings and does not pass. It is **advisory** in
+`test.yml` rather than a gate, deliberately, because they are not all noise —
+reading them one at a time has already produced two real bugs and several
+half-wired features. Deleting an unused name to get a clean gate would erase the
+evidence.
+
+Two were fixed as they were found: the five real type errors in `GameRoom.tsx`,
+and `useNetworkQuality`'s callback that was never passed to its constructor, which
+left the network indicator reporting its initial value forever.
+
+**Open, with a verdict on each. Do not sweep these.**
+
+| Finding | Verdict |
+|---|---|
+| `BingoCard.tsx:21` `calledNumbers` | **Product decision, not a bug.** The prop is passed and ignored: the player's own card does not highlight numbers that have been called, while GameRoom's *other* grid (`GameRoom.tsx:625`, `:698`) does. That asymmetry is plausibly the game design — the README calls this "skill and speed-based, not gambling", and spotting your own numbers is the skill. Wiring the prop up would change gameplay fairness for every player, so it needs a decision, not a fix. If the answer is "it should highlight", the change is small; if it is "it should not", delete the prop. |
+| `DepositManagement.tsx:31` `adminKey` | **Real, and part of the known admin gap.** The prop is declared and destructured and never used, so the component authenticates as nobody — its `deposit_transactions` read at line 53 goes out unauthenticated and is governed only by that table's RLS. It currently returns nothing because the table is empty, so this is **untested rather than working**. Belongs with replacing the shared admin string (§7), not before it: wiring `adminKey` into requests would only propagate a credential that is already the wrong mechanism. |
+| `Lobby.tsx:45` `isJoining` / `setIsJoining` | Neither is used. A join spinner that was never wired — newly visible now that joining works rather than 404ing, so pressing join gives no feedback at all. |
+| `Lobby.tsx:53,54` `isTimeSynced` / `isLoadingData` | The **setters** are called (6 and 3 times) and nothing reads the values. Work is being done to populate state no one renders. |
+| `Lobby.tsx:37` `onSpectateGame` | See below. |
+| `App.tsx:26` `userBalance`, `Admin.tsx:50` `recentActivity`, `BankWithdrawalModal.tsx:33` `isLoading`, `BankDepositModal.tsx:21` `telegramUserId`, `useOptimizedRealtimeSubscription.ts:146` `subscriptionId` | Same shape — state or props populated and never read. Each needs the same one-minute look before it is removed or wired. |
+| `networkOptimization.ts:34` `response` | `measureLatency()` discards the fetch response, so a failing HEAD still records a latency as though healthy. Minor, but it means the number it reports is round-trip time regardless of whether the round trip succeeded. |
+
 ### Spectator mode is documented and dead
 
 `App.tsx:300` defines `handleSpectateGame`, `App.tsx:355` passes it to `Lobby` as
