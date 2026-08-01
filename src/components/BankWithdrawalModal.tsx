@@ -1,6 +1,34 @@
+/**
+ * Requesting a bank payout.
+ *
+ * WHAT CHANGED, and why the old version could never have worked.
+ *
+ * handleSubmit used to INSERT into withdrawal_requests directly:
+ *
+ *   supabase.from('withdrawal_requests').insert({ telegram_user_id, amount, ... })
+ *
+ * db/20-post/007 gives that table no INSERT policy at all, deliberately, and
+ * says so in a comment naming this file: a client-side insert sets
+ * telegram_user_id and amount with no balance check and no serialisation, so a
+ * player could file against somebody else's balance, or ten against their own at
+ * once. The insert therefore failed on RLS -- correctly -- and this modal was
+ * also mounted nowhere, so nobody hit it.
+ *
+ * It now POSTs /withdrawals/request, which calls request_bank_withdrawal(): the
+ * player's row is locked FOR UPDATE, available balance is won_balance minus
+ * everything already pending, and the identity comes from the JWT rather than
+ * from this component.
+ */
+
 import { useState, useEffect } from 'react';
 import { supabase } from '../lib/supabase';
+import { getAccessToken } from '../lib/auth';
 import { X, Building2, AlertCircle, CheckCircle } from 'lucide-react';
+
+const API = import.meta.env.VITE_SUPABASE_URL;
+
+/** Matches request_bank_withdrawal's own floor. */
+const MIN_WITHDRAWAL_ETB = 100;
 
 interface WithdrawalBank {
   id: string;
@@ -26,6 +54,12 @@ export function BankWithdrawalModal({
 }: BankWithdrawalModalProps) {
   const [step, setStep] = useState<'amount' | 'bank' | 'account' | 'name' | 'confirm'>('amount');
   const [amount, setAmount] = useState('');
+  // The bank OPTION ID, not its name.
+  //
+  // /withdrawals/request resolves the name from withdrawal_bank_options itself
+  // and ignores anything this component might send, for the same reason the
+  // deposit claim does: a request naming an account that was never ours is one
+  // the operator has to disprove.
   const [selectedBank, setSelectedBank] = useState<string>('');
   const [accountNumber, setAccountNumber] = useState('');
   const [accountName, setAccountName] = useState('');
@@ -35,12 +69,24 @@ export function BankWithdrawalModal({
   const [pendingWithdrawals, setPendingWithdrawals] = useState(0);
   const [isSubmitting, setIsSubmitting] = useState(false);
 
-  const availableBalance = wonBalance - pendingWithdrawals;
+  // FROM THE SERVER, not computed here.
+  //
+  // This was `wonBalance - pendingWithdrawals`, summed from a table read. The
+  // arithmetic was right, but the number a player is shown and the number
+  // request_bank_withdrawal() enforces have to come from ONE expression -- or
+  // the form offers an amount the server then refuses, which reads as a bug in
+  // the game rather than as the race it is. /withdrawals/available calls
+  // get_available_balance(), which is what the request path itself uses.
+  //
+  // Falls back to the local calculation only until the fetch resolves.
+  const [serverAvailable, setServerAvailable] = useState<number | null>(null);
+  const availableBalance = serverAvailable ?? Math.max(0, wonBalance - pendingWithdrawals);
 
   useEffect(() => {
     if (isOpen) {
       loadBankOptions();
       loadPendingWithdrawals();
+      loadAvailableBalance();
       resetForm();
     }
   }, [isOpen]);
@@ -74,6 +120,9 @@ export function BankWithdrawalModal({
   };
 
   const loadPendingWithdrawals = async () => {
+    // Still read directly, and legitimately: db/20-post/007 gives `authenticated`
+    // a SELECT policy scoped to the caller's own rows, so this is plain data
+    // access. It is shown as "pending" for context; it does not decide anything.
     try {
       const { data } = await supabase
         .from('withdrawal_requests')
@@ -88,14 +137,32 @@ export function BankWithdrawalModal({
     }
   };
 
+  const loadAvailableBalance = async () => {
+    try {
+      const token = await getAccessToken();
+      if (!token) return;
+
+      const res = await fetch(`${API}/functions/v1/withdrawals/available`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+
+      if (!res.ok) return;
+
+      const body = await res.json();
+      if (typeof body.available === 'number') setServerAvailable(body.available);
+    } catch (error) {
+      console.error('Error loading available balance:', error);
+    }
+  };
+
   const handleAmountNext = () => {
     const amountNum = parseFloat(amount);
     if (isNaN(amountNum) || amountNum <= 0) {
       setError('Please enter a valid amount');
       return;
     }
-    if (amountNum < 100) {
-      setError('Minimum withdrawal amount is 100 ETB');
+    if (amountNum < MIN_WITHDRAWAL_ETB) {
+      setError(`Minimum withdrawal amount is ${MIN_WITHDRAWAL_ETB} ETB`);
       return;
     }
     if (amountNum > availableBalance) {
@@ -138,25 +205,58 @@ export function BankWithdrawalModal({
     setError(null);
 
     try {
-      const { error: insertError } = await supabase
-        .from('withdrawal_requests')
-        .insert({
-          telegram_user_id: telegramUserId,
-          amount: parseFloat(amount),
-          bank_name: selectedBank,
-          account_number: accountNumber,
-          account_name: accountName.trim(),
-          status: 'pending'
-        });
+      const token = await getAccessToken();
+      if (!token) {
+        setError('Your session has expired. Close this and open the app again.');
+        return;
+      }
 
-      if (insertError) throw insertError;
+      // telegram_user_id is NOT sent. The route takes it from the token, and
+      // would ignore it here -- there is a test asserting exactly that.
+      const res = await fetch(`${API}/functions/v1/withdrawals/request`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          bankOptionId: selectedBank,
+          amount: parseFloat(amount),
+          accountNumber: accountNumber.trim(),
+          accountName: accountName.trim(),
+        }),
+      });
+
+      const body = await res.json().catch(() => ({}));
+
+      if (!res.ok) {
+        // INSUFFICIENT_BALANCE is a 409 carrying the real numbers, so the form
+        // can say what actually changed rather than repeating a stale figure.
+        // Most often the cause is the player's own earlier request still sitting
+        // in the queue, which they cannot see from this screen.
+        if (body.error_code === 'INSUFFICIENT_BALANCE') {
+          setServerAvailable(body.available ?? 0);
+          setPendingWithdrawals(body.already_pending ?? 0);
+          setError(
+            `Not enough available balance. You can withdraw ${body.available ?? 0} ETB` +
+              (body.already_pending
+                ? ` — ${body.already_pending} ETB is already awaiting payout.`
+                : '.'),
+          );
+          setStep('amount');
+          return;
+        }
+
+        setError(body.error || 'Failed to submit withdrawal request');
+        return;
+      }
 
       onSuccess();
       onClose();
       resetForm();
-    } catch (error: any) {
+    } catch (error) {
       console.error('Error submitting withdrawal:', error);
-      setError(error.message || 'Failed to submit withdrawal request');
+      setError(error instanceof Error ? error.message : 'Failed to submit withdrawal request');
     } finally {
       setIsSubmitting(false);
     }
@@ -261,9 +361,9 @@ export function BankWithdrawalModal({
                   {banks.map((bank) => (
                     <button
                       key={bank.id}
-                      onClick={() => setSelectedBank(bank.bank_name)}
+                      onClick={() => setSelectedBank(bank.id)}
                       className={`w-full text-left border-2 rounded-xl p-4 transition-all ${
-                        selectedBank === bank.bank_name
+                        selectedBank === bank.id
                           ? 'border-yellow-500 bg-yellow-50 dark:bg-yellow-900/20'
                           : 'border-gray-200 dark:border-gray-600 hover:border-yellow-400 bg-white dark:bg-gray-700'
                       }`}
@@ -271,12 +371,12 @@ export function BankWithdrawalModal({
                       <div className="flex items-center justify-between">
                         <div className="flex items-center gap-3">
                           <div className={`p-3 rounded-lg ${
-                            selectedBank === bank.bank_name
+                            selectedBank === bank.id
                               ? 'bg-yellow-100 dark:bg-yellow-900/40'
                               : 'bg-gray-100 dark:bg-gray-600'
                           }`}>
                             <Building2 className={`w-6 h-6 ${
-                              selectedBank === bank.bank_name
+                              selectedBank === bank.id
                                 ? 'text-yellow-600'
                                 : 'text-gray-600 dark:text-gray-300'
                             }`} />
@@ -285,7 +385,7 @@ export function BankWithdrawalModal({
                             {bank.bank_name}
                           </span>
                         </div>
-                        {selectedBank === bank.bank_name && (
+                        {selectedBank === bank.id && (
                           <CheckCircle className="w-6 h-6 text-yellow-600" />
                         )}
                       </div>
@@ -337,7 +437,9 @@ export function BankWithdrawalModal({
                     </div>
                     <div className="flex justify-between">
                       <span className="text-gray-600 dark:text-gray-400">Bank:</span>
-                      <span className="font-bold text-gray-900 dark:text-white">{selectedBank}</span>
+                      <span className="font-bold text-gray-900 dark:text-white">
+                        {banks.find((b) => b.id === selectedBank)?.bank_name ?? ''}
+                      </span>
                     </div>
                     <div className="flex justify-between">
                       <span className="text-gray-600 dark:text-gray-400">Account:</span>

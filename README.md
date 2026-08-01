@@ -41,12 +41,35 @@ countdown ticks — driven by a server-side game loop, not by a browser tab.
 | Mini App | served from Caddy at `app.<domain>`, built into the image |
 | Joining and claiming | **working** — `/select-card` and `/claim-bingo`, identity and card layout derived server-side |
 | Bank deposit (TeleBirr / CBE) | **working** — player claims, operator approves against their own statement. No wallet, no contract |
-| Bank withdrawal | **half** — correctness layer in `db/20-post/007`, routes and UI not built |
+| Bank withdrawal | **working** — player requests, operator pays by hand and records the reference. `db/20-post/007` + `/withdrawals/*` |
 | Admin | Telegram identity + `is_admin`, single factor. Bootstrap route promotes only the first admin, then disarms |
-| Three API routes | **404** — `submit-deposit`, `record-withdrawal`, `manage-bnb-withdrawal`. All deposit/withdrawal, all need the contract |
-| Database authorization | **enforced** — EXECUTE is an allowlist, `telegram_users` is owner-scoped, verified by `probe-public-access.sh` |
-| Smart contract | **not deployed** — blocked on a free faucet visit |
+| Database authorization | **enforced** — EXECUTE is an allowlist, `telegram_users` is owner-scoped, game state is read-only to clients, verified by `probe-public-access.sh` |
+| Crypto (wallet login, BNB deposit/withdrawal) | **deferred, not removed** — every surface is behind `VITE_CRYPTO_ENABLED`, off by default. Ethiopian players overwhelmingly do not hold cryptocurrency, so birr is the currency that matters. Code, contract and KMS key all retained |
+| Smart contract | **not deployed** — and not on the critical path while crypto is deferred |
 | Production | Terraform written, plans cleanly, never applied |
+
+**The money round trip is closed:** deposit by bank, play, withdraw by bank. That is
+the whole loop, with no wallet anywhere in it.
+
+> **Deploy order matters once.** `db/20-post/008` closes a path that let any
+> authenticated player mint an arbitrary `won_balance` with a single `PATCH` on
+> `games` — a permissive inherited policy plus a blanket table grant plus a
+> payout trigger that reads `winner_ids` straight from the update. That balance
+> previously had no exit; the bank withdrawal routes give it one. **Apply `008`
+> before deploying them.**
+
+### Routes the SPA no longer calls
+
+The inherited Deno function names are not being ported. Each was resolved by
+asking the question in `AGENTS.md` §7 — "why can RLS not do this?" — and most
+answered "it can":
+
+| Route | Resolution |
+|---|---|
+| `get-card-layouts` · `force-finish-game` | deleted; `get_all_card_layouts()` and `game_tick()` already did the work |
+| `submit-deposit` · `record-withdrawal` · `manage-bnb-withdrawal` · `claim-winnings-to-contract` · `get-withdrawal-wallet-info` · `monitor-deposits` | crypto, deferred with the flag |
+| `deselect-card` | **still 404**, still called from `Lobby.tsx` |
+| `update-settings` · `setup-telegram-webhook` | **still 404.** Note before rebuilding `update-settings`: it wrote `telegram_bot_token` into the `settings` table, which is exactly the exposure `db/20-post/003` fixed. That token belongs in SSM |
 
 Engineering detail, decisions and their reasons live in **[AGENTS.md](AGENTS.md)**.
 Read it before changing anything; most of it was learned expensively.

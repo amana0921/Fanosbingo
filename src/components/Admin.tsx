@@ -1,10 +1,22 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, lazy, Suspense } from 'react';
 import { getAccessToken } from '../lib/auth';
 import { BankDepositQueue } from './BankDepositQueue';
+import { BankWithdrawalQueue } from './BankWithdrawalQueue';
 import { supabase, Game, Player } from '../lib/supabase';
 import { Shield, XCircle, Users, Clock, Trophy, Settings, DollarSign, TrendingUp, CircleUser as UserCircle, Wallet, ArrowDownToLine } from 'lucide-react';
-import { DepositManagement } from './DepositManagement';
-import { BnbWithdrawalManagement } from './BnbWithdrawalManagement';
+import { CRYPTO_ENABLED } from '../lib/features';
+
+// The two on-chain admin views, behind the same flag and the same dynamic import
+// as the player-facing crypto surfaces. Their routes -- monitor-deposits,
+// manage-bnb-withdrawal, get-withdrawal-wallet-info -- are all 404 today, so
+// with crypto deferred these panels could only ever show an error. Nothing is
+// deleted: flip VITE_CRYPTO_ENABLED and they return. See src/lib/features.ts.
+const DepositManagement = lazy(() =>
+  import('./DepositManagement').then((m) => ({ default: m.DepositManagement })),
+);
+const BnbWithdrawalManagement = lazy(() =>
+  import('./BnbWithdrawalManagement').then((m) => ({ default: m.BnbWithdrawalManagement })),
+);
 import { formatBnb } from '../utils/formatBalance';
 
 interface UserSpending {
@@ -470,21 +482,44 @@ export function Admin() {
   };
 
 
+  // Through the admin route, not a direct UPDATE.
+  //
+  // This used to write games.status itself, which required the browser to hold
+  // UPDATE on that table -- the privilege that let ANY authenticated player set
+  // winner_ids and winner_prize_each and have payout_winners() credit them.
+  // db/20-post/008 revoked it; db/20-post/009 brings this one legitimate write
+  // back as admin_end_game(), which sets status and finished_at and nothing
+  // else, exactly as game_tick() does.
   const handleEndGame = async (gameId: string) => {
     if (!confirm('Are you sure you want to end this game?')) return;
 
-    await supabase
-      .from('games')
-      .update({
-        status: 'finished',
-        finished_at: new Date().toISOString(),
-      })
-      .eq('id', gameId);
+    try {
+      const token = await getAccessToken();
+      const res = await fetch(`${import.meta.env.VITE_SUPABASE_URL}/functions/v1/admin/games/${gameId}/end`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      });
 
-    await supabase.rpc('create_game_with_server_time', {
-      countdown_seconds: 25,
-      stake_amount_param: 10
-    });
+      const result = await res.json().catch(() => ({}));
+
+      if (!res.ok || !result.success) {
+        // 409 is "already finished", which a double-clicked button produces.
+        alert(res.status === 409
+          ? 'That game has already ended.'
+          : `Could not end the game: ${result.error ?? res.status}`);
+        return;
+      }
+
+      // Still an RPC: create_game_with_server_time is SECURITY DEFINER and on
+      // db/20-post/004's allowlist, so it is unaffected by the table revoke.
+      await supabase.rpc('create_game_with_server_time', {
+        countdown_seconds: 25,
+        stake_amount_param: 10
+      });
+    } catch (err) {
+      console.error('Failed to end game:', err);
+      alert('Could not end the game. Please try again.');
+    }
   };
 
   return !isAuthenticated ? (
@@ -764,14 +799,16 @@ export function Admin() {
                 </button>
               </div>
             </div>
-            {/* Bank transfers first: this is the path players actually use
-                today. DepositManagement below it is the on-chain BNB view, whose
-                routes are still unimplemented. */}
+            {/* Bank transfers: the path players actually use. */}
             <BankDepositQueue />
 
-            <div className="mt-6">
-              <DepositManagement adminKey={accessKey} />
-            </div>
+            {CRYPTO_ENABLED && (
+              <div className="mt-6">
+                <Suspense fallback={null}>
+                  <DepositManagement adminKey={accessKey} />
+                </Suspense>
+              </div>
+            )}
           </>
         )}
 
@@ -779,7 +816,7 @@ export function Admin() {
           <>
             <div className="bg-white rounded-2xl shadow-xl p-6 mb-6">
               <div className="flex items-center justify-between mb-4">
-                <h2 className="text-2xl font-bold text-gray-900">BNB Withdrawal Management</h2>
+                <h2 className="text-2xl font-bold text-gray-900">Withdrawal Management</h2>
                 <button
                   onClick={() => setCurrentPage('dashboard')}
                   className="text-sm text-gray-600 hover:text-gray-800 font-medium"
@@ -788,7 +825,19 @@ export function Admin() {
                 </button>
               </div>
             </div>
-            <BnbWithdrawalManagement adminKey={accessKey} />
+            {/* The bank payout queue, mirroring the deposit queue. This is what
+                actually pays players today -- db/20-post/007 has had the
+                correctness layer for a while, and until the routes landed it had
+                no caller at all. */}
+            <BankWithdrawalQueue />
+
+            {CRYPTO_ENABLED && (
+              <div className="mt-6">
+                <Suspense fallback={null}>
+                  <BnbWithdrawalManagement adminKey={accessKey} />
+                </Suspense>
+              </div>
+            )}
           </>
         )}
 

@@ -1,30 +1,41 @@
-import { useState, useEffect, useCallback, useRef, lazy, Suspense } from 'react';
-import { WagmiProvider } from 'wagmi';
-import { QueryClientProvider } from '@tanstack/react-query';
-import { useAccount } from 'wagmi';
+import { useState, useEffect, useCallback, lazy, Suspense } from 'react';
 import { Lobby } from './components/Lobby';
 import { GameRoom } from './components/GameRoom';
-import { WalletDepositModal } from './components/WalletDepositModal';
+import { BankDepositModal } from './components/BankDepositModal';
 import { NetworkQualityIndicator } from './components/NetworkQualityIndicator';
 import { supabase } from './lib/supabase';
 import { initTelegram, TelegramUser } from './utils/telegram';
 import { authenticate, getAccessToken } from './lib/auth';
-import { config, queryClient } from './lib/walletConfig';
+import { CRYPTO_ENABLED } from './lib/features';
 
 const Admin = lazy(() => import('./components/Admin').then(module => ({ default: module.Admin })));
 
+// The wallet stack, behind a dynamic import. With CRYPTO_ENABLED false this
+// lazy() is never invoked, so the chunk is never fetched -- which is the whole
+// point, and the reason the PROVIDER moved rather than just the modals. See
+// src/components/CryptoProvider.tsx.
+const CryptoProvider = lazy(() => import('./components/CryptoProvider'));
+
 type View = 'lobby' | 'game' | 'admin';
 
-function AppContent() {
-  const { address, isConnected } = useAccount();
+interface AppContentProps {
+  /**
+   * A player resolved from a connected wallet, or null.
+   *
+   * Always null when crypto is disabled. Passed down rather than read from a
+   * context so this component compiles and runs with the wallet stack absent
+   * entirely.
+   */
+  walletUser: TelegramUser | null;
+}
+
+function AppContent({ walletUser }: AppContentProps) {
   const [view, setView] = useState<View>('lobby');
   const [appUser, setAppUser] = useState<TelegramUser | null>(null);
   const [gameId, setGameId] = useState<string | null>(() => localStorage.getItem('gameId'));
   const [playerId, setPlayerId] = useState<string | null>(() => localStorage.getItem('playerId'));
   const [gameStarted, setGameStarted] = useState(false);
   const [showDepositModal, setShowDepositModal] = useState(false);
-  const [userBalance, setUserBalance] = useState(0);
-  const walletRegistered = useRef(false);
 
   useEffect(() => {
     // Exchange Telegram's SIGNED initData for a session token before doing
@@ -60,40 +71,15 @@ function AppContent() {
     void bootstrapIdentity();
   }, []);
 
+  // The wallet-login path, now that its useAccount() lives in CryptoProvider.
+  //
+  // Telegram wins if it got there first: `!appUser` means a Mini App player who
+  // also has a wallet connected is not re-identified as the wallet account.
+  // That was the previous behaviour too -- the old effect began `if (appUser ...)
+  // return` -- it is just expressed here instead.
   useEffect(() => {
-    if (appUser || !isConnected || !address || walletRegistered.current) return;
-
-    const registerWalletUser = async () => {
-      try {
-        walletRegistered.current = true;
-        const { data, error } = await supabase.rpc('get_or_create_wallet_user', {
-          p_wallet_address: address,
-        });
-
-        if (error || !data?.success) {
-          walletRegistered.current = false;
-          return;
-        }
-
-        const user = data.user;
-        setAppUser({
-          id: user.telegram_user_id,
-          first_name: user.telegram_first_name || `${address.slice(0, 6)}...${address.slice(-4)}`,
-          username: user.telegram_username || undefined,
-        });
-      } catch {
-        walletRegistered.current = false;
-      }
-    };
-
-    registerWalletUser();
-  }, [isConnected, address, appUser]);
-
-  useEffect(() => {
-    if (!isConnected && !appUser) {
-      walletRegistered.current = false;
-    }
-  }, [isConnected, appUser]);
+    if (walletUser && !appUser) setAppUser(walletUser);
+  }, [walletUser, appUser]);
 
   useEffect(() => {
     if (gameId) {
@@ -255,7 +241,11 @@ function AppContent() {
   // the server derives both from the verified token and from the card number. The
   // parameter is kept in the signature because Lobby still passes it, and removing
   // it is a caller change belonging with the next route rather than this one.
-  const handleJoinGame = async (gameId: string, selectedNumber: number, user: TelegramUser, _cardLayout?: number[][]) => {
+  // `_user` joins `_cardLayout` in being accepted and ignored. It was last read
+  // by the balance lookup removed below; the server derives identity from the
+  // token. Kept in the signature because Lobby still passes it -- dropping both
+  // is a caller change that belongs with the next route, not with this one.
+  const handleJoinGame = async (gameId: string, selectedNumber: number, _user: TelegramUser, _cardLayout?: number[][]) => {
 
     const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
 
@@ -297,13 +287,13 @@ function AppContent() {
 
     if (!response.ok) {
       if (result.error === 'Insufficient balance') {
-        const { data: userData } = await supabase
-          .from('telegram_users')
-          .select('deposited_balance, won_balance')
-          .eq('telegram_user_id', user.id)
-          .maybeSingle();
-
-        setUserBalance((userData?.deposited_balance || 0) + (userData?.won_balance || 0));
+        // Just open the deposit modal.
+        //
+        // This used to fetch deposited_balance and won_balance first and store
+        // the sum in a `userBalance` state that NOTHING read -- tsc reported it
+        // as TS6133. So the round trip happened on every failed join, on the
+        // error path, to populate a variable that was never rendered. Dropped
+        // along with the state.
         setShowDepositModal(true);
       }
       throw new Error(result.error || 'Failed to join game');
@@ -354,11 +344,10 @@ function AppContent() {
       <>
         <GameRoom gameId={gameId} playerId={playerId} onReturnToLobby={handleReturnToLobby} />
         {appUser && (
-          <WalletDepositModal
+          <BankDepositModal
             isOpen={showDepositModal}
             onClose={() => setShowDepositModal(false)}
             telegramUserId={appUser.id}
-            onSuccess={() => setShowDepositModal(false)}
           />
         )}
         <NetworkQualityIndicator />
@@ -370,11 +359,10 @@ function AppContent() {
     <>
       <Lobby onJoinGame={handleJoinGame} onSpectateGame={handleSpectateGame} telegramUser={appUser} />
       {appUser && (
-        <WalletDepositModal
+        <BankDepositModal
           isOpen={showDepositModal}
           onClose={() => setShowDepositModal(false)}
           telegramUserId={appUser.id}
-          onSuccess={() => setShowDepositModal(false)}
         />
       )}
       <NetworkQualityIndicator />
@@ -382,13 +370,35 @@ function AppContent() {
   );
 }
 
+/**
+ * The gate.
+ *
+ * With CRYPTO_ENABLED false this returns AppContent directly, the lazy() above
+ * is never invoked, and the wallet chunk is never requested -- so the saving is
+ * real rather than deferred to a second render.
+ *
+ * With it true the tree is identical to what App used to render, plus the
+ * identity bridge that moved out of AppContent.
+ *
+ * `fallback={null}` rather than a spinner: this resolves from cache in
+ * milliseconds and a flash of loading UI ahead of the lobby is worse than a
+ * frame of nothing. Rendering AppContent as the fallback would be wrong for a
+ * different reason -- it would mount, then remount inside the provider, running
+ * every bootstrap effect twice.
+ */
 function App() {
+  const [walletUser, setWalletUser] = useState<TelegramUser | null>(null);
+
+  if (!CRYPTO_ENABLED) {
+    return <AppContent walletUser={null} />;
+  }
+
   return (
-    <WagmiProvider config={config}>
-      <QueryClientProvider client={queryClient}>
-        <AppContent />
-      </QueryClientProvider>
-    </WagmiProvider>
+    <Suspense fallback={null}>
+      <CryptoProvider onWalletUser={setWalletUser} needsIdentity={walletUser === null}>
+        <AppContent walletUser={walletUser} />
+      </CryptoProvider>
+    </Suspense>
   );
 }
 

@@ -23,6 +23,26 @@ export default tseslint.config(
         'warn',
         { allowConstantExport: true },
       ],
+
+      // Make the underscore convention the codebase already uses actually work.
+      //
+      // `_cardLayout` in src/App.tsx is deliberately accepted and ignored -- the
+      // server derives the card layout, and the parameter stays only because
+      // Lobby still passes it. tsc honours the leading underscore; eslint did
+      // not, so the file has been carrying an error for a convention it was
+      // following correctly. `_user` joined it for the same reason.
+      //
+      // Applied to arguments and to caught errors, not to variables: an unused
+      // local is usually a mistake, where an unused parameter in the middle of a
+      // signature cannot be removed without changing every caller.
+      '@typescript-eslint/no-unused-vars': [
+        'error',
+        {
+          argsIgnorePattern: '^_',
+          caughtErrorsIgnorePattern: '^_',
+          varsIgnorePattern: '^_',
+        },
+      ],
     },
   }
 );
