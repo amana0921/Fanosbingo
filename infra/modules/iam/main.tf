@@ -423,6 +423,13 @@ data "aws_iam_policy_document" "github_deploy" {
       "cloudtrail:DescribeTrails",
       "sns:ListTopics",
       "sns:ListSubscriptionsByTopic",
+
+      # An encrypted alert topic needs the KEY POLICY to admit
+      # cloudwatch.amazonaws.com, or every notification is dropped silently.
+      # Reading both is what lets verify-alarms.sh check it.
+      "sns:GetTopicAttributes",
+      "kms:GetKeyPolicy",
+      "kms:DescribeKey",
       "cloudwatch:DescribeAlarms",
 
       # Reading the datapoints an alarm is evaluating, not just its state.
