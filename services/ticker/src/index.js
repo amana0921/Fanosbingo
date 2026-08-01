@@ -160,6 +160,88 @@ async function tryAcquireLock() {
   return false;
 }
 
+/**
+ * The manual money queues, on their own slower schedule.
+ *
+ * NOT folded into game_tick(). That runs once a second and is the game loop;
+ * queue age moves three orders of magnitude slower, and coupling the two would
+ * mean "is the game running" and "is anybody approving deposits" share a failure
+ * path. They have different responders.
+ *
+ * WHY THIS EXISTS AT ALL: a player's activity panel showed a deposit pending for
+ * a DAY against a zero play balance, while the deposit form promised "usually
+ * within a few minutes". Nothing was broken -- the queue, the policy and the
+ * route all worked. There was simply no signal that anything was in it.
+ *
+ * A metrics failure must never stop the game, so this is fire-and-forget in the
+ * same way publishMetrics is.
+ */
+const QUEUE_HEALTH_INTERVAL_MS = Number(process.env.QUEUE_HEALTH_INTERVAL_MS ?? 60_000);
+let lastQueueHealthAt = 0;
+
+async function publishQueueHealth(client) {
+  if (!cloudwatch) return;
+
+  const now = Date.now();
+  if (now - lastQueueHealthAt < QUEUE_HEALTH_INTERVAL_MS) return;
+  lastQueueHealthAt = now;
+
+  try {
+    const { rows } = await client.query('SELECT queue_health() AS q');
+    const q = rows[0]?.q;
+    if (!q) return;
+
+    const dims = [{ Name: 'Environment', Value: ENVIRONMENT }];
+
+    await cloudwatch.send(
+      new PutMetricDataCommand({
+        Namespace: METRIC_NAMESPACE,
+        MetricData: [
+          {
+            // THE alarm metric of the pair. A deposit sitting unapproved is a
+            // player who cannot join a game, and who was told "a few minutes".
+            MetricName: 'OldestPendingDepositMinutes',
+            Value: Number(q.oldest_pending_deposit_minutes ?? 0),
+            Unit: 'Count',
+            Dimensions: dims,
+          },
+          {
+            MetricName: 'OldestPendingWithdrawalMinutes',
+            Value: Number(q.oldest_pending_withdrawal_minutes ?? 0),
+            Unit: 'Count',
+            Dimensions: dims,
+          },
+          {
+            // Counts answer a different question from ages. One old claim is
+            // somebody forgotten; forty recent ones is a queue nobody is working.
+            MetricName: 'PendingDeposits',
+            Value: Number(q.pending_deposits ?? 0),
+            Unit: 'Count',
+            Dimensions: dims,
+          },
+          {
+            MetricName: 'PendingWithdrawals',
+            Value: Number(q.pending_withdrawals ?? 0),
+            Unit: 'Count',
+            Dimensions: dims,
+          },
+          {
+            // The operator's float requirement. If this exceeds what is in the
+            // house account, the queue cannot be cleared however promptly
+            // somebody looks at it.
+            MetricName: 'PendingWithdrawalTotal',
+            Value: Number(q.pending_withdrawal_total ?? 0),
+            Unit: 'Count',
+            Dimensions: dims,
+          },
+        ],
+      })
+    );
+  } catch (error) {
+    log('warn', 'Failed to publish queue health', { error: error.message });
+  }
+}
+
 async function publishMetrics(result, tickDurationMs) {
   if (!cloudwatch) return;
 
@@ -234,6 +316,13 @@ async function tick() {
   }
 
   await publishMetrics(result, duration);
+
+  // Money queues, on their own interval. Rate-limited inside rather than by a
+  // second timer: one scheduler, and it cannot drift out of phase with the tick
+  // or keep the event loop alive past a SIGTERM the way an unref'd interval
+  // would. `pool` rather than the lock connection -- this is an ordinary read
+  // and must not share the session that holds the advisory lock.
+  await publishQueueHealth(pool);
 }
 
 /**

@@ -19,7 +19,14 @@
  * liveness is asserted here instead, from the outside, on the thing that
  * actually matters.
  *
- * Everything here fits in the CloudWatch free tier (10 alarms, 1M API requests).
+ * ALARM BUDGET: this module now defines exactly TEN alarms, which is the whole
+ * CloudWatch free-tier allowance. There is no headroom left. An eleventh starts
+ * costing $0.10/mo -- trivial in isolation, and worth knowing deliberately on a
+ * $32 budget where the point is that nothing is billed by accident.
+ *
+ * If you need another, the honest options are to pay for it, to retire one that
+ * has never fired, or to fold two related signals into a metric math alarm.
+ * Do not quietly add an eleventh and leave this comment saying it fits.
  */
 
 resource "aws_sns_topic" "alerts" {
@@ -298,6 +305,75 @@ resource "aws_cloudwatch_metric_alarm" "ec2_cpu_credits" {
 
   dimensions         = { AutoScalingGroupName = var.autoscaling_group_name }
   alarm_actions      = [aws_sns_topic.alerts.arn]
+  treat_missing_data = "notBreaching"
+
+  tags = var.tags
+}
+
+# ---------------------------------------------------------------------------
+# The manual money queues
+#
+# THE GAP THESE CLOSE, found on a player's screen rather than in a dashboard:
+#
+#   Deposit · Telebirr    0.10    pending    1d ago
+#
+# against a zero play balance, while the deposit form promised "usually within a
+# few minutes". Nothing was broken -- the queue, the RLS policy and the route all
+# worked. There was no signal that anything was in it.
+#
+# Same shape as the game-loop alarm above, and the same reasoning db/20-post/002
+# gives for that one: a health signal exists so an alarm on it turns a support
+# ticket into a page. A deposit pending overnight is a support ticket that should
+# have been a page.
+#
+# The ticker publishes these from queue_health() once a minute; see
+# db/20-post/015 for why that is a separate function from game_tick().
+# ---------------------------------------------------------------------------
+
+# treat_missing_data = "notBreaching", UNLIKE the game-loop alarm.
+#
+# That one uses "breaching" so a dead ticker alarms, and it is right to: a
+# stopped heartbeat and a frozen game are the same outage. Here, absent data
+# means the ticker is down -- which game_loop_stalled already pages for. Using
+# "breaching" would page twice for one incident and make this alarm noisy in
+# exactly the situation it has nothing to say about.
+resource "aws_cloudwatch_metric_alarm" "pending_deposits_stale" {
+  alarm_name        = "${var.name_prefix}-deposits-waiting-too-long"
+  alarm_description = "A deposit claim has been unapproved for ${var.pending_deposit_alarm_minutes} minutes. That player cannot join a game, and the form told them a few minutes."
+
+  namespace   = var.metric_namespace
+  metric_name = "OldestPendingDepositMinutes"
+  statistic   = "Maximum"
+
+  period              = 300
+  evaluation_periods  = 2
+  comparison_operator = "GreaterThanThreshold"
+  threshold           = var.pending_deposit_alarm_minutes
+
+  dimensions         = { Environment = var.environment }
+  alarm_actions      = [aws_sns_topic.alerts.arn]
+  ok_actions         = [aws_sns_topic.alerts.arn]
+  treat_missing_data = "notBreaching"
+
+  tags = var.tags
+}
+
+resource "aws_cloudwatch_metric_alarm" "pending_withdrawals_stale" {
+  alarm_name        = "${var.name_prefix}-withdrawals-waiting-too-long"
+  alarm_description = "A withdrawal has been unpaid for ${var.pending_withdrawal_alarm_minutes} minutes. This is money owed to a player."
+
+  namespace   = var.metric_namespace
+  metric_name = "OldestPendingWithdrawalMinutes"
+  statistic   = "Maximum"
+
+  period              = 300
+  evaluation_periods  = 2
+  comparison_operator = "GreaterThanThreshold"
+  threshold           = var.pending_withdrawal_alarm_minutes
+
+  dimensions         = { Environment = var.environment }
+  alarm_actions      = [aws_sns_topic.alerts.arn]
+  ok_actions         = [aws_sns_topic.alerts.arn]
   treat_missing_data = "notBreaching"
 
   tags = var.tags
