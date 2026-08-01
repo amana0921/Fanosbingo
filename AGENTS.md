@@ -724,6 +724,24 @@ reaching `20-post`.
 
 ## 5. Verification discipline
 
+> **The recurring failure in this codebase is things that report success while
+> doing nothing.** A budget filter that rendered as literal text and matched
+> nothing. `ALTER DEFAULT PRIVILEGES ... REVOKE` that wrote no ACL row. Four
+> assertions that passed vacuously. An alarm that changed state correctly and
+> could not encrypt its own notification. None of them errored; every one of
+> them reported success.
+>
+> The defence is the same every time: **execute the control, do not inspect its
+> configuration.** `SET ROLE anon` and query the table rather than comparing two
+> lists you wrote. Create a table and ask whether it is writable rather than
+> trusting the statement you just ran. Fire the alarm and wait for the email
+> rather than reading its state.
+>
+> And when a lesson is written down, **grep for the other place it applies.**
+> `environments/account` carried the CloudWatch key-policy statement, with a
+> comment saying precisely what its absence costs, while `modules/kms` did not —
+> for as long as both files existed.
+
 This project got significantly faster and less error-prone when local
 verification started preceding every push. **Keep doing it.**
 
@@ -853,6 +871,9 @@ Every one of these cost real time.
 | A deployment left the service down | Enable `deployment_circuit_breaker` with `rollback`. On one instance with static host ports ECS must stop the old task first, so a bad image *ends* the service rather than degrading it |
 | `wait services-stable` succeeded but the old code is running | The circuit breaker rolled back. Stable ≠ deployed. Compare the running task definition against the one you registered |
 | `no pg_hba.conf entry ... no encryption` | RDS PostgreSQL 15+ ships `rds.force_ssl = 1` as the **engine default** |
+| An alarm fires and **no email arrives** | The SNS topic is KMS-encrypted and the key policy does not admit `cloudwatch.amazonaws.com`. CloudWatch cannot produce a data key, the publish fails, and the notification is **dropped silently** — alarm state correct, console shows ALARM, subscription confirmed, metric publishing. Every individual signal says healthy. `modules/kms` needs `kms:GenerateDataKey*` + `kms:Decrypt` for that service principal, same as the audit key in `environments/account`. Cost: every per-environment alarm, including `game-loop-stalled`, could never deliver |
+| An alarm at **OK** that has never had data | Not healthy — **unarmed**. With `treat_missing_data = "notBreaching"` a metric that never publishes leaves the alarm at OK forever, and OK is indistinguishable from working. `scripts/verify-alarms.sh` exists to tell the two apart; run it before trusting any alarm |
+| A verifier that passes on a broken system | Worse than no verifier: it converts "we do not know" into "we checked". `verify-alarms.sh` shipped checking confirmed subscribers, live metrics and non-empty actions — three of the four links — and passed an environment where every notification was being dropped by the fourth. When writing a check, enumerate the links in the chain and say which ones it does **not** cover |
 | A budget that reports **$0 forever** | `"user:Environment$${var.environment}"` — in HCL `$${` is the escape for a literal `${`, so the filter renders as the literal text and matches nothing. Both threshold alerts and the forecast alert are unreachable, silently. Use `format("user:Environment$%s", var.environment)`. Verified with `terraform console` |
 | `ssm:StartSession` scoped to a document is **not** scoped | Listing `AWS-StartPortForwardingSessionToRemoteHost` in `Resource` constrains nothing: a session naming **no** document uses the default `SSM-SessionManagerRunShell`, so only the instance ARN is evaluated. `instance/*` is therefore an interactive root shell on every instance in the account. Add a tag condition (`ssm:resourceTag/Environment`) or `ssm:SessionDocumentAccessCheck` |
 | A plan reporting "2 to destroy" on an ECS change | A task definition is **immutable**, so Terraform expresses every change to one as destroy-and-create. The two destroyed and the two added are the same two resources. What *is* worth stopping for: a **service** being replaced rather than updated in-place, or `aws_db_instance` / `aws_kms_key` in a destroy list |
