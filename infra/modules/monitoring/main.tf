@@ -51,9 +51,29 @@ resource "aws_budgets_budget" "monthly" {
   limit_unit   = "USD"
   time_unit    = "MONTHLY"
 
+  # format(), NOT "user:Environment$${var.environment}".
+  #
+  # In HCL, `$${` is the escape sequence for a LITERAL `${`. The obvious-looking
+  # string therefore renders as the seven characters `user:Environment` followed
+  # by the literal text `${var.environment}` -- the interpolation never happens.
+  # Verified with `terraform console`:
+  #
+  #   > "user:Environment$${var.environment}"
+  #   "user:Environment${var.environment}"
+  #
+  # That filter matches no resource, so the budget reported $0 actual and $0
+  # forecast permanently, and every notification below was unreachable. Silent,
+  # and in exactly the situation they exist to catch: on a credit-based Free Tier
+  # plan, exhausting credits SUSPENDS resources, and these alerts are the warning
+  # to switch to Paid before that happens to a real-money game.
+  #
+  # Same class of defect as the ALTER DEFAULT PRIVILEGES form documented in
+  # db/20-post/004 -- a statement that reports success and changes nothing.
+  #
+  # format() sidesteps the escape entirely: the `$` is data, not syntax.
   cost_filter {
     name   = "TagKeyValue"
-    values = ["user:Environment$${var.environment}"]
+    values = [format("user:Environment$%s", var.environment)]
   }
 
   # Absolute dollar thresholds, expressed as percentages of the limit.
