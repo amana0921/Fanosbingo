@@ -41,12 +41,36 @@ countdown ticks — driven by a server-side game loop, not by a browser tab.
 | Mini App | served from Caddy at `app.<domain>`, built into the image |
 | Joining and claiming | **working** — `/select-card` and `/claim-bingo`, identity and card layout derived server-side |
 | Bank deposit (TeleBirr / CBE) | **working** — player claims, operator approves against their own statement. No wallet, no contract |
-| Bank withdrawal | **half** — correctness layer in `db/20-post/007`, routes and UI not built |
+| Bank withdrawal | **working** — player requests, operator pays by hand and records the reference. `db/20-post/007` + `/withdrawals/*` |
 | Admin | Telegram identity + `is_admin`, single factor. Bootstrap route promotes only the first admin, then disarms |
-| Three API routes | **404** — `submit-deposit`, `record-withdrawal`, `manage-bnb-withdrawal`. All deposit/withdrawal, all need the contract |
-| Database authorization | **enforced** — EXECUTE is an allowlist, `telegram_users` is owner-scoped, verified by `probe-public-access.sh` |
-| Smart contract | **not deployed** — blocked on a free faucet visit |
+| Database authorization | **enforced** — EXECUTE is an allowlist, `telegram_users` is owner-scoped, game state is read-only to clients, verified by `probe-public-access.sh` |
+| Crypto (wallet login, BNB deposit/withdrawal) | **deferred, not removed** — every surface is behind `VITE_CRYPTO_ENABLED`, off by default. Ethiopian players overwhelmingly do not hold cryptocurrency, so birr is the currency that matters. Code, contract and KMS key all retained |
+| Smart contract | **not deployed** — and not on the critical path while crypto is deferred |
 | Production | Terraform written, plans cleanly, never applied |
+
+**The money round trip is closed:** deposit by bank, play, withdraw by bank. That is
+the whole loop, with no wallet anywhere in it.
+
+> **Deploy order matters once.** `db/20-post/008` closes a path that let any
+> authenticated player mint an arbitrary `won_balance` with a single `PATCH` on
+> `games` — a permissive inherited policy plus a blanket table grant plus a
+> payout trigger that reads `winner_ids` straight from the update. That balance
+> previously had no exit; the bank withdrawal routes give it one. **Apply `008`
+> before deploying them.**
+
+### Routes the SPA no longer calls
+
+The inherited Deno function names are not being ported. Each was resolved by
+asking the question in `AGENTS.md` §7 — "why can RLS not do this?" — and most
+answered "it can":
+
+| Route | Resolution |
+|---|---|
+| `get-card-layouts` · `force-finish-game` | deleted; `get_all_card_layouts()` and `game_tick()` already did the work |
+| `submit-deposit` · `record-withdrawal` · `manage-bnb-withdrawal` · `claim-winnings-to-contract` · `get-withdrawal-wallet-info` · `monitor-deposits` | crypto, deferred with the flag |
+| `deselect-card` | rebuilt as `/deselect-card` + `release_card()`. RLS could not express "only while selection is open" — that condition lives on the `games` row |
+| `update-settings` | rebuilt as `/admin/settings` + `admin_update_setting()`, **minus `telegram_bot_token`**. Writing that key back would have undone `db/20-post/003`, which redacted it after `curl /rest/v1/settings` returned a live one anonymously. It signs every player's login; it lives in SSM |
+| `setup-telegram-webhook` | **not built.** The button that claimed to do it POSTed a 404 and did nothing. Now says so, rather than failing silently. The receiving route must verify `X-Telegram-Bot-Api-Secret-Token` strictly, and `setWebhook` must be re-registered with that secret **before** the check ships |
 
 Engineering detail, decisions and their reasons live in **[AGENTS.md](AGENTS.md)**.
 Read it before changing anything; most of it was learned expensively.
@@ -104,11 +128,74 @@ Local checks that need no AWS:
 
 ```bash
 npm --prefix services/functions install
-npm run test:functions        # 189 assertions, 8 suites
+npm run test:functions        # 263 assertions, 10 suites
 ./scripts/test-migrations.sh   # applies db/20-post to a throwaway postgres, twice
 node scripts/check-migrations.mjs
 terraform fmt -check -recursive infra/
 ```
+
+### Deploy order, and the one case where it matters
+
+Most of the time these three are independent and can go in any order. Once they
+are not, and getting it wrong is expensive:
+
+```
+1. database migrations      gh workflow run db-migrate.yml -f environment=<env>
+2. the functions service    gh workflow run deploy-services.yml -f service=functions ...
+3. the Mini App (caddy)     gh workflow run deploy-services.yml -f service=caddy ...
+```
+
+**Migrations first, always, when a migration REMOVES a permission.**
+
+`db/20-post/008` closes a path that let any authenticated player credit
+themselves an arbitrary `won_balance` with one `PATCH` on `games`. Before the
+bank withdrawal routes existed, a minted balance had nowhere to go — every
+on-chain route is a 404. Those routes give it a cash exit, by hand,
+irreversibly.
+
+So deploying the `functions` image before the migration opens a window where
+both halves are live at once. The reverse order has no such window: the
+migration alone just makes a few admin actions fail until the image catches up.
+
+The general rule, worth applying to migrations nobody has thought about yet:
+
+| the change | order |
+|---|---|
+| a migration that REVOKES something | migration first |
+| a migration that GRANTS something the code needs | migration first |
+| a migration that only ADDS a table or function | either |
+| code that stops calling something | code first, then drop it |
+
+When in doubt, migrations first. A migration that runs early usually degrades a
+feature; code that runs early can expose one.
+
+### Reading `terraform plan` on an ECS change
+
+A plan touching services routinely reports resources destroyed, and it is
+almost never what it sounds like:
+
+```
+Plan: 2 to add, 4 to change, 2 to destroy
+```
+
+An **ECS task definition is immutable**. Terraform cannot edit one, so any
+change at all — a new image tag, one added secret — is expressed as *destroy the
+old revision, create a new one*. The two destroyed and the two added are the
+same two resources. Nothing is torn down; `:4` is deregistered and `:5` takes
+over, which is exactly what a normal deploy does.
+
+What to actually look for in that summary:
+
+- **`aws_ecs_service` should say `updated in-place`.** If a SERVICE is being
+  replaced, that is a real outage — read why.
+- **`aws_db_instance`, `aws_kms_key`, `aws_eip` in the destroy list.** Any of
+  those is a stop-and-think. `prod` has `deletion_protection` and
+  `skip_final_snapshot = false` precisely so the database cannot go quietly.
+- **Task-definition churn you did not cause.** The image tag moves whenever CI
+  has pushed a newer build than the last apply — that is the SSM image-pointer
+  mechanism in `modules/app_stack` converging, not drift to be alarmed by. But it
+  does mean an infrastructure apply will ALSO roll those services onto the newer
+  image. Know that before running one at a busy moment.
 
 ---
 

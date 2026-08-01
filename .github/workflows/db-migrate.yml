@@ -10,6 +10,33 @@ name: Database migrations
 #
 # A pull request touching migrations gets a DRY RUN showing exactly what would
 # be applied. Applying is deliberate: either merged to main, or dispatched.
+#
+# TWO JOBS, AND THE SPLIT IS A SECURITY BOUNDARY RATHER THAN TIDINESS.
+#
+# This was one job with no `environment:` at all, and a comment claiming "prod's
+# role stays unreachable: obtaining it requires `environment: prod`, which is
+# behind required reviewers." That was false.
+#
+# prod's trust policy admitted `ref:refs/heads/main` as well as
+# `environment:prod`. A workflow_dispatch from main emits the subject
+# `repo:<owner>/<repo>:ref:refs/heads/main`, which matched -- so dispatching this
+# with environment=prod handed out the prod deploy role with NO reviewer asked.
+# That is decrypt of prod's entire SSM tree and a tunnel to the prod database as
+# app_service, which db/00-bootstrap/001 gives BYPASSRLS: read/write on every
+# player balance, with the second-person control bypassed.
+#
+# Fixed in two places, because either alone is not enough:
+#
+#   1. infra/environments/prod/main.tf no longer trusts `ref:refs/heads/main`.
+#      Reaching prod's role now genuinely requires declaring `environment: prod`.
+#   2. This file therefore has to declare it -- hence the `apply` job below --
+#      while the PR dry run must NOT, because dev's GitHub Environment carries a
+#      deployment branch policy restricting it to `main` and declaring it on a PR
+#      would make GitHub refuse the deployment outright.
+#
+# Those two requirements are contradictory within one job, which is why there are
+# two. The setup steps are duplicated as a result; that is the cost, and it is
+# worth paying for a boundary that holds rather than one that reads well.
 
 on:
   pull_request:
@@ -38,36 +65,37 @@ permissions:
   pull-requests: write
 
 jobs:
-  migrate:
-    name: Migrate (${{ github.event.inputs.environment || 'dev' }})
+  # ==========================================================================
+  # Pull request dry run — dev only, and deliberately NOT behind an environment
+  #
+  # NO `environment:` here. That is what lets the OIDC subject be `pull_request`,
+  # which dev's deploy role trusts and prod's does not.
+  #
+  # THE TRADE, STATED: a pull request can reach dev's deploy role, and can
+  # therefore read and write dev's SSM tree and tunnel to the dev database from
+  # PR-branch code. That is the price of dry-running a migration against a real
+  # database at all -- the check is worth having, and dev holds BSC testnet
+  # credentials by construction.
+  #
+  # What bounds the cost is the deploy role's own policy, not this file. See
+  # infra/modules/iam/main.tf: ssm:StartSession is conditioned on the Environment
+  # tag, so this cannot open a session on the prod instance.
+  # ==========================================================================
+  dry-run:
+    name: Dry run (dev)
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
 
-    # NO `environment:` here, and it is a deliberate reversal.
-    #
-    # This job runs on PULL REQUESTS for the migration dry run. `dev` now
-    # carries a deployment branch policy restricting it to `main` -- the control
-    # that stops a modified workflow on a PR branch from declaring
-    # `environment: dev` and reaching the AdministratorAccess executor -- so
-    # declaring an environment here would make GitHub refuse the deployment
-    # outright, before any step runs.
-    #
-    # Dropping it makes the OIDC subject `pull_request` on a PR and
-    # `ref:refs/heads/main` on a dispatch, both of which the SCOPED per-
-    # environment deploy role trusts. It never yields the executor.
-    #
-    # THE TRADE, STATED: a pull request can reach dev's deploy role, and can
-    # therefore read and write dev's SSM tree and tunnel to the dev database
-    # from PR-branch code. That is the price of running a dry run against a real
-    # database at all -- the check is worth having, and dev holds BSC testnet
-    # credentials by construction. Prod's role stays unreachable: obtaining it
-    # requires `environment: prod`, which is behind required reviewers.
     concurrency:
-      # Two concurrent runners applying migrations to one database is a genuine
-      # corruption risk, not merely wasteful.
-      group: db-migrate-${{ github.event.inputs.environment || 'dev' }}
+      # Two concurrent runners against one database is a genuine corruption
+      # risk, not merely wasteful. Shared with `apply` below via the same group
+      # name so a dry run and an apply cannot overlap either.
+      group: db-migrate-dev
       cancel-in-progress: false
+
     env:
-      ENVIRONMENT: ${{ github.event.inputs.environment || 'dev' }}
+      ENVIRONMENT: dev
+
     steps:
       - uses: actions/checkout@v4
 
@@ -89,16 +117,14 @@ jobs:
         uses: aws-actions/configure-aws-credentials@v4
         with:
           # The scoped per-environment deploy role, not the AdministratorAccess
-          # Terraform executor. This job runs on PULL REQUESTS for the dry run,
-          # which means it runs workflow code from the PR branch -- exactly the
-          # situation where an admin credential should not be present.
+          # Terraform executor. This job runs workflow code from the PR branch --
+          # exactly the situation where an admin credential should not be present.
           #
-          # A pull request can only ever reach the DEV role: obtaining the prod
-          # one requires declaring `environment: prod`, which puts the job behind
-          # prod's required reviewers.
-          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/fanosbingo-${{ github.event.inputs.environment || 'dev' }}-github-deploy
+          # Hardcoded to dev. There is no input to interpolate here, which is the
+          # point: this job has no path to any other environment.
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/fanosbingo-dev-github-deploy
           aws-region: ${{ vars.AWS_REGION }}
-          role-session-name: db-migrate-${{ github.run_id }}
+          role-session-name: db-migrate-dryrun-${{ github.run_id }}
 
       - name: Install session-manager-plugin
         run: |
@@ -110,16 +136,14 @@ jobs:
       - name: Verify psql
         run: psql --version
 
-      - name: Run migrations
-        env:
+      - name: Run migrations (dry run)
+        run: |
+          set -euo pipefail
+
           # PostgREST connects as `authenticator`. The bootstrap file sets this
           # role's password, so the runner needs it. Read from SSM at run time
           # rather than passed as a workflow input, so it never appears in logs
           # or run metadata.
-          DRY_RUN_FLAG: ${{ github.event_name == 'pull_request' && '--dry-run' || (github.event.inputs.dry_run == 'true' && '--dry-run' || '') }}
-        run: |
-          set -euo pipefail
-
           DB_AUTHENTICATOR_PASSWORD="$(aws ssm get-parameter \
             --name "/fanosbingo-${ENVIRONMENT}/db/postgrest_password" \
             --with-decryption --query 'Parameter.Value' --output text)"
@@ -143,13 +167,123 @@ jobs:
           source scripts/db-tunnel.sh "$ENVIRONMENT"
           trap stop_db_tunnel EXIT
 
+          ./scripts/db-migrate.sh --dry-run | tee /tmp/migrate-output.txt
+
+      - name: Comment dry run on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const out = fs.readFileSync('/tmp/migrate-output.txt', 'utf8');
+            const body = [
+              '### Pending database migrations — `dev`',
+              '',
+              '```',
+              out.replace(/\u001b\[[0-9;]*m/g, '').slice(-60000),
+              '```',
+            ].join('\n');
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const mine = comments.find(c =>
+              c.user.type === 'Bot' && c.body.includes('### Pending database migrations'));
+            if (mine) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                comment_id: mine.id, body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: context.issue.number, body,
+              });
+            }
+
+  # ==========================================================================
+  # Dispatched apply — behind the target environment's GitHub Environment
+  #
+  # `environment:` IS declared here, and it is the control rather than a label.
+  # It makes the OIDC subject `environment:<target>`, which is now the ONLY
+  # subject prod's role trusts, and it puts the job behind prod's required
+  # reviewers before a single step runs.
+  # ==========================================================================
+  apply:
+    name: Migrate (${{ github.event.inputs.environment }})
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment }}
+
+    concurrency:
+      group: db-migrate-${{ github.event.inputs.environment }}
+      cancel-in-progress: false
+
+    env:
+      ENVIRONMENT: ${{ github.event.inputs.environment }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the repository is bootstrapped
+        env:
+          ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+        run: |
+          if [ -z "$ACCOUNT_ID" ]; then
+            echo "::error::AWS_ACCOUNT_ID is not set, so the deploy role ARN cannot be built. Run ./scripts/bootstrap-github.sh."
+            exit 1
+          fi
+
+      - name: Assume AWS role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/fanosbingo-${{ github.event.inputs.environment }}-github-deploy
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: db-migrate-${{ github.run_id }}
+
+      - name: Install session-manager-plugin
+        run: |
+          curl -fsSL -o /tmp/session-manager-plugin.deb \
+            "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_64bit/session-manager-plugin.deb"
+          sudo dpkg -i /tmp/session-manager-plugin.deb
+          session-manager-plugin --version
+
+      - name: Verify psql
+        run: psql --version
+
+      - name: Run migrations
+        env:
+          DRY_RUN_FLAG: ${{ github.event.inputs.dry_run == 'true' && '--dry-run' || '' }}
+        run: |
+          set -euo pipefail
+
+          DB_AUTHENTICATOR_PASSWORD="$(aws ssm get-parameter \
+            --name "/fanosbingo-${ENVIRONMENT}/db/postgrest_password" \
+            --with-decryption --query 'Parameter.Value' --output text)"
+          export DB_AUTHENTICATOR_PASSWORD
+
+          DB_APP_PASSWORD="$(aws ssm get-parameter \
+            --name "/fanosbingo-${ENVIRONMENT}/db/app_password" \
+            --with-decryption --query 'Parameter.Value' --output text)"
+          export DB_APP_PASSWORD
+
+          for v in DB_AUTHENTICATOR_PASSWORD DB_APP_PASSWORD; do
+            if [ "${!v}" = "PLACEHOLDER_SET_ME_OUT_OF_BAND" ]; then
+              echo "::error::$v is still a placeholder. Run the 'Sync secrets to SSM' workflow first."
+              exit 1
+            fi
+          done
+
+          # shellcheck disable=SC1091
+          source scripts/db-tunnel.sh "$ENVIRONMENT"
+          trap stop_db_tunnel EXIT
+
           ./scripts/db-migrate.sh $DRY_RUN_FLAG | tee /tmp/migrate-output.txt
 
       # One tunnel for every check. Each `source db-tunnel.sh` opens a separate
       # SSM session, and a just-closed session can still hold its local port,
       # which presents as a confusing "tunnel did not become ready".
       - name: Verify database state and game loop
-        if: github.event_name != 'pull_request' && github.event.inputs.dry_run != 'true'
+        if: github.event.inputs.dry_run != 'true'
         run: |
           set -euo pipefail
           # shellcheck disable=SC1091
@@ -230,7 +364,7 @@ jobs:
       # Tests the whole chain (Cloudflare -> Caddy -> PostgREST -> RLS), which
       # the migration-time SET ROLE anon assertions deliberately do not.
       - name: Probe public access
-        if: github.event_name != 'pull_request' && github.event.inputs.dry_run != 'true'
+        if: github.event.inputs.dry_run != 'true'
         run: |
           BASE="https://api.${{ vars.DOMAIN_NAME }}"
           if ! curl -sf -m 15 -o /dev/null "$BASE/healthz"; then
@@ -239,35 +373,3 @@ jobs:
             exit 0
           fi
           ./scripts/probe-public-access.sh "$BASE" | tee -a "$GITHUB_STEP_SUMMARY"
-
-      - name: Comment dry run on PR
-        if: github.event_name == 'pull_request'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            const out = fs.readFileSync('/tmp/migrate-output.txt', 'utf8');
-            const body = [
-              '### Pending database migrations — `dev`',
-              '',
-              '```',
-              out.replace(/\u001b\[[0-9;]*m/g, '').slice(-60000),
-              '```',
-            ].join('\n');
-            const { data: comments } = await github.rest.issues.listComments({
-              owner: context.repo.owner, repo: context.repo.repo,
-              issue_number: context.issue.number,
-            });
-            const mine = comments.find(c =>
-              c.user.type === 'Bot' && c.body.includes('### Pending database migrations'));
-            if (mine) {
-              await github.rest.issues.updateComment({
-                owner: context.repo.owner, repo: context.repo.repo,
-                comment_id: mine.id, body,
-              });
-            } else {
-              await github.rest.issues.createComment({
-                owner: context.repo.owner, repo: context.repo.repo,
-                issue_number: context.issue.number, body,
-              });
-            }

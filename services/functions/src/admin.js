@@ -181,3 +181,126 @@ export function timingSafeEqual(a, b) {
   }
   return diff === 0;
 }
+
+/**
+ * POST /admin/games/:id/end
+ *
+ * Ending a game as an operator. Exists because db/20-post/008 revoked UPDATE on
+ * `games` from the browser -- that privilege was what let any player set
+ * winner_ids and have payout_winners() credit them.
+ *
+ * The route passes an id and the admin's proven uid, and NOTHING ELSE. It
+ * deliberately accepts no winner or prize field from the request: admin_end_game
+ * writes status and finished_at only, matching what game_tick() does, so a game
+ * ended here pays out whatever atomic_claim_bingo already recorded and nothing
+ * if nobody claimed. Accepting those columns here would rebuild the hole 008
+ * closed, one authorization level up.
+ */
+export function createEndGameHandler(pool) {
+  const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+  return async function endGame(req, res) {
+    const id = req.params?.id;
+    if (typeof id !== 'string' || !UUID_RE.test(id)) {
+      return res.status(400).json({ success: false, error: 'id must be a uuid' });
+    }
+
+    const { rows } = await pool.query('SELECT admin_end_game($1, $2) AS result', [
+      id,
+      req.auth.uid,
+    ]);
+
+    const result = rows[0]?.result ?? { success: false, error_code: 'INTERNAL_ERROR' };
+
+    if (!result.success) {
+      // NOT_ENDABLE covers "already finished" and "does not exist". A conflict,
+      // not an error: it is what a double-clicked button produces.
+      const code = result.error_code === 'NOT_ENDABLE' ? 409 : 400;
+      req.log?.warn?.({ event: 'end_game_refused', game_id: id, reason: result.error_code });
+      return res.status(code).json(result);
+    }
+
+    // Ending a game can trigger a payout. Logged at warn for the same reason the
+    // deposit approval is.
+    req.log?.warn?.({
+      event: 'game_ended_by_admin',
+      game_id: id,
+      admin_uid: req.auth.uid,
+      previous_status: result.previous_status,
+    });
+
+    return res.json(result);
+  };
+}
+
+/**
+ * POST /admin/settings  { key, value }
+ *
+ * Replaces the inherited update-settings route, which 404'd and which saved SIX
+ * keys -- the first of them telegram_bot_token.
+ *
+ * That key is deliberately not writable. db/20-post/003 exists because
+ * `curl /rest/v1/settings` returned a live bot token to an anonymous caller, and
+ * it both excluded the key from the read allowlist AND redacted the stored
+ * value. It is the HMAC key Telegram uses to sign initData, so holding it means
+ * forging any player's identity. Porting the route faithfully would have written
+ * a live one straight back into the table 003 cleared, while looking like a
+ * feature being restored. It lives in SSM; rotating it is put-parameter plus a
+ * redeploy.
+ *
+ * The allowlist is enforced by admin_update_setting(), not here. This validates
+ * shape and reports; the database decides what may be written, so a second route
+ * added later cannot widen it by forgetting.
+ */
+export function createUpdateSettingHandler(pool) {
+  return async function updateSetting(req, res) {
+    const key = typeof req.body?.key === 'string' ? req.body.key.trim() : '';
+    const value = req.body?.value;
+
+    if (!key) {
+      return res.status(400).json({ success: false, error: 'key is required' });
+    }
+
+    // Values are presentation strings. Bounded so a paste accident cannot put a
+    // megabyte into a row every player reads.
+    if (typeof value !== 'string' || value.length > 4000) {
+      return res
+        .status(400)
+        .json({ success: false, error: 'value must be a string of at most 4000 characters' });
+    }
+
+    const { rows } = await pool.query('SELECT admin_update_setting($1, $2, $3) AS result', [
+      key,
+      value,
+      req.auth.uid,
+    ]);
+
+    const result = rows[0]?.result ?? { success: false, error_code: 'INTERNAL_ERROR' };
+
+    if (!result.success) {
+      // NOT_WRITABLE is a 403 rather than a 400: the request is well formed and
+      // the key simply is not the operator's to change. The response names the
+      // writable set, which is not a secret -- it is in db/20-post/013.
+      const code = result.error_code === 'NOT_WRITABLE' ? 403 : 400;
+      req.log?.warn?.({
+        event: 'setting_write_refused',
+        key,
+        admin_uid: req.auth.uid,
+        reason: result.error_code,
+      });
+      return res.status(code).json(result);
+    }
+
+    // commission_rate decides the prize/fee split, so a change to it is logged
+    // with its value. The others are presentation and are logged by key only --
+    // there is no reason to copy user_instructions into CloudWatch.
+    req.log?.warn?.({
+      event: 'setting_updated',
+      key,
+      admin_uid: req.auth.uid,
+      ...(key === 'commission_rate' ? { value } : {}),
+    });
+
+    return res.json(result);
+  };
+}

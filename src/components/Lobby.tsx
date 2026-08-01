@@ -1,13 +1,17 @@
-import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
-import { useAccount } from 'wagmi';
+import { useState, useEffect, useCallback, useMemo, useRef, lazy, Suspense } from 'react';
 import { supabase, Game } from '../lib/supabase';
 import { TelegramUser } from '../utils/telegram';
 import { ToastContainer, ToastData } from './ToastContainer';
 import { getCachedLayouts, setCachedLayouts } from '../utils/cardLayoutCache';
-import WalletConnect from './WalletConnect';
-import { WalletDepositModal } from './WalletDepositModal';
-import { BnbWithdrawalModal } from './BnbWithdrawalModal';
 import { BankDepositModal } from './BankDepositModal';
+import { BankWithdrawalModal } from './BankWithdrawalModal';
+import { getAccessToken } from '../lib/auth';
+import { CRYPTO_ENABLED } from '../lib/features';
+
+// Every wallet-dependent surface, behind one dynamic import. useAccount() used
+// to be called at this component's top level, which put wagmi in the entry
+// chunk -- Lobby is imported statically by App. See src/components/WalletPanel.tsx.
+const WalletPanel = lazy(() => import('./WalletPanel'));
 import { Sun, Moon, Wallet, Timer, Hash, Trophy, Coins } from 'lucide-react';
 import { formatBnb } from '../utils/formatBalance';
 
@@ -36,7 +40,14 @@ interface PlayerInfo {
 }
 
 export function Lobby({ onJoinGame, onSpectateGame, telegramUser }: LobbyProps) {
-  const { address: walletAddress, isConnected: isWalletConnected } = useAccount();
+  // Reported upward by WalletPanel rather than read from useAccount() here.
+  //
+  // Undefined whenever crypto is disabled, which is the correct value: there is
+  // no wallet. The header then renders "No wallet" and get_lobby_data_instant
+  // is called with a null address, both of which were already the behaviour for
+  // a Telegram player who had not connected one.
+  const [walletAddress, setWalletAddress] = useState<string | undefined>(undefined);
+  const isWalletConnected = Boolean(walletAddress);
   const [selectedNumber, setSelectedNumber] = useState<number | null>(null);
   const [previewCard, setPreviewCard] = useState<number[][] | null>(null);
   const [activeGame, setActiveGame] = useState<Game | null>(null);
@@ -58,6 +69,7 @@ export function Lobby({ onJoinGame, onSpectateGame, telegramUser }: LobbyProps) 
   const [isWalletDepositModalOpen, setIsWalletDepositModalOpen] = useState(false);
   const [isBnbWithdrawalModalOpen, setIsBnbWithdrawalModalOpen] = useState(false);
   const [isBankDepositModalOpen, setIsBankDepositModalOpen] = useState(false);
+  const [isBankWithdrawalModalOpen, setIsBankWithdrawalModalOpen] = useState(false);
 
   // A FUNDED ACCOUNT is what gates playing, not a crypto wallet.
   //
@@ -468,18 +480,27 @@ export function Lobby({ onJoinGame, onSpectateGame, telegramUser }: LobbyProps) 
       if (players && players.length > 0) {
         await startGame();
       } else {
+        // Still needed: the clock offset below is computed from it, and
+        // get_server_timestamp_ms is a read that returns no user data (it is on
+        // db/20-post/004's anon allowlist for exactly this).
         const { data: serverTime } = await supabase.rpc('get_server_timestamp_ms');
 
+        // Read the game back rather than rescheduling it from here.
+        //
+        // This used to compute a new starts_at / selection_closed_at and write
+        // them. game_tick() owns that -- db/20-post/002 step 3, the same branch
+        // that flips waiting -> playing -- so the browser was racing a loop that
+        // runs once a second regardless.
+        //
+        // It also required the client to hold UPDATE on games, which is the
+        // privilege that let ANY authenticated player set winner_ids and
+        // winner_prize_each and have payout_winners() credit them. Revoked in
+        // db/20-post/008.
         if (serverTime) {
-          const newStartTimeMs = serverTime + 25000;
-          const newStartTime = new Date(newStartTimeMs).toISOString();
-          const newSelectionClosedAt = new Date(newStartTimeMs - 5000).toISOString();
-
           const { data: updatedGame } = await supabase
             .from('games')
-            .update({ starts_at: newStartTime, selection_closed_at: newSelectionClosedAt })
-            .eq('id', activeGame.id)
             .select()
+            .eq('id', activeGame.id)
             .maybeSingle();
 
           if (updatedGame) {
@@ -520,13 +541,28 @@ export function Lobby({ onJoinGame, onSpectateGame, telegramUser }: LobbyProps) 
     }
   };
 
+  // NOTHING HERE. This used to UPDATE games SET status='playing' from the
+  // browser when the countdown hit zero.
+  //
+  // Two things were wrong with it, and the second is why it is gone rather than
+  // merely unnecessary.
+  //
+  // It was client-driven game logic -- the same defect GameRoom.tsx documents
+  // for the force-finish-game route it deleted: a game that only starts when
+  // somebody has the tab open. game_tick() has owned this since db/20-post/002
+  // step 3, evaluated once a second by the ticker whether or not a browser is
+  // watching:
+  //
+  //   WHERE status = 'waiting' AND starts_at <= now()
+  //     SET status = 'playing', started_at = now()
+  //
+  // And it required the client to hold UPDATE on games. That privilege is what
+  // made a single PATCH able to set winner_ids and winner_prize_each and have
+  // payout_winners() credit them -- an arbitrary balance, mintable by any
+  // authenticated player. db/20-post/008 revokes it, so this call would now fail
+  // anyway; it is removed because it should never have been the client's job.
   const startGame = async () => {
-    if (!activeGame) return;
-    await supabase
-      .from('games')
-      .update({ status: 'playing', started_at: new Date().toISOString() })
-      .eq('id', activeGame.id)
-      .eq('status', 'waiting');
+    /* game_tick() owns the waiting -> playing transition. */
   };
 
   const handleNumberClick = async (num: number, isRetry = false) => {
@@ -646,24 +682,39 @@ export function Lobby({ onJoinGame, onSpectateGame, telegramUser }: LobbyProps) 
     setTakenNumbers((prev) => prev.filter(n => n !== cardNumber));
 
     const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
-    const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
 
     try {
+      // THE PLAYER'S TOKEN, not the anon key, and no telegramUserId in the body.
+      //
+      // This used to send `Bearer ${VITE_SUPABASE_ANON_KEY}` with
+      // `telegramUserId` alongside playerId -- identity asserted rather than
+      // proven, which is the defect the auth service exists to remove. The route
+      // takes the telegram id from the verified JWT and ignores anything the
+      // body says about it (there is a test pinning exactly that).
+      //
+      // The route also 404'd until now, so this whole path has never worked.
+      const token = await getAccessToken();
+
       const response = await fetch(`${supabaseUrl}/functions/v1/deselect-card`, {
         method: 'POST',
         headers: {
-          'Authorization': `Bearer ${supabaseAnonKey}`,
+          'Authorization': `Bearer ${token}`,
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({
-          playerId,
-          telegramUserId: telegramUser.id
-        }),
+        body: JSON.stringify({ playerId }),
       });
 
-      const result = await response.json();
+      const result = await response.json().catch(() => ({}));
 
       if (!response.ok) {
+        // 409 means the lobby moved on while this was in flight -- the game
+        // started, or selection closed. Not a failure the player caused, and the
+        // useful response is the real state rather than "try again".
+        if (response.status === 409) {
+          addToast('Too late to release that card — the game has started.', 'info');
+          await loadLobbyDataOptimized();
+          return false;
+        }
         throw new Error(result.error || 'Failed to deselect card');
       }
 
@@ -842,7 +893,7 @@ export function Lobby({ onJoinGame, onSpectateGame, telegramUser }: LobbyProps) 
         {registeredUser && (
           <div className={`border-l-4 p-3 mb-3 rounded transition-colors duration-300 ${isDarkMode ? 'bg-sky-900/20 border-sky-600 text-sky-300' : 'bg-sky-50 border-sky-400 text-sky-800'}`}>
             <p className="text-sm font-semibold mb-2">Deposit or withdraw by bank</p>
-            <p className="text-xs mb-2 opacity-90">TeleBirr or CBE. No wallet needed. Withdrawal by bank is coming next.</p>
+            <p className="text-xs mb-2 opacity-90">TeleBirr or CBE. No wallet needed.</p>
             <div className="flex gap-2">
               <button
                 onClick={() => setIsBankDepositModalOpen(true)}
@@ -850,54 +901,63 @@ export function Lobby({ onJoinGame, onSpectateGame, telegramUser }: LobbyProps) 
               >
                 Deposit
               </button>
-            </div>
-          </div>
-        )}
-
-        {/* Crypto, for players who want it. Genuinely needs a wallet: there has
-            to be somewhere to send BNB. */}
-        {!isWalletConnected && (
-          <div className={`border-l-4 p-3 mb-3 rounded transition-colors duration-300 ${isDarkMode ? 'bg-yellow-900/20 border-yellow-600 text-yellow-300' : 'bg-yellow-50 border-yellow-400 text-yellow-800'}`}>
-            <p className="text-sm font-semibold mb-2">Prefer crypto?</p>
-            <p className="text-xs mb-2 opacity-90">Connect a BNB wallet to deposit or withdraw in BNB. Not needed to play.</p>
-            <WalletConnect
-              telegramUserId={telegramUser?.id || 0}
-              onWalletConnected={() => addToast('Wallet connected!', 'success')}
-            />
-          </div>
-        )}
-
-        {isWalletConnected && registeredUser && (
-          <div className={`border-l-4 p-3 mb-3 rounded transition-colors duration-300 ${isDarkMode ? 'bg-emerald-900/20 border-emerald-600 text-emerald-300' : 'bg-emerald-50 border-emerald-400 text-emerald-800'}`}>
-            <p className="text-sm font-semibold mb-2">Crypto (BNB) Deposits & Withdrawals</p>
-            <p className="text-xs mb-2 opacity-90">Deposit BNB to play or withdraw your winnings ({activeGame ? formatBnb(activeGame.stake_amount) : '0.10'} BNB per game)</p>
-            <div className="flex gap-2">
+              {/* Gated on WON balance, not total.
+                  db/20-post/007 pays out won_balance only -- deposits are not
+                  withdrawable (20251217172433), because paying them out would
+                  make this a way to move money in and straight back out. Showing
+                  the button enabled on a deposit-only balance would mean the
+                  request is refused with INSUFFICIENT_BALANCE for a reason the
+                  player cannot see from here. */}
               <button
-                onClick={() => setIsWalletDepositModalOpen(true)}
-                className="flex-1 py-2 px-4 rounded-lg font-semibold transition-colors bg-emerald-600 hover:bg-emerald-700 text-white"
-              >
-                Deposit BNB
-              </button>
-              <button
-                onClick={() => setIsBnbWithdrawalModalOpen(true)}
+                onClick={() => setIsBankWithdrawalModalOpen(true)}
                 disabled={!registeredUser.won_balance || registeredUser.won_balance === 0}
+                title={
+                  registeredUser.won_balance > 0
+                    ? undefined
+                    : 'Only winnings can be withdrawn. Deposits are not withdrawable.'
+                }
                 className={`flex-1 py-2 px-4 rounded-lg font-semibold transition-colors ${
                   registeredUser.won_balance > 0
-                    ? 'bg-yellow-600 hover:bg-yellow-700 text-white'
+                    ? 'bg-sky-700 hover:bg-sky-800 text-white'
                     : isDarkMode ? 'bg-gray-700 text-gray-500 cursor-not-allowed' : 'bg-gray-200 text-gray-400 cursor-not-allowed'
                 }`}
               >
-                Withdraw BNB
+                Withdraw
               </button>
             </div>
           </div>
         )}
 
-        {/* Loading registration */}
-        {isWalletConnected && !registeredUser && isCheckingRegistration && (
-          <div className={`border-l-4 p-3 mb-3 rounded transition-colors duration-300 ${isDarkMode ? 'bg-blue-900/20 border-blue-600 text-blue-300' : 'bg-blue-50 border-blue-400 text-blue-800'}`}>
-            <p className="text-sm font-medium">Setting up your account...</p>
-          </div>
+        {/* Crypto, for players who want it.
+            DEFERRED, not removed: Ethiopian players overwhelmingly do not hold
+            cryptocurrency, so birr through TeleBirr and CBE is the currency that
+            matters. Set VITE_CRYPTO_ENABLED=true and this returns unchanged.
+
+            The whole panel is lazy because useAccount() lived here, and that one
+            hook pinned wagmi, @reown/appkit and viem into the ENTRY chunk --
+            Lobby is imported statically by App. Gating only the JSX would have
+            saved nothing. See src/lib/features.ts. */}
+        {CRYPTO_ENABLED && (
+          <Suspense fallback={null}>
+            <WalletPanel
+              telegramUserId={telegramUser?.id ?? null}
+              wonBalance={registeredUser?.won_balance || 0}
+              depositedBalance={registeredUser?.deposited_balance || 0}
+              isRegistered={Boolean(registeredUser)}
+              isCheckingRegistration={isCheckingRegistration}
+              stakeAmount={activeGame ? activeGame.stake_amount : null}
+              isDarkMode={isDarkMode}
+              depositOpen={isWalletDepositModalOpen}
+              withdrawOpen={isBnbWithdrawalModalOpen}
+              onOpenDeposit={() => setIsWalletDepositModalOpen(true)}
+              onOpenWithdraw={() => setIsBnbWithdrawalModalOpen(true)}
+              onCloseDeposit={() => setIsWalletDepositModalOpen(false)}
+              onCloseWithdraw={() => setIsBnbWithdrawalModalOpen(false)}
+              onToast={addToast}
+              onRefresh={loadLobbyDataOptimized}
+              onAddressChange={setWalletAddress}
+            />
+          </Suspense>
         )}
 
         {activeGame && countdown > 25 && activeGame.status === 'waiting' && (
@@ -1033,23 +1093,15 @@ export function Lobby({ onJoinGame, onSpectateGame, telegramUser }: LobbyProps) 
             telegramUserId={telegramUser?.id || 0}
           />
 
-          <WalletDepositModal
-            isOpen={isWalletDepositModalOpen}
-            onClose={() => setIsWalletDepositModalOpen(false)}
-            telegramUserId={telegramUser.id}
-            onSuccess={() => {
-              addToast('Deposit successful! Your balance will be updated shortly.', 'success');
-              loadLobbyDataOptimized();
-            }}
-          />
-          <BnbWithdrawalModal
-            isOpen={isBnbWithdrawalModalOpen}
-            onClose={() => setIsBnbWithdrawalModalOpen(false)}
+          {/* The BNB deposit and withdrawal modals now live inside WalletPanel,
+              so they are only fetched when crypto is enabled. */}
+          <BankWithdrawalModal
+            isOpen={isBankWithdrawalModalOpen}
+            onClose={() => setIsBankWithdrawalModalOpen(false)}
             telegramUserId={telegramUser.id}
             wonBalance={registeredUser?.won_balance || 0}
-            depositedBalance={registeredUser?.deposited_balance || 0}
             onSuccess={() => {
-              addToast('Withdrawal request submitted successfully!', 'success');
+              addToast('Withdrawal request submitted. You will be paid by bank.', 'success');
               loadLobbyDataOptimized();
             }}
           />

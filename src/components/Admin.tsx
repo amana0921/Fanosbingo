@@ -1,10 +1,22 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, lazy, Suspense } from 'react';
 import { getAccessToken } from '../lib/auth';
 import { BankDepositQueue } from './BankDepositQueue';
+import { BankWithdrawalQueue } from './BankWithdrawalQueue';
 import { supabase, Game, Player } from '../lib/supabase';
 import { Shield, XCircle, Users, Clock, Trophy, Settings, DollarSign, TrendingUp, CircleUser as UserCircle, Wallet, ArrowDownToLine } from 'lucide-react';
-import { DepositManagement } from './DepositManagement';
-import { BnbWithdrawalManagement } from './BnbWithdrawalManagement';
+import { CRYPTO_ENABLED } from '../lib/features';
+
+// The two on-chain admin views, behind the same flag and the same dynamic import
+// as the player-facing crypto surfaces. Their routes -- monitor-deposits,
+// manage-bnb-withdrawal, get-withdrawal-wallet-info -- are all 404 today, so
+// with crypto deferred these panels could only ever show an error. Nothing is
+// deleted: flip VITE_CRYPTO_ENABLED and they return. See src/lib/features.ts.
+const DepositManagement = lazy(() =>
+  import('./DepositManagement').then((m) => ({ default: m.DepositManagement })),
+);
+const BnbWithdrawalManagement = lazy(() =>
+  import('./BnbWithdrawalManagement').then((m) => ({ default: m.BnbWithdrawalManagement })),
+);
 import { formatBnb } from '../utils/formatBalance';
 
 interface UserSpending {
@@ -34,14 +46,12 @@ export function Admin() {
   const [currentPage, setCurrentPage] = useState<'dashboard' | 'users' | 'deposits' | 'withdrawals' | 'settings'>('dashboard');
   const [users, setUsers] = useState<UserSpending[]>([]);
   const [isLoadingUsers, setIsLoadingUsers] = useState(false);
-  const [telegramToken, setTelegramToken] = useState('');
   const [telegramBotUsername, setTelegramBotUsername] = useState('');
   const [supportContact, setSupportContact] = useState('');
   const [userInstructions, setUserInstructions] = useState('');
   const [commissionRate, setCommissionRate] = useState('20');
   const [gameUrl, setGameUrl] = useState('');
   const [isSaving, setIsSaving] = useState(false);
-  const [isSettingWebhook, setIsSettingWebhook] = useState(false);
   const [statistics, setStatistics] = useState({
     totalUsers: 0,
     totalGamesPlayed: 0,
@@ -142,16 +152,6 @@ export function Admin() {
   };
 
   const loadSettings = async () => {
-    const { data: tokenData } = await supabase
-      .from('settings')
-      .select('value')
-      .eq('id', 'telegram_bot_token')
-      .maybeSingle();
-
-    if (tokenData) {
-      setTelegramToken(tokenData.value);
-    }
-
     const { data: botUsernameData } = await supabase
       .from('settings')
       .select('value')
@@ -314,11 +314,6 @@ export function Admin() {
   };
 
   const handleSaveSettings = async () => {
-    if (!telegramToken.trim()) {
-      alert('Please enter a valid Telegram bot token');
-      return;
-    }
-
     if (!telegramBotUsername.trim()) {
       alert('Please enter a valid Telegram bot username');
       return;
@@ -326,8 +321,22 @@ export function Admin() {
 
     setIsSaving(true);
     try {
+      // NO telegram_bot_token, and that is the point rather than an omission.
+      //
+      // This list used to lead with it. db/20-post/003 exists because
+      // `curl /rest/v1/settings` returned a LIVE bot token to an anonymous
+      // caller; it excluded the key from the read allowlist and redacted the
+      // stored value. The token is the HMAC key Telegram signs initData with, so
+      // whoever holds it can forge any player's identity. Saving it from this
+      // form would put a live one back in the table 003 cleared.
+      //
+      // It lives at /<prefix>/telegram/bot_token in SSM, Terraform declares it
+      // and the ECS agent injects it. Rotating it is put-parameter plus a
+      // redeploy, not a text box.
+      //
+      // db/20-post/013 refuses to write it, so this is the client agreeing with
+      // a rule the database enforces -- not the rule itself.
       const settingsToSave = [
-        { key: 'telegram_bot_token', value: telegramToken },
         { key: 'telegram_bot_username', value: telegramBotUsername },
         { key: 'support_contact', value: supportContact },
         { key: 'user_instructions', value: userInstructions },
@@ -335,26 +344,31 @@ export function Admin() {
         { key: 'game_url', value: gameUrl },
       ];
 
+      // The PLAYER'S token, not the anon key, and no adminKey in the body.
+      //
+      // The old call sent `Bearer ${VITE_SUPABASE_ANON_KEY}` with `adminKey`
+      // alongside the value -- a shared secret in a request body, checked by a
+      // route that answered 404 so nothing checked it at all. Admin is now a
+      // flag on an identity Telegram signed for, verified server-side on every
+      // request by requireAdmin.
+      const token = await getAccessToken();
+
       for (const setting of settingsToSave) {
         const response = await fetch(
-          `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/update-settings`,
+          `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/admin/settings`,
           {
             method: 'POST',
             headers: {
-              'Authorization': `Bearer ${import.meta.env.VITE_SUPABASE_ANON_KEY}`,
+              'Authorization': `Bearer ${token}`,
               'Content-Type': 'application/json',
             },
-            body: JSON.stringify({
-              key: setting.key,
-              value: setting.value,
-              adminKey: accessKey,
-            }),
+            body: JSON.stringify({ key: setting.key, value: setting.value }),
           }
         );
 
         if (!response.ok) {
-          const result = await response.json();
-          alert(`Error saving ${setting.key}: ${result.error || 'Unknown error'}`);
+          const result = await response.json().catch(() => ({}));
+          alert(`Error saving ${setting.key}: ${result.error ?? result.error_code ?? response.status}`);
           setIsSaving(false);
           return;
         }
@@ -371,37 +385,6 @@ export function Admin() {
     }
   };
 
-  const handleSetupWebhook = async () => {
-    setIsSettingWebhook(true);
-    try {
-      const response = await fetch(
-        `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/setup-telegram-webhook`,
-        {
-          method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${import.meta.env.VITE_SUPABASE_ANON_KEY}`,
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            adminKey: accessKey,
-          }),
-        }
-      );
-
-      const result = await response.json();
-
-      if (response.ok) {
-        alert(`Webhook set up successfully!\nURL: ${result.webhookUrl}`);
-      } else {
-        alert(`Error setting webhook: ${result.error || 'Unknown error'}`);
-      }
-    } catch (error) {
-      alert('Failed to set up webhook. Please try again.');
-      console.error(error);
-    } finally {
-      setIsSettingWebhook(false);
-    }
-  };
 
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -470,21 +453,44 @@ export function Admin() {
   };
 
 
+  // Through the admin route, not a direct UPDATE.
+  //
+  // This used to write games.status itself, which required the browser to hold
+  // UPDATE on that table -- the privilege that let ANY authenticated player set
+  // winner_ids and winner_prize_each and have payout_winners() credit them.
+  // db/20-post/008 revoked it; db/20-post/009 brings this one legitimate write
+  // back as admin_end_game(), which sets status and finished_at and nothing
+  // else, exactly as game_tick() does.
   const handleEndGame = async (gameId: string) => {
     if (!confirm('Are you sure you want to end this game?')) return;
 
-    await supabase
-      .from('games')
-      .update({
-        status: 'finished',
-        finished_at: new Date().toISOString(),
-      })
-      .eq('id', gameId);
+    try {
+      const token = await getAccessToken();
+      const res = await fetch(`${import.meta.env.VITE_SUPABASE_URL}/functions/v1/admin/games/${gameId}/end`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      });
 
-    await supabase.rpc('create_game_with_server_time', {
-      countdown_seconds: 25,
-      stake_amount_param: 10
-    });
+      const result = await res.json().catch(() => ({}));
+
+      if (!res.ok || !result.success) {
+        // 409 is "already finished", which a double-clicked button produces.
+        alert(res.status === 409
+          ? 'That game has already ended.'
+          : `Could not end the game: ${result.error ?? res.status}`);
+        return;
+      }
+
+      // Still an RPC: create_game_with_server_time is SECURITY DEFINER and on
+      // db/20-post/004's allowlist, so it is unaffected by the table revoke.
+      await supabase.rpc('create_game_with_server_time', {
+        countdown_seconds: 25,
+        stake_amount_param: 10
+      });
+    } catch (err) {
+      console.error('Failed to end game:', err);
+      alert('Could not end the game. Please try again.');
+    }
   };
 
   return !isAuthenticated ? (
@@ -764,14 +770,16 @@ export function Admin() {
                 </button>
               </div>
             </div>
-            {/* Bank transfers first: this is the path players actually use
-                today. DepositManagement below it is the on-chain BNB view, whose
-                routes are still unimplemented. */}
+            {/* Bank transfers: the path players actually use. */}
             <BankDepositQueue />
 
-            <div className="mt-6">
-              <DepositManagement adminKey={accessKey} />
-            </div>
+            {CRYPTO_ENABLED && (
+              <div className="mt-6">
+                <Suspense fallback={null}>
+                  <DepositManagement adminKey={accessKey} />
+                </Suspense>
+              </div>
+            )}
           </>
         )}
 
@@ -779,7 +787,7 @@ export function Admin() {
           <>
             <div className="bg-white rounded-2xl shadow-xl p-6 mb-6">
               <div className="flex items-center justify-between mb-4">
-                <h2 className="text-2xl font-bold text-gray-900">BNB Withdrawal Management</h2>
+                <h2 className="text-2xl font-bold text-gray-900">Withdrawal Management</h2>
                 <button
                   onClick={() => setCurrentPage('dashboard')}
                   className="text-sm text-gray-600 hover:text-gray-800 font-medium"
@@ -788,7 +796,19 @@ export function Admin() {
                 </button>
               </div>
             </div>
-            <BnbWithdrawalManagement adminKey={accessKey} />
+            {/* The bank payout queue, mirroring the deposit queue. This is what
+                actually pays players today -- db/20-post/007 has had the
+                correctness layer for a while, and until the routes landed it had
+                no caller at all. */}
+            <BankWithdrawalQueue />
+
+            {CRYPTO_ENABLED && (
+              <div className="mt-6">
+                <Suspense fallback={null}>
+                  <BnbWithdrawalManagement adminKey={accessKey} />
+                </Suspense>
+              </div>
+            )}
           </>
         )}
 
@@ -804,20 +824,28 @@ export function Admin() {
               </button>
             </div>
             <div className="space-y-6">
-              <div>
-                <label htmlFor="telegram-token" className="block text-sm font-medium text-gray-700 mb-2">
-                  Telegram Bot Token
-                </label>
-                <input
-                  id="telegram-token"
-                  type="text"
-                  value={telegramToken}
-                  onChange={(e) => setTelegramToken(e.target.value)}
-                  placeholder="Enter Telegram bot token"
-                  className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-slate-500 focus:border-transparent outline-none transition font-mono text-sm"
-                />
-                <p className="text-sm text-gray-500 mt-2">
-                  Get your bot token from @BotFather on Telegram
+              {/* The token is NOT editable here, and saying so beats removing
+                  the section silently -- an operator who used to set it here
+                  needs to know where it went.
+
+                  db/20-post/003 redacted this key from the settings table after
+                  `curl /rest/v1/settings` returned a live one anonymously. It is
+                  the HMAC key Telegram signs initData with, so it forges any
+                  player's identity. db/20-post/013 refuses to write it. */}
+              <div className="rounded-lg border border-amber-300 bg-amber-50 p-4">
+                <p className="text-sm font-semibold text-amber-900 mb-1">
+                  Telegram bot token — managed outside this panel
+                </p>
+                <p className="text-sm text-amber-900/80">
+                  The token signs every player&apos;s login, so it is stored encrypted in
+                  AWS Parameter Store rather than in the database. To rotate it:
+                </p>
+                <pre className="mt-2 rounded bg-amber-100 px-3 py-2 text-xs text-amber-900 overflow-x-auto">
+{`aws ssm put-parameter --name /fanosbingo-<env>/telegram/bot_token \\
+  --type SecureString --value '<new token>' --overwrite`}
+                </pre>
+                <p className="text-xs text-amber-900/70 mt-2">
+                  Then redeploy the <code>functions</code> service so it picks up the new value.
                 </p>
               </div>
 
@@ -908,27 +936,34 @@ export function Admin() {
                 </p>
               </div>
 
+              {/* The webhook is NOT SET UP FROM HERE, and the button that used
+                  to claim otherwise did nothing: it POSTed
+                  /functions/v1/setup-telegram-webhook, an inherited Deno name
+                  that answers 404, and it gated on a bot token this panel no
+                  longer holds.
+
+                  Saying so is better than a disabled button, because the failure
+                  it replaces was silent -- an operator pressed it, got no error
+                  worth reading, and reasonably assumed the bot was wired up.
+
+                  What has to be built, and the order, is recorded in
+                  services/functions/src/index.js: the receiving route must
+                  verify X-Telegram-Bot-Api-Secret-Token STRICTLY -- rejecting a
+                  missing header, because a forger simply omits it -- and
+                  setWebhook must be re-registered WITH secret_token BEFORE that
+                  check ships, or the bot goes silent. */}
               <div className="border-t pt-4">
-                <h3 className="font-semibold text-gray-900 mb-3">Webhook Setup</h3>
-                <div className="bg-gray-50 rounded-lg p-4 space-y-3">
-                  <div>
-                    <p className="text-sm font-medium text-gray-700 mb-2">Webhook URL:</p>
-                    <div className="bg-white border border-gray-300 rounded px-3 py-2 font-mono text-xs break-all">
-                      {import.meta.env.VITE_SUPABASE_URL}/functions/v1/telegram-bot-webhook
-                    </div>
-                  </div>
-                  <div>
-                    <button
-                      onClick={handleSetupWebhook}
-                      disabled={isSettingWebhook || !telegramToken}
-                      className="bg-blue-600 hover:bg-blue-700 text-white font-semibold py-2 px-4 rounded-lg transition disabled:opacity-50 disabled:cursor-not-allowed text-sm"
-                    >
-                      {isSettingWebhook ? 'Setting up webhook...' : 'Auto-Setup Webhook'}
-                    </button>
-                    <p className="text-xs text-gray-500 mt-2">
-                      Click to automatically configure the Telegram webhook. Make sure you've saved the bot token first.
-                    </p>
-                  </div>
+                <h3 className="font-semibold text-gray-900 mb-3">Webhook</h3>
+                <div className="rounded-lg border border-gray-300 bg-gray-50 p-4 space-y-2">
+                  <p className="text-sm text-gray-700">
+                    Not configured from this panel. The bot webhook is registered out of band,
+                    and the receiving route is not built yet.
+                  </p>
+                  <p className="text-xs text-gray-500">
+                    It must verify <code>X-Telegram-Bot-Api-Secret-Token</code> on every request,
+                    and <code>setWebhook</code> has to be re-registered with that secret
+                    <em> before</em> the check is deployed — otherwise the bot stops responding.
+                  </p>
                 </div>
               </div>
 

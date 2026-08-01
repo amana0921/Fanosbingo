@@ -132,18 +132,58 @@ data "aws_iam_policy_document" "github_deploy" {
     resources = ["arn:${local.partition}:ecr:*:${local.account_id}:repository/${var.name_prefix}/*"]
   }
 
+  # Task definitions are account-scoped: neither of these actions supports a
+  # resource ARN, so `*` here is the API's limit rather than a choice. What keeps
+  # RegisterTaskDefinition from being a privilege escalation is PassTaskRoles
+  # below, which pins the roles a definition may be registered with to this
+  # environment's.
+  statement {
+    sid    = "EcsTaskDefinitions"
+    effect = "Allow"
+    actions = [
+      "ecs:RegisterTaskDefinition",
+      "ecs:DescribeTaskDefinition",
+    ]
+    resources = ["*"]
+  }
+
+  # SCOPED TO THIS ENVIRONMENT'S CLUSTER, unlike the `*` this replaced.
+  #
+  # ecs:UpdateService on `*` let the dev deploy role act on PROD's services --
+  # setting desiredCount to 0 for an outage, or rolling prod back to an older
+  # revision. PassTaskRoles stops it registering a definition carrying prod's
+  # roles, but nothing stopped it pointing a prod service at a revision that
+  # already existed.
+  #
+  # The cluster is named for the environment (see modules/ecs), so the service
+  # ARN prefix is a sufficient boundary.
   statement {
     sid    = "EcsDeploy"
     effect = "Allow"
     actions = [
       "ecs:DescribeServices",
-      "ecs:DescribeTaskDefinition",
-      "ecs:RegisterTaskDefinition",
       "ecs:UpdateService",
+    ]
+    resources = ["arn:${local.partition}:ecs:*:${local.account_id}:service/${var.name_prefix}/*"]
+  }
+
+  # ListTasks and DescribeTasks take task ids that are generated per run, so
+  # there is no ARN prefix to match on. The ecs:cluster condition key is how
+  # these are scoped instead, and it reaches the same boundary.
+  statement {
+    sid    = "EcsInspectTasks"
+    effect = "Allow"
+    actions = [
       "ecs:ListTasks",
       "ecs:DescribeTasks",
     ]
     resources = ["*"]
+
+    condition {
+      test     = "ArnEquals"
+      variable = "ecs:cluster"
+      values   = ["arn:${local.partition}:ecs:*:${local.account_id}:cluster/${var.name_prefix}"]
+    }
   }
 
   # Registering a task definition means handing ECS a role to run it under.
@@ -264,6 +304,28 @@ data "aws_iam_policy_document" "github_deploy" {
   # the ECS container instance over Session Manager: no inbound port, no SSH
   # key, and every session attributable to a principal in CloudTrail.
   # ---------------------------------------------------------------------
+  #
+  # SCOPED BY TAG, and the condition is the whole control.
+  #
+  # This used to be `instance/*` with no condition, which is EVERY EC2 instance
+  # in the account -- including the other environment's. Listing the
+  # port-forwarding document alongside it constrains nothing: a session that
+  # names no document uses the default SSM-SessionManagerRunShell, so only the
+  # instance ARN is evaluated, and there is no ssm:SessionDocumentAccessCheck
+  # condition here to force document matching.
+  #
+  # So the grant was an INTERACTIVE ROOT SHELL on any instance in the account.
+  # Chained with dev's trust policy admitting `pull_request` (see
+  # environments/dev/main.tf), that made pull-request branch code a path to a
+  # shell on the PROD container instance -- where every container's injected
+  # secrets are readable from the environment, and the functions task role holds
+  # kms:Sign. The comment on dev's `pull_request` grant states the cost as "dev's
+  # parameter tree and the dev database"; without this condition that bound did
+  # not hold.
+  #
+  # The Environment tag is propagated to the instance by the ASG (see
+  # modules/ecs), the same tag the ec2:AssociateAddress condition already relies
+  # on, so this needs nothing new to be true.
   statement {
     sid     = "OpenDatabaseTunnel"
     effect  = "Allow"
@@ -272,6 +334,12 @@ data "aws_iam_policy_document" "github_deploy" {
       "arn:${local.partition}:ec2:*:${local.account_id}:instance/*",
       "arn:${local.partition}:ssm:*::document/AWS-StartPortForwardingSessionToRemoteHost",
     ]
+
+    condition {
+      test     = "StringEquals"
+      variable = "ssm:resourceTag/Environment"
+      values   = [var.environment]
+    }
   }
 
   statement {
@@ -304,13 +372,33 @@ data "aws_iam_policy_document" "github_deploy" {
   }
 
   # The migration runner connects as the RDS master user, whose password is
-  # generated and rotated by RDS itself. Scoped to the "rds!db-" prefix that
-  # RDS-managed secrets use, so this grants no access to any other secret.
-  statement {
-    sid       = "ReadRdsManagedMasterSecret"
-    effect    = "Allow"
-    actions   = ["secretsmanager:GetSecretValue"]
-    resources = ["arn:${local.partition}:secretsmanager:*:${local.account_id}:secret:rds!db-*"]
+  # generated and rotated by RDS itself.
+  #
+  # THIS ENVIRONMENT'S SECRET, by exact ARN. It used to be the `rds!db-*` prefix,
+  # which is every RDS-managed secret in the ACCOUNT -- so the dev role could ask
+  # for prod's master password.
+  #
+  # That was not exploitable, and the reason is worth recording because it was
+  # luck rather than design: the secret is encrypted with prod's CMK, and
+  # UseEnvironmentKey grants kms:Decrypt on this environment's key only, so
+  # GetSecretValue returned AccessDenied from KMS. A policy that is correct
+  # because a DIFFERENT policy happens to cover it is one edit away from not
+  # being correct, which is exactly what db/20-post/007 says about the
+  # withdrawal_requests read policy.
+  #
+  # The ARN is computed by RDS, so it is passed in from the rds module rather
+  # than pattern-matched. Guarded with a dynamic block because it is unknown
+  # until the instance exists -- an environment can then still plan before RDS
+  # has been created.
+  dynamic "statement" {
+    for_each = try(trimspace(var.rds_master_secret_arn), "") == "" ? [] : [var.rds_master_secret_arn]
+
+    content {
+      sid       = "ReadRdsManagedMasterSecret"
+      effect    = "Allow"
+      actions   = ["secretsmanager:GetSecretValue"]
+      resources = [statement.value]
+    }
   }
 
   # ---------------------------------------------------------------------

@@ -829,7 +829,12 @@ Every one of these cost real time.
 | `must not contain non-printable control characters` | RDS treats any non-ASCII as non-printable. **Keep every AWS-bound string plain ASCII** (an em-dash in a description fails the apply) |
 | A `DROP POLICY IF EXISTS` that does nothing | Wrong name = **silent no-op**, and PostgreSQL **ORs permissive policies**. Enumerate `pg_policies`; never guess a name |
 | An RLS assertion that passes while the data is exposed | `SELECT count(*) ... IF count > 0 THEN RAISE` tests **rows**, not **policies**, and passes vacuously on an empty table. Assert against `pg_policies` / `has_function_privilege` instead — those hold on an empty database *and* a full one |
+| An assertion that passes because the thing it tests **is not installed** | Second variant of the row above, and harder to see. `db/20-post/014` verified a refund by joining a game and releasing it — against a fixture that installed **neither** the deduct nor the refund trigger. Balances never moved, so they trivially matched. A money fix, proven by a test that exercised no money code. `db/test/fixture.sql` must model the **buggy inherited** version of whatever a migration replaces, exactly as it already models the blanket grants "so the revoke has something to revoke" |
+| An assertion that **skips** when it cannot build its case | Third variant. The same probe wanted a stake above 30 where the fixture's is 10, and returned quietly. A check that cannot run must `RAISE`, not `RETURN` — a `NOTICE` nobody reads is indistinguishable from a pass. Where the precondition is legitimately absent, construct it (`ensure_waiting_game_exists()`), do not skip |
+| A trigger that pays out whatever the UPDATE told it to | `payout_winners()` is `BEFORE UPDATE ON games` and reads `NEW.winner_ids` / `NEW.winner_prize_each` **from the statement that fired it**. Correct code, given only trusted callers — but combined with a `USING (true)` policy and a blanket table grant, one `PATCH /rest/v1/games` credited an arbitrary balance. Closed by `db/20-post/008`. **A `SECURITY DEFINER` trigger is only as trustworthy as the write privilege on its table** |
+| RLS looks right and the table is still writable | RLS is the *second* gate. Table-level `GRANT` is the first, and a permissive policy plus a blanket grant is an open door. `db/20-post/012` revokes writes on every table and on tables added later, because the client legitimately needs none — every write goes through a `SECURITY DEFINER` function and runs as the owner |
 | `ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC` | Reports success, writes **no** `pg_default_acl` row, and has **no effect**. The PUBLIC-executes-functions rule is a **database-wide** default; a per-schema entry can only add to it. Drop `IN SCHEMA` and it works. Verified on PG 16.14 |
+| …but the same statement for TABLES **does** work | Do not over-generalise the row above. `ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE INSERT, UPDATE, DELETE ON TABLES FROM authenticated` takes effect, because it revokes a default **this project explicitly granted** in `db/00-bootstrap/001` with a matching `IN SCHEMA` and the same grantor role — not a database-wide built-in. The rule is: you can remove what was granted, you cannot subtract what PostgreSQL assumes. `db/20-post/012` proves it by creating a table and asking |
 | `permission denied for function uid` on every query | Something revoked the PUBLIC EXECUTE default and `auth.uid()` was relying on it. `db/00-bootstrap/001` now grants it explicitly — do not remove that |
 | `PGRST203 Could not choose the best candidate function` after a **successful** migration | PostgREST builds its schema cache **at boot** and does not notice DDL. Dropping or changing a function signature leaves it serving from a database that no longer exists. `db-migrate.sh` now sends `NOTIFY pgrst, 'reload schema'`; if that ever fails, `aws ecs update-service --service postgrest --force-new-deployment`. This took the lobby down once |
 | `CREATE OR REPLACE FUNCTION` that does not replace | It only replaces a **matching signature**. Add a parameter and you have created an **overload**, with the old body still live and still reachable. Three migrations did this to `get_lobby_data_instant`. Check `pg_proc` for the name before assuming your version is the only one |
@@ -848,6 +853,9 @@ Every one of these cost real time.
 | A deployment left the service down | Enable `deployment_circuit_breaker` with `rollback`. On one instance with static host ports ECS must stop the old task first, so a bad image *ends* the service rather than degrading it |
 | `wait services-stable` succeeded but the old code is running | The circuit breaker rolled back. Stable ≠ deployed. Compare the running task definition against the one you registered |
 | `no pg_hba.conf entry ... no encryption` | RDS PostgreSQL 15+ ships `rds.force_ssl = 1` as the **engine default** |
+| A budget that reports **$0 forever** | `"user:Environment$${var.environment}"` — in HCL `$${` is the escape for a literal `${`, so the filter renders as the literal text and matches nothing. Both threshold alerts and the forecast alert are unreachable, silently. Use `format("user:Environment$%s", var.environment)`. Verified with `terraform console` |
+| `ssm:StartSession` scoped to a document is **not** scoped | Listing `AWS-StartPortForwardingSessionToRemoteHost` in `Resource` constrains nothing: a session naming **no** document uses the default `SSM-SessionManagerRunShell`, so only the instance ARN is evaluated. `instance/*` is therefore an interactive root shell on every instance in the account. Add a tag condition (`ssm:resourceTag/Environment`) or `ssm:SessionDocumentAccessCheck` |
+| A plan reporting "2 to destroy" on an ECS change | A task definition is **immutable**, so Terraform expresses every change to one as destroy-and-create. The two destroyed and the two added are the same two resources. What *is* worth stopping for: a **service** being replaced rather than updated in-place, or `aws_db_instance` / `aws_kms_key` in a destroy list |
 
 ### Containers
 
@@ -881,6 +889,8 @@ Every one of these cost real time.
 
 ### CI
 
+- **A job with no `environment:` still emits an OIDC subject.** On `workflow_dispatch` it is `repo:owner/name:ref:refs/heads/<branch>`. So a trust policy allowing `ref:refs/heads/main` is reachable **without** the GitHub Environment gate, and any workflow building a role ARN from an input reached prod with no reviewer asked. Two did. The rule now: **any workflow that interpolates an environment into a role ARN must declare that environment**, and prod trusts `environment:prod` and nothing else.
+- A PR dry-run job and a prod apply job **cannot be the same job**. The first must not declare an environment (dev's deployment branch policy would refuse it on a PR branch); the second must. `db-migrate.yml` is split for exactly this, and the duplicated setup steps are the price.
 - A **21-minute hang on "Assume AWS role"** has been observed once. Cancel and re-dispatch; do not wait it out.
 - Piping `psql` into `sed` under `set -e -o pipefail` **discards the error text**. Capture with `2>&1` and print explicitly.
 - `jq '.x // "default"'` fires on **`false`** as well as `null` — `//` is an *alternative* operator, not a null-coalescer. A check reading a boolean flag will silently discard `false`, which is usually the value you most wanted to see. Use `has("x")` to test presence, then stringify.
@@ -999,6 +1009,15 @@ project. That made it the cheapest moment the design will ever be changed.
 | `POST /auth/telegram` | none — this is where identity is *proved*, via Telegram's `initData` HMAC |
 | `GET /auth/whoami` | bearer token |
 | `GET /healthz`, `/readyz` | none |
+| `POST /select-card` · `/claim-bingo` · `/deselect-card` | bearer token |
+| `POST /deposits/claim` | bearer token |
+| `GET /withdrawals/available` · `POST /withdrawals/request` | bearer token |
+| `GET /admin/whoami` · `/admin/ping` | bearer token (+ `is_admin` on the gated ones) |
+| `POST /admin/bootstrap` | bearer token + the one-shot key; disarms itself once an admin exists |
+| `GET /admin/deposits` · `POST /admin/deposits/:id/{approve,reject}` | bearer + admin |
+| `GET /admin/withdrawals` · `POST /admin/withdrawals/:id/{complete,reject}` | bearer + admin |
+| `POST /admin/games/:id/end` | bearer + admin |
+| `POST /admin/settings` | bearer + admin |
 
 `POST /auth/telegram` returns a 15-minute JWT whose claims are shaped for the
 database:
@@ -1027,9 +1046,13 @@ stops 25 insecure endpoints reappearing one convenience at a time.
 
 | Route | Notes |
 |---|---|
-| `POST /telegram/webhook` | verify `X-Telegram-Bot-Api-Secret-Token` **strictly**. `setWebhook` must be called WITH `secret_token`, and re-registered BEFORE the check is deployed or the bot goes silent |
-| `POST /wins/credit` | `requireAuth`, debit in the DB, then `addWinCredits` on the contract signed by KMS. **Blocked on the contract existing** |
-| `POST /deposits/confirm` | `requireAuth`. Credit `req.auth.uid` only, never an id from the body |
+| `POST /telegram/webhook` | verify `X-Telegram-Bot-Api-Secret-Token` **strictly** — reject a *missing* header, because a forger simply omits it. `setWebhook` must be called WITH `secret_token`, and re-registered BEFORE the check is deployed or the bot goes silent. The admin panel used to offer a button for this that POSTed a 404 and did nothing; it now says so instead |
+| `POST /wins/credit` | `requireAuth`, debit in the DB, then `addWinCredits` on the contract signed by KMS. **Blocked on the contract existing**, and on crypto being un-deferred |
+| `POST /deposits/confirm` | `requireAuth`. Credit `req.auth.uid` only, never an id from the body. **Crypto path — deferred** |
+
+**The money round trip is closed without any of those.** Deposit by bank →
+play → withdraw by bank, with no wallet anywhere in it. The remaining routes are
+either crypto (deferred behind `VITE_CRYPTO_ENABLED`) or the Telegram bot.
 
 Card selection, cell marking and game state are deliberately absent — plain data
 access, belongs in PostgREST under RLS.
@@ -1044,7 +1067,7 @@ access, belongs in PostgREST under RLS.
 | CORS `*` on every function | ✅ locked to one origin, falls back to `"null"` not `"*"` so misconfiguration fails closed |
 | Identity taken from the request body | ✅ replaced by proven identity + RLS |
 | No wallet signature challenge | ⬜ SIWE-style nonce, if wallet login is wanted |
-| Admin = one shared string | ⬜ Cognito with TOTP, plus `admin_audit_log` |
+| Admin = one shared string | 🟡 replaced by a Telegram identity + `is_admin`, checked server-side on every request. **Still single-factor** — Cognito with TOTP and an `admin_audit_log` remain the target |
 
 The admin gap is the significant one left. It is a shared string compared with
 `!==` in browser React state, and six inherited functions gate on it. None of

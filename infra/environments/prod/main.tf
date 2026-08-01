@@ -118,16 +118,40 @@ module "iam" {
   wallet_signing_key_arn = module.kms.wallet_signing_key_arn
   spa_bucket_name        = local.spa_bucket_name
 
+  # This environment's master secret, by exact ARN. Sourced from the rds module
+  # rather than pattern-matched, so the dev deploy role cannot request it.
+  rds_master_secret_arn = module.rds.master_user_secret_arn
+
   github_repository           = var.github_repository
   create_github_oidc_provider = var.create_github_oidc_provider
 
-  # NO `pull_request` here, unlike dev.
+  # ONE subject, and that is the entire point.
   #
-  # Reaching this role requires declaring `environment: prod`, which puts the
-  # job behind prod's required reviewers. A pull request cannot obtain it, and
-  # that is the boundary between "a contributor can break testnet" and "a
-  # contributor can touch real balances".
-  github_allowed_refs = ["environment:prod", "ref:refs/heads/main"]
+  # Reaching this role requires declaring `environment: prod`, which puts the job
+  # behind prod's required reviewers. That is the boundary between "a contributor
+  # can break testnet" and "a contributor can touch real balances".
+  #
+  # `ref:refs/heads/main` USED TO BE HERE, and it silently dissolved that
+  # boundary. A workflow_dispatch from main emits the subject
+  # `repo:<owner>/<repo>:ref:refs/heads/main` regardless of whether the job
+  # declares an environment -- so any workflow that built this role's ARN from an
+  # input without declaring `environment:` reached prod with nobody asked to
+  # approve. Two did: db-migrate.yml and verify.yml. Between them that is decrypt
+  # of prod's whole SSM tree and a tunnel to the prod database as app_service,
+  # which holds BYPASSRLS.
+  #
+  # The comment that used to sit here asserted the boundary held. It did not, and
+  # the assertion is what stopped anyone checking -- the same failure shape
+  # db/20-post/004 documents for a security statement that reports success and
+  # changes nothing.
+  #
+  # Removing it costs nothing, because every legitimate consumer already declares
+  # an environment: deploy-services, sync-secrets and db-restore-drill always
+  # did, and db-migrate and verify now do. terraform.yml does not use this role
+  # at all -- it uses the separate executor and planner roles.
+  #
+  # NO `pull_request` either, unlike dev.
+  github_allowed_refs = ["environment:prod"]
 }
 
 # ---------------------------------------------------------------------------

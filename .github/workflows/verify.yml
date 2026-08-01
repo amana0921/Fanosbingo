@@ -55,6 +55,28 @@ jobs:
   verify:
     name: Verify (${{ github.event.inputs.environment || 'dev' }})
     runs-on: ubuntu-latest
+
+    # DECLARED, where it previously was not.
+    #
+    # This job builds a role ARN from an environment input, and without this line
+    # a dispatch from main emitted the subject `ref:refs/heads/main` -- which
+    # prod's trust policy used to accept. So verifying prod handed out prod's
+    # deploy role with no reviewer asked.
+    #
+    # The step comment below says "everything below is read-only", and that is
+    # true of the STEPS. It was never true of the CREDENTIAL: the deploy role can
+    # write this environment's SSM tree, tunnel to its database, and create and
+    # delete the restore-drill instance. Describing the workload is not the same
+    # as describing what was handed to it.
+    #
+    # Safe to declare here, unlike in db-migrate.yml, because this workflow has
+    # no `pull_request` trigger -- so there is no PR-branch run for a deployment
+    # branch policy to refuse.
+    #
+    # The rule this establishes: any workflow that interpolates an environment
+    # into a role ARN must declare that environment.
+    environment: ${{ github.event.inputs.environment || 'dev' }}
+
     env:
       ENVIRONMENT: ${{ github.event.inputs.environment || 'dev' }}
     steps:
