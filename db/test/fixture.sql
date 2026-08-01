@@ -116,10 +116,16 @@ CREATE TABLE games (
 ALTER TABLE games ENABLE ROW LEVEL SECURITY;
 CREATE POLICY g_read ON games FOR SELECT TO anon, authenticated USING (true);
 
+-- name and card are NOT NULL on the real table (20251109203131). They were
+-- nullable here, which let db/20-post/014's probe pass the harness and then fail
+-- the first real apply. A fixture that is laxer than production tests nothing
+-- about the constraints production actually has.
 CREATE TABLE players (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  game_id uuid REFERENCES games(id) ON DELETE CASCADE,
-  selected_number integer, name text, telegram_user_id bigint,
+  game_id uuid NOT NULL REFERENCES games(id) ON DELETE CASCADE,
+  name text NOT NULL,
+  card jsonb NOT NULL,
+  selected_number integer, telegram_user_id bigint,
   card_numbers jsonb, marked_cells jsonb, is_disqualified boolean DEFAULT false
 );
 ALTER TABLE players ENABLE ROW LEVEL SECURITY;
