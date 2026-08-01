@@ -232,3 +232,75 @@ export function createEndGameHandler(pool) {
     return res.json(result);
   };
 }
+
+/**
+ * POST /admin/settings  { key, value }
+ *
+ * Replaces the inherited update-settings route, which 404'd and which saved SIX
+ * keys -- the first of them telegram_bot_token.
+ *
+ * That key is deliberately not writable. db/20-post/003 exists because
+ * `curl /rest/v1/settings` returned a live bot token to an anonymous caller, and
+ * it both excluded the key from the read allowlist AND redacted the stored
+ * value. It is the HMAC key Telegram uses to sign initData, so holding it means
+ * forging any player's identity. Porting the route faithfully would have written
+ * a live one straight back into the table 003 cleared, while looking like a
+ * feature being restored. It lives in SSM; rotating it is put-parameter plus a
+ * redeploy.
+ *
+ * The allowlist is enforced by admin_update_setting(), not here. This validates
+ * shape and reports; the database decides what may be written, so a second route
+ * added later cannot widen it by forgetting.
+ */
+export function createUpdateSettingHandler(pool) {
+  return async function updateSetting(req, res) {
+    const key = typeof req.body?.key === 'string' ? req.body.key.trim() : '';
+    const value = req.body?.value;
+
+    if (!key) {
+      return res.status(400).json({ success: false, error: 'key is required' });
+    }
+
+    // Values are presentation strings. Bounded so a paste accident cannot put a
+    // megabyte into a row every player reads.
+    if (typeof value !== 'string' || value.length > 4000) {
+      return res
+        .status(400)
+        .json({ success: false, error: 'value must be a string of at most 4000 characters' });
+    }
+
+    const { rows } = await pool.query('SELECT admin_update_setting($1, $2, $3) AS result', [
+      key,
+      value,
+      req.auth.uid,
+    ]);
+
+    const result = rows[0]?.result ?? { success: false, error_code: 'INTERNAL_ERROR' };
+
+    if (!result.success) {
+      // NOT_WRITABLE is a 403 rather than a 400: the request is well formed and
+      // the key simply is not the operator's to change. The response names the
+      // writable set, which is not a secret -- it is in db/20-post/013.
+      const code = result.error_code === 'NOT_WRITABLE' ? 403 : 400;
+      req.log?.warn?.({
+        event: 'setting_write_refused',
+        key,
+        admin_uid: req.auth.uid,
+        reason: result.error_code,
+      });
+      return res.status(code).json(result);
+    }
+
+    // commission_rate decides the prize/fee split, so a change to it is logged
+    // with its value. The others are presentation and are logged by key only --
+    // there is no reason to copy user_instructions into CloudWatch.
+    req.log?.warn?.({
+      event: 'setting_updated',
+      key,
+      admin_uid: req.auth.uid,
+      ...(key === 'commission_rate' ? { value } : {}),
+    });
+
+    return res.json(result);
+  };
+}

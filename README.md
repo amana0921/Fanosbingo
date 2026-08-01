@@ -68,8 +68,9 @@ answered "it can":
 |---|---|
 | `get-card-layouts` · `force-finish-game` | deleted; `get_all_card_layouts()` and `game_tick()` already did the work |
 | `submit-deposit` · `record-withdrawal` · `manage-bnb-withdrawal` · `claim-winnings-to-contract` · `get-withdrawal-wallet-info` · `monitor-deposits` | crypto, deferred with the flag |
-| `deselect-card` | **still 404**, still called from `Lobby.tsx` |
-| `update-settings` · `setup-telegram-webhook` | **still 404.** Note before rebuilding `update-settings`: it wrote `telegram_bot_token` into the `settings` table, which is exactly the exposure `db/20-post/003` fixed. That token belongs in SSM |
+| `deselect-card` | rebuilt as `/deselect-card` + `release_card()`. RLS could not express "only while selection is open" — that condition lives on the `games` row |
+| `update-settings` | rebuilt as `/admin/settings` + `admin_update_setting()`, **minus `telegram_bot_token`**. Writing that key back would have undone `db/20-post/003`, which redacted it after `curl /rest/v1/settings` returned a live one anonymously. It signs every player's login; it lives in SSM |
+| `setup-telegram-webhook` | **not built.** The button that claimed to do it POSTed a 404 and did nothing. Now says so, rather than failing silently. The receiving route must verify `X-Telegram-Bot-Api-Secret-Token` strictly, and `setWebhook` must be re-registered with that secret **before** the check ships |
 
 Engineering detail, decisions and their reasons live in **[AGENTS.md](AGENTS.md)**.
 Read it before changing anything; most of it was learned expensively.

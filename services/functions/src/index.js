@@ -65,6 +65,7 @@ import {
   createAdminWhoamiHandler,
   createAdminBootstrapHandler,
   createEndGameHandler,
+  createUpdateSettingHandler,
 } from './admin.js';
 import {
   createDepositClaimHandler,
@@ -463,6 +464,18 @@ app.post(
   requireAuth(JWT_SECRET),
   requireAdmin(pool),
   createEndGameHandler(pool),
+);
+
+/**
+ * Operator settings. NOT a port of update-settings: telegram_bot_token is not
+ * writable, because db/20-post/003 redacted it from this table and it belongs
+ * in SSM. The allowlist lives in admin_update_setting(), see db/20-post/013.
+ */
+app.post(
+  '/admin/settings',
+  requireAuth(JWT_SECRET),
+  requireAdmin(pool),
+  createUpdateSettingHandler(pool),
 );
 
 app.use((req, res) => res.status(404).json({ error: 'not found', path: req.path }));
