@@ -88,3 +88,46 @@ variable "tags" {
   type        = map(string)
   default     = {}
 }
+
+variable "pending_deposit_alarm_minutes" {
+  description = <<-EOT
+    Age of the oldest unapproved deposit before alerting, in minutes.
+
+    FOUR HOURS, and the number is chosen against what a human can act on rather
+    than against what the UI promises.
+
+    The deposit form says "usually within a few minutes", and a player with an
+    unapproved claim cannot join a game at all -- so the temptation is to alarm
+    at five. That would page a solo operator through the night for every
+    overnight deposit and teach them to ignore the alarm, which is worse than
+    having none.
+
+    This is the backstop underneath a per-claim notification, not a replacement
+    for one. It answers "is anybody looking at the queue at all", and four hours
+    is long enough that a normal working rhythm never trips it and short enough
+    that a claim does not sit for a day -- which is exactly what was found on a
+    player's screen and prompted this.
+
+    When the Telegram bot exists, notify the operator per claim and this can be
+    raised further.
+  EOT
+  type        = number
+  default     = 240
+}
+
+variable "pending_withdrawal_alarm_minutes" {
+  description = <<-EOT
+    Age of the oldest unpaid withdrawal before alerting, in minutes.
+
+    EIGHT HOURS, longer than the deposit threshold, and deliberately.
+
+    A pending deposit BLOCKS a player from playing. A pending withdrawal does
+    not block anything -- it is money owed, and the operator has to physically
+    send it from their own bank account, which they cannot do at 3am. The slower
+    action deserves the longer fuse.
+
+    It is still a trust issue rather than a convenience one, so it alarms at all.
+  EOT
+  type        = number
+  default     = 480
+}
