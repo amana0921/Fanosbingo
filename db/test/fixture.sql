@@ -212,6 +212,25 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authentic
 GRANT ALL ON ALL TABLES IN SCHEMA public TO service_role;
 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO anon, authenticated, service_role;
 
+-- The FORWARD-LOOKING half of the same grant, from db/00-bootstrap/001.
+--
+-- Absent until now, which made the probe at the end of db/20-post/012 pass
+-- VACUOUSLY: it creates a table and checks that `authenticated` cannot write it,
+-- and with no default-privileges entry to revoke there was nothing for that
+-- check to catch. A green run proved only that the fixture had never granted
+-- the thing being revoked.
+--
+-- That is the same defect 004 documents in the guard it replaced -- "it counts
+-- ROWS, not POLICIES ... a security assertion whose result depends on how much
+-- data happens to be present is not an assertion". Reproduced here so the probe
+-- is testing the condition it was written for.
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+  GRANT SELECT ON TABLES TO anon;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+  GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO authenticated;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+  GRANT ALL ON TABLES TO service_role;
+
 -- Real rows, so no assertion can pass merely because a table is empty -- which is
 -- exactly how the vacuous check in the original 003 passed while balances were
 -- readable.
