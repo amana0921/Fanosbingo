@@ -284,9 +284,26 @@ BEGIN
   ON CONFLICT (telegram_user_id) DO UPDATE
     SET deposited_balance = v_stake - 1, won_balance = 100;
 
-  INSERT INTO players (game_id, telegram_user_id, selected_number)
-  VALUES (v_game, v_tg, 9999)
-  RETURNING id INTO v_player;
+  -- name and card are NOT NULL on the real table (20251109203131) and were
+  -- nullable in db/test/fixture.sql, so the first version of this probe passed
+  -- the harness and failed the first real apply with
+  --
+  --   ERROR: null value in column "name" of relation "players"
+  --
+  -- The fixture is now strict about both, so the harness catches this class of
+  -- thing rather than the dev database doing it. The exception handler below
+  -- turns a future addition into a message that says what to do about it,
+  -- instead of a constraint name.
+  BEGIN
+    INSERT INTO players (game_id, telegram_user_id, selected_number, name, card)
+    VALUES (v_game, v_tg, 9999, '_split_probe', '[]'::jsonb)
+    RETURNING id INTO v_player;
+  EXCEPTION WHEN not_null_violation THEN
+    DELETE FROM telegram_users WHERE telegram_user_id = v_tg;
+    RAISE EXCEPTION
+      'the refund-split probe cannot insert a players row: %. A NOT NULL column has been added since this file was written -- supply it in the INSERT above, and add it to db/test/fixture.sql so the harness catches the next one.',
+      SQLERRM;
+  END;
 
   -- Prove the deduction actually split, before trusting what the refund does
   -- with it. Without this the next assertion passes on a database where the
