@@ -424,8 +424,47 @@ data "aws_iam_policy_document" "github_deploy" {
       "sns:ListTopics",
       "sns:ListSubscriptionsByTopic",
       "cloudwatch:DescribeAlarms",
+
+      # Reading the datapoints an alarm is evaluating, not just its state.
+      #
+      # An alarm sitting at OK is ambiguous: it can mean "the thing is healthy"
+      # or "no data has ever arrived and treat_missing_data says not to worry".
+      # Those look identical from DescribeAlarms and are completely different
+      # situations -- the second is a control that will never fire. Telling them
+      # apart requires looking at whether the metric has any datapoints at all.
+      "cloudwatch:GetMetricData",
+      "cloudwatch:GetMetricStatistics",
+      "cloudwatch:ListMetrics",
     ]
     resources = ["*"] # None of these read actions supports resource scoping.
+  }
+
+  # ---------------------------------------------------------------------
+  # Proving an alarm reaches a human
+  #
+  # verify-detections.sh already establishes the principle for metric filters:
+  # "a detector that has never seen a positive is not a detector". It tests the
+  # deployed patterns against synthetic events.
+  #
+  # Nothing did the equivalent for ALARMS. An alarm can be correctly configured,
+  # its metric can be publishing, and the notification can still go nowhere --
+  # an SNS subscription left in "pending confirmation" is reported by Terraform
+  # as created, and modules/monitoring warns about exactly that. The failure is
+  # silent and is only discovered when something goes wrong and no one is told.
+  #
+  # SetAlarmState forces a transition and therefore the alarm ACTION, which is
+  # the whole path: alarm -> SNS -> subscription -> inbox. CloudWatch re-evaluates
+  # from real data on the next period, so the forced state is transient and
+  # nothing is left misreporting.
+  #
+  # Scoped to this environment's alarms by name prefix, so a test cannot silence
+  # or trip anything belonging to another environment.
+  # ---------------------------------------------------------------------
+  statement {
+    sid       = "TestAlarmDelivery"
+    effect    = "Allow"
+    actions   = ["cloudwatch:SetAlarmState"]
+    resources = ["arn:${local.partition}:cloudwatch:*:${local.account_id}:alarm:${var.name_prefix}-*"]
   }
 
   # ---------------------------------------------------------------------

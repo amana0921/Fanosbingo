@@ -151,6 +151,21 @@ jobs:
           echo "::error::Browsers will complete the preflight and then refuse to send the request. Check ALLOWED_ORIGIN on the functions service."
           exit 1
 
+      # An alarm that cannot fire is not coverage.
+      #
+      # verify-detections.sh above proves the metric FILTERS still match. This
+      # proves the ALARMS still have somewhere to send to, and -- the part that
+      # is genuinely silent -- that their metrics are still publishing at all.
+      #
+      # An alarm sitting at OK with no datapoints looks identical to a healthy
+      # one from the console, and with treat_missing_data=notBreaching it will
+      # never say otherwise. That is how a deposit alarm was created, a deposit
+      # sat pending for a day, and no email arrived.
+      - name: Alarms have a recipient, and a live metric
+        id: alarms
+        continue-on-error: true
+        run: ./scripts/verify-alarms.sh "$ENVIRONMENT"
+
       - name: Nothing is exposed anonymously
         id: probe
         continue-on-error: true
@@ -170,6 +185,7 @@ jobs:
           detections="${{ steps.detections.outcome }}"
           cloudflare="${{ steps.cloudflare.outcome }}"
           cors="${{ steps.cors.outcome }}"
+          alarms="${{ steps.alarms.outcome }}"
           probe="${{ steps.probe.outcome }}"
 
           icon() { [ "$1" = "success" ] && echo "pass" || echo "**FAIL**"; }
@@ -182,11 +198,12 @@ jobs:
             echo "| Security detections (kms:Sign, root usage) | $(icon "$detections") |"
             echo "| Cloudflare settings (Bot Fight Mode, SSL, proxy) | $(icon "$cloudflare") |"
             echo "| API allows the app's origin | $(icon "$cors") |"
+            echo "| Alarms can reach a human, metrics are live | $(icon "$alarms") |"
             echo "| Anonymous access probe | $(icon "$probe") |"
           } >> "$GITHUB_STEP_SUMMARY"
 
           failed=0
-          for r in "$detections" "$cloudflare" "$cors" "$probe"; do
+          for r in "$detections" "$cloudflare" "$cors" "$alarms" "$probe"; do
             [ "$r" = "success" ] || failed=$((failed + 1))
           done
 
