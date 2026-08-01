@@ -20,7 +20,26 @@
 #
 # Usage:
 #   ./scripts/verify-alarms.sh dev              # report only, changes nothing
+#   ./scripts/verify-alarms.sh account          # the account-wide detections
 #   ./scripts/verify-alarms.sh dev --fire NAME  # force one alarm, prove delivery
+#
+# TWO KINDS OF METRIC, AND THE DIFFERENCE DECIDES WHAT "NO DATA" MEANS.
+#
+#   CONTINUOUS  SecondsSinceLastNumberCalled, OldestPendingDepositMinutes.
+#               The ticker publishes these every tick regardless of state, so
+#               ABSENCE MEANS BROKEN -- the alarm is unarmed and will sit at OK
+#               forever.
+#
+#   EVENT-DRIVEN  UnexpectedKmsSign, RootAccountUsage. A CloudTrail metric
+#               filter emits these only when something matches, so ABSENCE IS
+#               THE GOAL. Demanding datapoints here would fail permanently and
+#               train everyone to ignore this script -- which is the failure
+#               mode it exists to prevent, applied to itself.
+#
+# So the datapoint assertion runs for environments and not for `account`. What
+# DOES apply to both is the delivery path: an encrypted topic whose key policy
+# omits cloudwatch.amazonaws.com drops every notification silently, and that is
+# a property of the topic, not of how often the metric fires.
 #
 # --fire uses SetAlarmState, which triggers the alarm ACTION and therefore the
 # whole path: alarm -> SNS -> subscription -> inbox. CloudWatch re-evaluates from
@@ -29,9 +48,24 @@
 
 set -euo pipefail
 
-ENVIRONMENT="${1:-dev}"
-PREFIX="fanosbingo-${ENVIRONMENT}"
-NAMESPACE="FanosBingo/${PREFIX}"
+TARGET="${1:-dev}"
+
+if [ "$TARGET" = "account" ]; then
+  # The account root's alarms are named `fanosbingo-<thing>` with no environment
+  # segment, so this prefix also matches every environment alarm. They are
+  # filtered out below rather than by the prefix, because "fanosbingo-" is the
+  # only prefix that catches these two.
+  PREFIX="fanosbingo-"
+  NAMESPACE="FanosBingo/Security"
+  DIMENSIONED=0
+  EXPECT_DATA=0
+else
+  PREFIX="fanosbingo-${TARGET}"
+  NAMESPACE="FanosBingo/${PREFIX}"
+  DIMENSIONED=1
+  EXPECT_DATA=1
+fi
+ENVIRONMENT="$TARGET"
 
 GREEN=$'\033[0;32m'; RED=$'\033[0;31m'; YELLOW=$'\033[0;33m'; BOLD=$'\033[1m'; NC=$'\033[0m'
 pass() { echo "  ${GREEN}PASS${NC} $*"; }
@@ -45,25 +79,34 @@ command -v aws >/dev/null || { echo "aws CLI not found" >&2; exit 1; }
 # --fire: force one alarm through a full transition
 # ---------------------------------------------------------------------------
 if [ "${2:-}" = "--fire" ]; then
-  TARGET="${3:?usage: verify-alarms.sh <env> --fire <alarm-name>}"
+  FIRE_TARGET="${3:?usage: verify-alarms.sh <env> --fire <alarm-name>}"
 
-  case "$TARGET" in
+  if [ "$TARGET" = "account" ]; then
+    echo "${RED}Refusing:${NC} --fire is not available for the account detections." >&2
+    echo "Those alarms mean 'somebody used root' or 'something unexpected signed a" >&2
+    echo "withdrawal'. Firing one deliberately puts a false positive in the record of" >&2
+    echo "exactly the events you would later be reading back. The deploy role's IAM is" >&2
+    echo "scoped to \${PREFIX}-* for the same reason." >&2
+    exit 1
+  fi
+
+  case "$FIRE_TARGET" in
     "${PREFIX}"-*) ;;
-    *) echo "${RED}Refusing:${NC} '$TARGET' is not a ${PREFIX} alarm." >&2; exit 1 ;;
+    *) echo "${RED}Refusing:${NC} '$FIRE_TARGET' is not a ${PREFIX} alarm." >&2; exit 1 ;;
   esac
 
-  echo "${BOLD}Forcing ${TARGET} through ALARM -> OK${NC}"
+  echo "${BOLD}Forcing ${FIRE_TARGET} through ALARM -> OK${NC}"
   echo "This sends real notifications. CloudWatch re-evaluates from real data on"
   echo "the next period, so nothing is left misreporting."
   echo
 
-  aws cloudwatch set-alarm-state --alarm-name "$TARGET" --state-value ALARM \
+  aws cloudwatch set-alarm-state --alarm-name "$FIRE_TARGET" --state-value ALARM \
     --state-reason "Delivery test from scripts/verify-alarms.sh at $(date -u +%FT%TZ)"
   echo "  ${GREEN}sent${NC} ALARM"
 
   sleep 10
 
-  aws cloudwatch set-alarm-state --alarm-name "$TARGET" --state-value OK \
+  aws cloudwatch set-alarm-state --alarm-name "$FIRE_TARGET" --state-value OK \
     --state-reason "Delivery test complete"
   echo "  ${GREEN}sent${NC} OK"
 
@@ -83,6 +126,15 @@ echo
 alarms_json="$(aws cloudwatch describe-alarms --alarm-name-prefix "$PREFIX" \
   --query 'MetricAlarms[].{name:AlarmName,state:StateValue,actions:AlarmActions,ns:Namespace,metric:MetricName,missing:TreatMissingData}' \
   --output json)"
+
+# `fanosbingo-` matches the environment alarms too. Drop them, so `account`
+# reports on the two account-wide detections and nothing else.
+if [ "$TARGET" = "account" ]; then
+  alarms_json="$(echo "$alarms_json" | python3 -c '
+import json,re,sys
+print(json.dumps([a for a in json.load(sys.stdin)
+                  if not re.match(r"fanosbingo-(dev|prod)-", a["name"])]))')"
+fi
 
 count="$(echo "$alarms_json" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))')"
 echo "${BOLD}${count} alarm(s)${NC}"
@@ -154,7 +206,18 @@ while IFS=$'\t' read -r name state nactions ns metric missing; do
     fail "  no alarm actions - it can fire and tell nobody"
   fi
 
-  if [ "$ns" = "$NAMESPACE" ]; then
+  if [ "$ns" = "$NAMESPACE" ] && [ "$EXPECT_DATA" -eq 0 ]; then
+    # EVENT-DRIVEN. A CloudTrail metric filter emits only on a match, so no
+    # datapoints is the goal rather than a fault. Asserting otherwise would fail
+    # this check permanently and teach everyone to ignore it -- which is the
+    # exact failure this script exists to prevent, turned on itself.
+    #
+    # What covers these instead is scripts/verify-detections.sh, which tests the
+    # deployed filter PATTERNS against synthetic events. Delivery is covered by
+    # the topic checks above, which apply to both kinds.
+    pass "  ${metric}: event-driven, so no datapoints is correct. Pattern coverage is verify-detections.sh"
+
+  elif [ "$ns" = "$NAMESPACE" ]; then
     # Only our own metrics; AWS/RDS and AWS/EC2 always have data.
     points="$(aws cloudwatch get-metric-statistics \
       --namespace "$ns" --metric-name "$metric" \
@@ -183,8 +246,13 @@ done
 
 echo
 if [ "$failures" -eq 0 ]; then
-  echo "${GREEN}${BOLD}Every alarm has a confirmed recipient and a live metric.${NC}"
-  echo "To prove delivery end to end:  $0 ${ENVIRONMENT} --fire ${PREFIX}-game-loop-stalled"
+  echo "${GREEN}${BOLD}Every alarm has a confirmed recipient and a deliverable topic.${NC}"
+  if [ "$TARGET" = "account" ]; then
+    echo "Delivery here shares the audit key and the security topic; verify-detections.sh"
+    echo "covers whether the filters still match."
+  else
+    echo "To prove delivery end to end:  $0 ${ENVIRONMENT} --fire ${PREFIX}-game-loop-stalled"
+  fi
 else
   echo "${RED}${BOLD}${failures} problem(s).${NC} An alarm that cannot fire is not coverage."
   exit 1
