@@ -135,6 +135,10 @@ module "iam" {
   wallet_signing_key_arn = module.kms.wallet_signing_key_arn
   spa_bucket_name        = local.spa_bucket_name
 
+  # This environment's master secret, by exact ARN. Sourced from the rds module
+  # rather than pattern-matched, so this role cannot request prod's.
+  rds_master_secret_arn = module.rds.master_user_secret_arn
+
   github_repository = var.github_repository
 
   # The GitHub OIDC provider is account-wide. Dev creates it; prod reuses it by

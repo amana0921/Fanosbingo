@@ -69,3 +69,19 @@ variable "tags" {
   type        = map(string)
   default     = {}
 }
+
+variable "rds_master_secret_arn" {
+  description = <<-EOT
+    Secrets Manager ARN of the RDS-managed master password, from the rds module's
+    master_user_secret_arn output.
+
+    Passed in rather than matched with the `rds!db-*` prefix, because that prefix
+    covers every RDS-managed secret in the ACCOUNT and so let one environment's
+    deploy role request the other's master password.
+
+    Empty is legitimate and means the statement is omitted entirely, which is what
+    lets an environment plan before its database exists.
+  EOT
+  type        = string
+  default     = ""
+}
