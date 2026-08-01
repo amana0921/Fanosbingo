@@ -124,6 +124,57 @@ CREATE TABLE players (
 );
 ALTER TABLE players ENABLE ROW LEVEL SECURITY;
 
+-- The stake pair, in their INHERITED form -- the splitting deduction from
+-- 20260725000000 and the all-to-deposited refund from 20251225111615.
+--
+-- Present for the same reason the blanket grants above are: so db/20-post/014
+-- has something to replace. Without them a join-and-release probe inserts a row,
+-- deletes it, observes nothing happen, and passes -- which is the third variant
+-- of the vacuous-assertion trap 003 and 004 document, and the one that would
+-- have shipped a money fix proven by a test that exercised no money code.
+CREATE OR REPLACE FUNCTION deduct_stake_from_balance()
+RETURNS TRIGGER SECURITY DEFINER SET search_path=public LANGUAGE plpgsql AS $$
+DECLARE s integer; d integer; w integer; fd integer; fw integer;
+BEGIN
+  SELECT stake_amount INTO s FROM games WHERE id = NEW.game_id;
+  IF s IS NULL THEN RAISE EXCEPTION 'Game not found'; END IF;
+  SELECT COALESCE(deposited_balance,0), COALESCE(won_balance,0) INTO d, w
+    FROM telegram_users WHERE telegram_user_id = NEW.telegram_user_id FOR UPDATE;
+  IF NOT FOUND THEN RAISE EXCEPTION 'User % not found', NEW.telegram_user_id; END IF;
+  IF d + w < s THEN
+    RAISE EXCEPTION 'INSUFFICIENT_BALANCE: stake % exceeds available balance %', s, d + w
+      USING ERRCODE = 'check_violation';
+  END IF;
+  IF d >= s THEN fd := s; fw := 0; ELSE fd := d; fw := s - d; END IF;
+  UPDATE telegram_users
+     SET deposited_balance = deposited_balance - fd,
+         won_balance = won_balance - fw,
+         total_spent = COALESCE(total_spent,0) + s
+   WHERE telegram_user_id = NEW.telegram_user_id;
+  RETURN NEW;
+END $$;
+
+CREATE TRIGGER deduct_stake_on_join BEFORE INSERT ON players
+  FOR EACH ROW EXECUTE FUNCTION deduct_stake_from_balance();
+
+CREATE OR REPLACE FUNCTION refund_player_stake()
+RETURNS TRIGGER SECURITY DEFINER SET search_path=public LANGUAGE plpgsql AS $$
+DECLARE s integer;
+BEGIN
+  IF OLD.telegram_user_id IS NULL THEN RETURN OLD; END IF;
+  SELECT stake_amount INTO s FROM games WHERE id = OLD.game_id;
+  IF s IS NULL THEN RETURN OLD; END IF;
+  -- Everything to deposited_balance, which is the bug db/20-post/014 fixes.
+  UPDATE telegram_users
+     SET deposited_balance = deposited_balance + s,
+         total_spent = GREATEST(0, COALESCE(total_spent,0) - s)
+   WHERE telegram_user_id = OLD.telegram_user_id;
+  RETURN OLD;
+END $$;
+
+CREATE TRIGGER refund_on_player_delete BEFORE DELETE ON players
+  FOR EACH ROW EXECUTE FUNCTION refund_player_stake();
+
 CREATE TABLE bank_options (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   bank_name text NOT NULL, account_number text NOT NULL, account_name text,
