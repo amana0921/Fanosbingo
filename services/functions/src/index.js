@@ -59,13 +59,26 @@ import { bodyParserErrorHandler } from './http-errors.js';
 import { createRateLimiter } from './rate-limit.js';
 import { createSelectCardHandler } from './select-card.js';
 import { createClaimBingoHandler } from './claim-bingo.js';
-import { requireAdmin, createAdminWhoamiHandler, createAdminBootstrapHandler } from './admin.js';
+import { createDeselectCardHandler } from './deselect-card.js';
+import {
+  requireAdmin,
+  createAdminWhoamiHandler,
+  createAdminBootstrapHandler,
+  createEndGameHandler,
+} from './admin.js';
 import {
   createDepositClaimHandler,
   createListDepositsHandler,
   createApproveDepositHandler,
   createRejectDepositHandler,
 } from './deposits.js';
+import {
+  createAvailableBalanceHandler,
+  createRequestWithdrawalHandler,
+  createListWithdrawalsHandler,
+  createCompleteWithdrawalHandler,
+  createRejectWithdrawalHandler,
+} from './withdrawals.js';
 
 const {
   PORT = '8080',
@@ -314,6 +327,20 @@ app.post('/select-card', requireAuth(JWT_SECRET), createSelectCardHandler(pool))
 app.post('/claim-bingo', requireAuth(JWT_SECRET), createClaimBingoHandler(pool));
 
 /**
+ * POST /deselect-card  { playerId }  ->  release_card's result
+ *
+ * The inverse of /select-card, and the last of the inherited Deno names the
+ * Lobby still called that had no implementation.
+ *
+ * It is a route rather than plain data access because deleting a players row
+ * refunds money, and that is only legitimate while selection is still open --
+ * a condition on the GAMES row, which an RLS policy on `players` cannot reach.
+ * db/20-post/011 checks it under a row lock; db/20-post/008 revoked the DELETE
+ * privilege that would let a client go around it.
+ */
+app.post('/deselect-card', requireAuth(JWT_SECRET), createDeselectCardHandler(pool));
+
+/**
  * Admin.
  *
  * src/components/Admin.tsx validated its access key by POSTing to
@@ -374,6 +401,68 @@ app.post(
   requireAuth(JWT_SECRET),
   requireAdmin(pool),
   createRejectDepositHandler(pool),
+);
+
+/**
+ * Bank withdrawals — the mirror of the deposit queue, and the half of the money
+ * round trip that did not exist until now.
+ *
+ * db/20-post/007 had the correctness layer since it was written: the row lock,
+ * the available-balance calculation, the freeze trigger and the unique payout
+ * reference. What it did not have was any caller. Its three functions are
+ * SECURITY DEFINER and take an identity as a parameter, so 007 revoked EXECUTE
+ * from `authenticated` -- correctly -- and that left a player with no way to be
+ * paid at all.
+ *
+ * Reading your OWN requests is deliberately not a route: 007 gives
+ * `authenticated` a SELECT policy scoped through telegram_users, so the Mini App
+ * fetches its history straight from PostgREST. Same division as deposits.
+ *
+ * /withdrawals/available is a route and not a client-side subtraction, because
+ * the number the player is shown and the number request_bank_withdrawal()
+ * enforces must come from one expression. See src/withdrawals.js.
+ */
+app.get('/withdrawals/available', requireAuth(JWT_SECRET), createAvailableBalanceHandler(pool));
+
+app.post('/withdrawals/request', requireAuth(JWT_SECRET), createRequestWithdrawalHandler(pool));
+
+app.get(
+  '/admin/withdrawals',
+  requireAuth(JWT_SECRET),
+  requireAdmin(pool),
+  createListWithdrawalsHandler(pool),
+);
+
+// Recorded AFTER the operator has actually sent the money. The payout reference
+// is their own transfer's receipt, and 007's unique index on it is what stops
+// one transfer being recorded as two payouts.
+app.post(
+  '/admin/withdrawals/:id/complete',
+  requireAuth(JWT_SECRET),
+  requireAdmin(pool),
+  createCompleteWithdrawalHandler(pool),
+);
+
+app.post(
+  '/admin/withdrawals/:id/reject',
+  requireAuth(JWT_SECRET),
+  requireAdmin(pool),
+  createRejectWithdrawalHandler(pool),
+);
+
+/**
+ * Ending a game. The operator's only write to `games`.
+ *
+ * db/20-post/008 revoked UPDATE on that table from the browser, because it was
+ * what let any authenticated player set winner_ids and winner_prize_each and
+ * have payout_winners() credit them. Admin.tsx's direct UPDATE went with it;
+ * this replaces it.
+ */
+app.post(
+  '/admin/games/:id/end',
+  requireAuth(JWT_SECRET),
+  requireAdmin(pool),
+  createEndGameHandler(pool),
 );
 
 app.use((req, res) => res.status(404).json({ error: 'not found', path: req.path }));

@@ -181,3 +181,54 @@ export function timingSafeEqual(a, b) {
   }
   return diff === 0;
 }
+
+/**
+ * POST /admin/games/:id/end
+ *
+ * Ending a game as an operator. Exists because db/20-post/008 revoked UPDATE on
+ * `games` from the browser -- that privilege was what let any player set
+ * winner_ids and have payout_winners() credit them.
+ *
+ * The route passes an id and the admin's proven uid, and NOTHING ELSE. It
+ * deliberately accepts no winner or prize field from the request: admin_end_game
+ * writes status and finished_at only, matching what game_tick() does, so a game
+ * ended here pays out whatever atomic_claim_bingo already recorded and nothing
+ * if nobody claimed. Accepting those columns here would rebuild the hole 008
+ * closed, one authorization level up.
+ */
+export function createEndGameHandler(pool) {
+  const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+  return async function endGame(req, res) {
+    const id = req.params?.id;
+    if (typeof id !== 'string' || !UUID_RE.test(id)) {
+      return res.status(400).json({ success: false, error: 'id must be a uuid' });
+    }
+
+    const { rows } = await pool.query('SELECT admin_end_game($1, $2) AS result', [
+      id,
+      req.auth.uid,
+    ]);
+
+    const result = rows[0]?.result ?? { success: false, error_code: 'INTERNAL_ERROR' };
+
+    if (!result.success) {
+      // NOT_ENDABLE covers "already finished" and "does not exist". A conflict,
+      // not an error: it is what a double-clicked button produces.
+      const code = result.error_code === 'NOT_ENDABLE' ? 409 : 400;
+      req.log?.warn?.({ event: 'end_game_refused', game_id: id, reason: result.error_code });
+      return res.status(code).json(result);
+    }
+
+    // Ending a game can trigger a payout. Logged at warn for the same reason the
+    // deposit approval is.
+    req.log?.warn?.({
+      event: 'game_ended_by_admin',
+      game_id: id,
+      admin_uid: req.auth.uid,
+      previous_status: result.previous_status,
+    });
+
+    return res.json(result);
+  };
+}
