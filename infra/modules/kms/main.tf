@@ -82,6 +82,44 @@ data "aws_iam_policy_document" "main" {
     }
   }
 
+  # ALARMS PUBLISHING TO THE ENCRYPTED ALERT TOPIC.
+  #
+  # modules/monitoring encrypts its SNS topic with this key. Without this
+  # statement CloudWatch cannot produce a data key to encrypt the message, so an
+  # alarm transitioning to ALARM fails to publish and THE NOTIFICATION IS
+  # DROPPED. Silently: the alarm state changes correctly, the console shows
+  # ALARM, the subscription shows confirmed, and nothing arrives.
+  #
+  # THIS LESSON WAS ALREADY LEARNED ONCE, in infra/environments/account/main.tf,
+  # whose audit key carries the same statement with the comment "the notification
+  # is dropped -- silently, which is the worst possible outcome for a security
+  # alarm". It was never applied here, so while the account-wide kms:Sign and
+  # root-usage alarms could deliver, EVERY PER-ENVIRONMENT ALARM could not --
+  # including game-loop-stalled, which modules/monitoring calls "THE alarm ...
+  # the one that describes whether the game is running".
+  #
+  # Found by firing an alarm deliberately with scripts/verify-alarms.sh --fire
+  # and getting no email, having already confirmed the subscription, the alarm
+  # state and the metric datapoints. Each of those looked correct on its own;
+  # the failure was in the one link nothing inspected.
+  #
+  # Note that attaching an aws_kms_key_policy REPLACES the default policy, so
+  # "root has kms:* therefore IAM delegation covers it" does not apply to a
+  # service principal here -- the same trap the Auto Scaling statement below
+  # documents.
+  statement {
+    sid    = "AllowCloudWatchAlarmsToPublish"
+    effect = "Allow"
+
+    principals {
+      type        = "Service"
+      identifiers = ["cloudwatch.amazonaws.com"]
+    }
+
+    actions   = ["kms:GenerateDataKey*", "kms:Decrypt"]
+    resources = ["*"]
+  }
+
   # Auto Scaling must be able to use this key to encrypt the root volume of each
   # instance it launches. Without these two statements the ASG launches an
   # instance, fails to attach the encrypted volume, terminates it, and retries

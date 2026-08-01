@@ -105,6 +105,36 @@ print("\n".join(sorted({a for x in json.load(sys.stdin) for a in (x["actions"] o
   else
     fail "topic ${short}: NO confirmed subscribers. Alarms firing here reach nobody."
   fi
+
+  # CAN CLOUDWATCH ACTUALLY ENCRYPT TO IT?
+  #
+  # The check this script shipped without, and the one that would have caught
+  # the bug that motivated the script. An SNS topic encrypted with a CMK needs
+  # that key's policy to admit cloudwatch.amazonaws.com, or the publish fails
+  # and the notification is dropped -- with the alarm in ALARM, the subscription
+  # confirmed, and the metric publishing. Every other signal says healthy.
+  key="$(aws sns get-topic-attributes --topic-arn "$topic" \
+    --query 'Attributes.KmsMasterKeyId' --output text 2>/dev/null || echo "None")"
+
+  if [ "$key" = "None" ] || [ -z "$key" ]; then
+    pass "topic ${short}: not encrypted, so no key policy to satisfy"
+  else
+    if aws kms get-key-policy --key-id "$key" --policy-name default \
+         --query Policy --output text 2>/dev/null |
+       python3 -c '
+import json,sys
+pol = json.load(sys.stdin)
+ok = any(
+    "cloudwatch.amazonaws.com" in json.dumps(st.get("Principal", {}))
+    and st.get("Effect") == "Allow"
+    for st in pol.get("Statement", [])
+)
+sys.exit(0 if ok else 1)'; then
+      pass "topic ${short}: its CMK admits cloudwatch.amazonaws.com"
+    else
+      fail "topic ${short}: encrypted with ${key}, whose policy does NOT admit cloudwatch.amazonaws.com. Every notification is dropped silently -- alarm state, subscription and metric all still look correct."
+    fi
+  fi
 done
 echo
 
