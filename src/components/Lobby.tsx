@@ -43,9 +43,9 @@ export function Lobby({ onJoinGame, onSpectateGame, telegramUser }: LobbyProps) 
   // Reported upward by WalletPanel rather than read from useAccount() here.
   //
   // Undefined whenever crypto is disabled, which is the correct value: there is
-  // no wallet. The header then renders "No wallet" and get_lobby_data_instant
-  // is called with a null address, both of which were already the behaviour for
-  // a Telegram player who had not connected one.
+  // no wallet. get_lobby_data_instant is then called with a null address, which
+  // was already the behaviour for a Telegram player who had not connected one.
+  // The header's wallet line is hidden entirely in that case -- see below.
   const [walletAddress, setWalletAddress] = useState<string | undefined>(undefined);
   const isWalletConnected = Boolean(walletAddress);
   const [selectedNumber, setSelectedNumber] = useState<number | null>(null);
@@ -795,7 +795,12 @@ export function Lobby({ onJoinGame, onSpectateGame, telegramUser }: LobbyProps) 
                 <p className={`text-sm font-semibold truncate ${isDarkMode ? 'text-white' : 'text-gray-900'}`}>
                   {displayName}
                 </p>
-                {isWalletConnected && walletAddress ? (
+                {/* CRYPTO_ENABLED gates the whole line, not just the connected
+                    branch. Without that, a build with crypto deferred told every
+                    player "No wallet" -- advertising a thing they cannot connect
+                    and would not need if they could. Found by loading the
+                    deployed app rather than by reading the diff. */}
+                {!CRYPTO_ENABLED ? null : isWalletConnected && walletAddress ? (
                   <div className="flex items-center gap-1">
                     <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 flex-shrink-0" />
                     <span className={`text-[11px] font-mono truncate ${isDarkMode ? 'text-gray-400' : 'text-gray-500'}`}>
