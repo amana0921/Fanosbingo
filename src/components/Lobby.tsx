@@ -5,6 +5,7 @@ import { ToastContainer, ToastData } from './ToastContainer';
 import { getCachedLayouts, setCachedLayouts } from '../utils/cardLayoutCache';
 import { BankDepositModal } from './BankDepositModal';
 import { BankWithdrawalModal } from './BankWithdrawalModal';
+import { WalletSummary } from './WalletSummary';
 import { getAccessToken } from '../lib/auth';
 import { CRYPTO_ENABLED } from '../lib/features';
 
@@ -12,7 +13,7 @@ import { CRYPTO_ENABLED } from '../lib/features';
 // to be called at this component's top level, which put wagmi in the entry
 // chunk -- Lobby is imported statically by App. See src/components/WalletPanel.tsx.
 const WalletPanel = lazy(() => import('./WalletPanel'));
-import { Sun, Moon, Wallet, Timer, Hash, Trophy, Coins } from 'lucide-react';
+import { Sun, Moon, Wallet, Timer, Hash } from 'lucide-react';
 import { formatBnb } from '../utils/formatBalance';
 
 interface LobbyProps {
@@ -57,7 +58,10 @@ export function Lobby({ onJoinGame, onSpectateGame, telegramUser }: LobbyProps) 
   const [isJoining, setIsJoining] = useState(false);
   const [registeredUser, setRegisteredUser] = useState<RegisteredUser | null>(null);
   const [isCheckingRegistration, setIsCheckingRegistration] = useState(true);
-  const [balanceChanged, setBalanceChanged] = useState(false);
+  // A COUNTER, not a boolean. WalletSummary re-reads its activity list when this
+  // changes, and two deposits approved in quick succession must both fire --
+  // `true` -> `true` is not a change React would see.
+  const [balanceChanged, setBalanceChanged] = useState(0);
   const [toasts, setToasts] = useState<ToastData[]>([]);
   const [optimisticSelection, setOptimisticSelection] = useState<number | null>(null);
   const [processingNumbers, setProcessingNumbers] = useState<Set<number>>(new Set());
@@ -355,8 +359,7 @@ export function Lobby({ onJoinGame, onSpectateGame, telegramUser }: LobbyProps) 
         (payload) => {
           if (payload.new) {
             setRegisteredUser(payload.new as RegisteredUser);
-            setBalanceChanged(true);
-            setTimeout(() => setBalanceChanged(false), 2000);
+            setBalanceChanged((n) => n + 1);
           }
         }
       )
@@ -859,25 +862,15 @@ export function Lobby({ onJoinGame, onSpectateGame, telegramUser }: LobbyProps) 
 
             <div className={`w-px ${isDarkMode ? 'bg-gray-700/40' : 'bg-gray-200/80'}`} />
 
-            {registeredUser && (
-              <>
-                <div className={`flex-1 flex items-center justify-center gap-1.5 py-2 transition-all ${balanceChanged ? 'scale-105' : ''} ${isDarkMode ? 'text-emerald-400' : 'text-emerald-600'}`}>
-                  <Coins className="w-3.5 h-3.5 opacity-60" />
-                  <span className="text-base font-bold tabular-nums">{formatBnb(registeredUser.deposited_balance + registeredUser.won_balance)}</span>
-                </div>
-                <div className={`w-px ${isDarkMode ? 'bg-gray-700/40' : 'bg-gray-200/80'}`} />
-              </>
-            )}
+            {/* The two balances moved OUT of this strip and into WalletSummary.
+                They were rendered here as `deposited + won` -- one number -- with
+                the winnings shown separately only when above zero.
 
-            {registeredUser && registeredUser.won_balance > 0 && (
-              <>
-                <div className={`flex-1 flex items-center justify-center gap-1.5 py-2 ${isDarkMode ? 'text-yellow-400' : 'text-yellow-600'}`}>
-                  <Trophy className="w-3.5 h-3.5 opacity-60" />
-                  <span className="text-base font-bold tabular-nums">{formatBnb(registeredUser.won_balance)}</span>
-                </div>
-                <div className={`w-px ${isDarkMode ? 'bg-gray-700/40' : 'bg-gray-200/80'}`} />
-              </>
-            )}
+                Both halves of that hide the rule db/20-post/007 enforces: only
+                won_balance is withdrawable. Summing them means a player with
+                10.00 deposited sees 10.00 and a greyed-out Withdraw button with
+                nothing connecting the two, and hiding the winnings at zero
+                removes the explanation at exactly the moment it is needed. */}
 
             {activeGame && (
               <div className={`flex-1 flex items-center justify-center gap-1.5 py-2 ${isDarkMode ? 'text-blue-400' : 'text-blue-600'}`}>
@@ -895,6 +888,16 @@ export function Lobby({ onJoinGame, onSpectateGame, telegramUser }: LobbyProps) 
             This used to be a single "Connect Your BNB Wallet to Play" prompt
             shown to anyone without a wallet, gating deposits, withdrawals AND
             playing behind it. */}
+        {registeredUser && (
+          <WalletSummary
+            telegramUserId={telegramUser?.id ?? null}
+            depositedBalance={registeredUser.deposited_balance}
+            wonBalance={registeredUser.won_balance}
+            isDarkMode={isDarkMode}
+            changeSignal={balanceChanged}
+          />
+        )}
+
         {registeredUser && (
           <div className={`border-l-4 p-3 mb-3 rounded transition-colors duration-300 ${isDarkMode ? 'bg-sky-900/20 border-sky-600 text-sky-300' : 'bg-sky-50 border-sky-400 text-sky-800'}`}>
             <p className="text-sm font-semibold mb-2">Deposit or withdraw by bank</p>
