@@ -148,6 +148,8 @@ export async function authenticateTelegram(pool, initData, botToken, jwtSecret, 
  * and never a user id from the request body; taking identity from the body is
  * the exact defect this service exists to remove.
  */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 export function requireAuth(jwtSecret) {
   return (req, res, next) => {
     const header = req.get('authorization') ?? '';
@@ -159,6 +161,44 @@ export function requireAuth(jwtSecret) {
 
     try {
       const claims = jwt.verify(token, jwtSecret, { algorithms: ['HS256'] });
+
+      // A VALID SIGNATURE IS NOT AN IDENTITY.
+      //
+      // This used to accept any token this secret had signed. The ANON KEY is
+      // such a token: scripts/mint-anon-key.mjs signs it with the same secret,
+      // because PostgREST verifies both with one key. Its claims are
+      //
+      //     {"role":"anon","iss":"fanosbingo","iat":...}
+      //
+      // -- no `sub`, and no `exp`, so it never expires. And it is PUBLIC by
+      // design: .env.example says so, and it is baked into every SPA bundle
+      // where anyone can read it.
+      //
+      // So the public, permanent anon key passed this gate on every requireAuth
+      // route, arriving as `uid: undefined` with role `anon`. The comment in
+      // .env.example -- "it grants only what RLS allows anonymous users to see"
+      // -- is true of PostgREST, where role=anon maps to the anon DATABASE role
+      // and policies decide. It was never true here: this service reads
+      // req.auth.uid and passes it to SECURITY DEFINER functions that assume it
+      // identifies somebody.
+      //
+      // getAccessToken() makes it worse rather than academic: it FALLS BACK to
+      // the anon key when Telegram authentication fails, so the SPA itself sends
+      // it to authenticated routes from any browser outside Telegram.
+      //
+      // Two claims are therefore required, not one. `role` must be the one
+      // auth.js issues, and `sub` must be the uuid it puts there -- the same
+      // uuid auth.uid() casts to, and the same one db/20-post/004 scoped
+      // telegram_users by.
+      if (claims.role !== 'authenticated' || !UUID_RE.test(claims.sub ?? '')) {
+        req.log?.warn?.({
+          event: 'auth_rejected',
+          reason: 'not a player token',
+          role: claims.role ?? null,
+          has_sub: Boolean(claims.sub),
+        });
+        return res.status(401).json({ error: 'invalid token' });
+      }
 
       req.auth = {
         uid: claims.sub,
