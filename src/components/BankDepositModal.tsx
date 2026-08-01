@@ -235,13 +235,28 @@ export function BankDepositModal({ isOpen, onClose, telegramUserId }: BankDeposi
                   account and credit you, usually within a few minutes.
                 </p>
 
-                <div className="flex gap-2">
+                {/* STACKED ON A PHONE, side by side only when there is room.
+                    This was a single `flex gap-2` row, and the Amount field was
+                    CLIPPED OFF THE RIGHT EDGE on a real device -- seen in a
+                    Telegram Mini App screenshot, not in a desktop browser.
+
+                    The cause is a flex default rather than a missing width: a
+                    flex item is `min-width: auto`, so `flex-1` on the first
+                    input will not shrink below its own placeholder, and
+                    "Transaction number" is long. The row therefore overflows and
+                    pushes the fixed `w-28` field out of the card.
+
+                    `min-w-0` alone would stop the overflow by squeezing the
+                    reference field instead, which is the wrong trade: a
+                    transaction number is the longer of the two values and the
+                    one that must be read back to check it. So they stack. */}
+                <div className="flex flex-col gap-2 sm:flex-row">
                   <input
                     type="text"
                     value={reference}
                     onChange={(e) => setReference(e.target.value)}
                     placeholder="Transaction number"
-                    className="flex-1 px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg text-sm dark:bg-gray-700 dark:text-gray-100"
+                    className="min-w-0 flex-1 px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg text-sm dark:bg-gray-700 dark:text-gray-100"
                   />
                   <input
                     type="number"
@@ -249,7 +264,7 @@ export function BankDepositModal({ isOpen, onClose, telegramUserId }: BankDeposi
                     value={claimAmount}
                     onChange={(e) => setClaimAmount(e.target.value)}
                     placeholder="Amount"
-                    className="w-28 px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg text-sm dark:bg-gray-700 dark:text-gray-100"
+                    className="w-full sm:w-28 px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg text-sm dark:bg-gray-700 dark:text-gray-100"
                   />
                 </div>
 
