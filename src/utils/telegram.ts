@@ -16,6 +16,38 @@ export interface TelegramWebAppData {
   platform: string;
 }
 
+/**
+ * Telegram's deep-link parameter, from `t.me/<bot>/<app>?startapp=<value>`.
+ *
+ * THIS COMES FROM initDataUnsafe, AND THAT IS FINE HERE -- but only because of
+ * what it is used for.
+ *
+ * `initDataUnsafe` is Telegram's own word for "parsed but not verified", and
+ * this codebase is right to be suspicious of it: the identity used to come from
+ * there and was sent to the API as a telegram id the server could not check.
+ * services/functions/src/auth.js exists to remove exactly that.
+ *
+ * Routing is not authorization. This value decides WHICH SCREEN RENDERS, and
+ * nothing else. The admin panel it opens then asks the server `/admin/whoami`
+ * with a token minted from VERIFIED initData, and every admin route enforces
+ * requireAdmin server-side. Somebody who forges `startapp=admin` gets the login
+ * form and a 403, which is what a non-admin gets by typing the URL today.
+ *
+ * The rule to keep: unverified input may choose a view. It may never grant one.
+ */
+export function getStartParam(): string | null {
+  try {
+    const raw = WebApp?.initDataUnsafe?.start_param;
+    if (typeof raw !== 'string' || raw === '') return null;
+    // Bounded and alphanumeric. It is used only for comparison, never
+    // interpolated into a URL or the DOM, but an unbounded string from outside
+    // has no business flowing anywhere unchecked.
+    return /^[a-z0-9_-]{1,32}$/i.test(raw) ? raw : null;
+  } catch {
+    return null;
+  }
+}
+
 export function initTelegram(): TelegramWebAppData {
   try {
     console.log('[Telegram] Initializing WebApp SDK...', {
