@@ -128,11 +128,74 @@ Local checks that need no AWS:
 
 ```bash
 npm --prefix services/functions install
-npm run test:functions        # 189 assertions, 8 suites
+npm run test:functions        # 263 assertions, 10 suites
 ./scripts/test-migrations.sh   # applies db/20-post to a throwaway postgres, twice
 node scripts/check-migrations.mjs
 terraform fmt -check -recursive infra/
 ```
+
+### Deploy order, and the one case where it matters
+
+Most of the time these three are independent and can go in any order. Once they
+are not, and getting it wrong is expensive:
+
+```
+1. database migrations      gh workflow run db-migrate.yml -f environment=<env>
+2. the functions service    gh workflow run deploy-services.yml -f service=functions ...
+3. the Mini App (caddy)     gh workflow run deploy-services.yml -f service=caddy ...
+```
+
+**Migrations first, always, when a migration REMOVES a permission.**
+
+`db/20-post/008` closes a path that let any authenticated player credit
+themselves an arbitrary `won_balance` with one `PATCH` on `games`. Before the
+bank withdrawal routes existed, a minted balance had nowhere to go — every
+on-chain route is a 404. Those routes give it a cash exit, by hand,
+irreversibly.
+
+So deploying the `functions` image before the migration opens a window where
+both halves are live at once. The reverse order has no such window: the
+migration alone just makes a few admin actions fail until the image catches up.
+
+The general rule, worth applying to migrations nobody has thought about yet:
+
+| the change | order |
+|---|---|
+| a migration that REVOKES something | migration first |
+| a migration that GRANTS something the code needs | migration first |
+| a migration that only ADDS a table or function | either |
+| code that stops calling something | code first, then drop it |
+
+When in doubt, migrations first. A migration that runs early usually degrades a
+feature; code that runs early can expose one.
+
+### Reading `terraform plan` on an ECS change
+
+A plan touching services routinely reports resources destroyed, and it is
+almost never what it sounds like:
+
+```
+Plan: 2 to add, 4 to change, 2 to destroy
+```
+
+An **ECS task definition is immutable**. Terraform cannot edit one, so any
+change at all — a new image tag, one added secret — is expressed as *destroy the
+old revision, create a new one*. The two destroyed and the two added are the
+same two resources. Nothing is torn down; `:4` is deregistered and `:5` takes
+over, which is exactly what a normal deploy does.
+
+What to actually look for in that summary:
+
+- **`aws_ecs_service` should say `updated in-place`.** If a SERVICE is being
+  replaced, that is a real outage — read why.
+- **`aws_db_instance`, `aws_kms_key`, `aws_eip` in the destroy list.** Any of
+  those is a stop-and-think. `prod` has `deletion_protection` and
+  `skip_final_snapshot = false` precisely so the database cannot go quietly.
+- **Task-definition churn you did not cause.** The image tag moves whenever CI
+  has pushed a newer build than the last apply — that is the SSM image-pointer
+  mechanism in `modules/app_stack` converging, not drift to be alarmed by. But it
+  does mean an infrastructure apply will ALSO roll those services onto the newer
+  image. Know that before running one at a busy moment.
 
 ---
 
