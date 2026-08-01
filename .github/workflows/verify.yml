@@ -164,7 +164,18 @@ jobs:
       - name: Alarms have a recipient, and a live metric
         id: alarms
         continue-on-error: true
-        run: ./scripts/verify-alarms.sh "$ENVIRONMENT"
+        run: |
+          ./scripts/verify-alarms.sh "$ENVIRONMENT"
+
+          # The account-wide detections too. They are prefixed `fanosbingo-`
+          # with no environment segment, so the environment run does not see
+          # them -- and they are the kms:Sign and root-usage alarms, which are
+          # the two whose silence matters most.
+          #
+          # Their metrics are event-driven, so the script asserts delivery only:
+          # no datapoints is the goal, and verify-detections.sh above is what
+          # proves the filters still match.
+          ./scripts/verify-alarms.sh account
 
       - name: Nothing is exposed anonymously
         id: probe
