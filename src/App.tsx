@@ -4,7 +4,7 @@ import { GameRoom } from './components/GameRoom';
 import { BankDepositModal } from './components/BankDepositModal';
 import { NetworkQualityIndicator } from './components/NetworkQualityIndicator';
 import { supabase } from './lib/supabase';
-import { initTelegram, TelegramUser } from './utils/telegram';
+import { initTelegram, getStartParam, TelegramUser } from './utils/telegram';
 import { authenticate, getAccessToken } from './lib/auth';
 import { CRYPTO_ENABLED } from './lib/features';
 
@@ -309,9 +309,28 @@ function AppContent({ walletUser }: AppContentProps) {
     setView('game');
   };
 
+  // THE ADMIN PANEL WAS UNREACHABLE, which is not the same as unbuilt.
+  //
+  // The only way in was `window.location.pathname === '/admin'`. A Telegram Mini
+  // App opens at the URL BotFather is configured with and has no address bar, so
+  // that path could only be typed in a desktop browser -- where there is no
+  // initData, therefore no token, therefore a 401 from every admin route. The
+  // deposit queue, the withdrawal queue, settings and end-game were all deployed
+  // and none of them could be opened by the person who needs them.
+  //
+  // `startapp` is Telegram's own mechanism for this:
+  //
+  //     https://t.me/BingoNovaaBot/app?startapp=admin
+  //
+  // which opens the Mini App normally -- real initData, real token -- and hands
+  // the value through. See getStartParam() for why reading it from the UNSAFE
+  // payload is acceptable: it chooses a view, and the server still decides
+  // whether that view has anything in it.
+  //
+  // The pathname check stays for local development against a dev server.
   useEffect(() => {
     const checkAdminPath = () => {
-      if (window.location.pathname === '/admin') {
+      if (window.location.pathname === '/admin' || getStartParam() === 'admin') {
         setView('admin');
       }
     };
