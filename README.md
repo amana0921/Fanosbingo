@@ -35,18 +35,20 @@ countdown ticks — driven by a server-side game loop, not by a browser tab.
 | Layer | State |
 |---|---|
 | Infrastructure (VPC, RDS, ECS, KMS, CloudTrail) | live in **dev**, Terraform, applied through CI |
-| Database | PostgreSQL 16 on RDS, 114 migrations, PITR, restore drilled monthly |
+| Database | PostgreSQL 16 on RDS, **120 migrations applied to dev**, PITR, restore drilled monthly |
 | API (PostgREST) · realtime · game loop · TLS | running |
 | Auth service | running — Telegram `initData` verified, JWT enforced by RLS |
 | Mini App | served from Caddy at `app.<domain>`, built into the image |
 | Joining and claiming | **working** — `/select-card` and `/claim-bingo`, identity and card layout derived server-side |
 | Bank deposit (TeleBirr / CBE) | **working** — player claims, operator approves against their own statement. No wallet, no contract |
 | Bank withdrawal | **working** — player requests, operator pays by hand and records the reference. `db/20-post/007` + `/withdrawals/*` |
-| Admin | Telegram identity + `is_admin`, single factor. Bootstrap route promotes only the first admin, then disarms |
+| Admin | Telegram identity + `is_admin`, single factor. **Reachable two ways:** `t.me/BingoNovaaBot/app?startapp=admin` in Telegram, or the Login Widget at `app.<domain>/admin` in a browser. Bootstrap route promotes only the first admin, then disarms |
+| Alerting | **working, and proven** — 12 alarms, all verified to reach a human by `scripts/verify-alarms.sh`. Until 2026-08-01 **no per-environment alarm could deliver at all**; see `modules/kms` |
+| Currency | **whole birr, integer, labelled ብር.** One row value = one birr. There is no sub-unit and no divisor |
 | Database authorization | **enforced** — EXECUTE is an allowlist, `telegram_users` is owner-scoped, game state is read-only to clients, verified by `probe-public-access.sh` |
 | Crypto (wallet login, BNB deposit/withdrawal) | **deferred, not removed** — every surface is behind `VITE_CRYPTO_ENABLED`, off by default. Ethiopian players overwhelmingly do not hold cryptocurrency, so birr is the currency that matters. Code, contract and KMS key all retained |
 | Smart contract | **not deployed** — and not on the critical path while crypto is deferred |
-| Production | Terraform written, plans cleanly, never applied |
+| Production | Terraform written, plans cleanly, **never applied**. It inherits every fix below, so its first apply starts from a corrected baseline |
 
 **The money round trip is closed:** deposit by bank, play, withdraw by bank. That is
 the whole loop, with no wallet anywhere in it.
@@ -57,6 +59,87 @@ the whole loop, with no wallet anywhere in it.
 > payout trigger that reads `winner_ids` straight from the update. That balance
 > previously had no exit; the bank withdrawal routes give it one. **Apply `008`
 > before deploying them.**
+
+---
+
+## Handover — read this first
+
+Everything below was found or built on **2026-08-01/02**. dev is fully deployed
+and has been exercised by a real player with real money; **prod has never been
+applied**.
+
+### What has actually been proven end to end
+
+A real deposit was made by TeleBirr, approved by an operator, spent on a game,
+and the claim was correctly refused. Each of those exercised a path that had
+previously only been tested against a fixture or with `curl`.
+
+```
+✅ deposit by bank → operator approves → balance credited
+✅ join a game     → stake deducted, split across balances correctly
+✅ claim bingo     → atomic_claim_bingo checked the card and refused a false claim
+⬜ win → withdraw → operator pays        ← THE ONE UNTESTED LEG
+```
+
+**Closing that last leg is the highest-value next task**, and it is the gate
+before prod. It needs a non-zero `won_balance`, which means either winning a game
+or setting one through the SSM tunnel. Then **Withdraw** enables, a request is
+filed, and the operator pays it from the admin queue — which exercises
+`request_bank_withdrawal`, the pending-balance arithmetic in `WalletSummary`,
+`complete_bank_withdrawal`, and the unique payout-reference guard in `007`.
+
+### Tasks left, in the order I would do them
+
+| # | Task | Why it is where it is |
+|---|---|---|
+| 1 | **Close the withdrawal leg** (above) | The only untested money path. Gate before prod |
+| 2 | **Fix two stale `settings` rows** | `telegram_bot_username` says `Habeshabingo91bot` (the bot is `BingoNovaaBot`); `game_url` still points at `multiplayer-bingo-we-5btk.bolt.host`. Both editable in the admin Settings form |
+| 3 | **Amharic labels on money actions** | `DEPOSIT (ገቢ)` / `WITHDRAW (ወጪ)`. Deliberately **not** done by me — getting a money verb subtly wrong in a language you do not speak is worse than leaving it in English. Ask the operator for exact wording |
+| 4 | **Prod's first apply** | After 1. Requires the `prod` GitHub Environment reviewers (already configured) and `PROD_APPLY_ENABLED` (deliberately unset) |
+| 5 | **Telegram bot webhook** | `POST /telegram/webhook`. Must verify `X-Telegram-Bot-Api-Secret-Token` **strictly** — reject a *missing* header, since a forger simply omits it — and `setWebhook` must be re-registered **with** the secret *before* the check ships, or the bot goes silent. Needs a live bot token, so it cannot be built blind |
+| 6 | **Root-cause the blanket table grant** | `db/20-post/001_rds_deltas.sql:121` grants `authenticated` write on every table. `012` neutralises it for all current and future tables, but the grant itself remains. Removing it has a regression surface of the whole schema |
+| 7 | **Admin auth is single-factor** | A Telegram identity plus an `is_admin` flag. Fine for one operator; revisit before there are several. Cognito + TOTP and an `admin_audit_log` are the target |
+| 8 | **Reinstate `unhealthy_status 5xx`** in the Caddyfile, and the crypto path | Both are explicitly Stage-2 items. See the Caddyfile comments and `src/lib/features.ts` |
+
+### Things that will bite you if you do not know them
+
+- **Money is whole birr.** One integer in the database is one birr. There is no
+  sub-unit. `formatBalance.ts` used to divide by 100 (a BNB leftover) and showed
+  a player `0.40` for a balance of 40 — while the operator's queue printed `40`.
+  Fixed 2026-08-02. Do not reintroduce a divisor; if crypto returns it needs a
+  **real rate**, not a compiled-in constant.
+- **Deploy order is migrations → `functions` → `caddy`.** Reversed at the first
+  step there is a window where a player can mint a balance *and* cash it out.
+- **`terraform apply` against dev also rolls `caddy` and `functions`** onto
+  whatever image the SSM pointer names. That is the pointer mechanism working,
+  not drift — but it means an infrastructure apply is also a deploy.
+- **Crypto is deferred, not deleted.** Everything is behind
+  `VITE_CRYPTO_ENABLED`, off by default, which cuts first load from 168.6 KB to
+  100.0 KB gzipped. `db/20-post/010` closes `get_or_create_wallet_user` while it
+  has no caller — **delete that migration in the same change that flips the
+  flag.**
+- **The admin panel is reachable two ways**, and neither is typing `/admin` in a
+  browser without logging in — see the table above.
+
+### The pattern this codebase keeps producing
+
+**Things that report success while doing nothing.** A budget filter that rendered
+as literal text and matched nothing. `ALTER DEFAULT PRIVILEGES ... REVOKE` that
+wrote no ACL row. Four assertions that passed vacuously. An alarm that changed
+state correctly and could not encrypt its own notification. None errored; every
+one reported success.
+
+The defence is the same every time: **execute the control, do not inspect its
+configuration.** `SET ROLE anon` and query the table. Create a table and ask
+whether it is writable. Fire the alarm and wait for the email. And when a lesson
+is written down, **grep for the other place it applies** — `environments/account`
+carried the CloudWatch key-policy statement, with a comment saying exactly what
+its absence costs, while `modules/kms` went without it.
+
+**Four of the defects fixed here were found by a human using the app on a phone**,
+not by tests, typechecks, or bundle inspection: a clipped input field, a label
+advertising a feature that did not exist, a deposit pending for a day, and the
+100× currency error. `AGENTS.md` §5 and §6 have the full list.
 
 ### Routes the SPA no longer calls
 
@@ -451,6 +534,3 @@ Supabase Edge Functions (Deno)
 Fanos Bingo is the foundation for a broader ecosystem of on-chain competitive mini-games.
 
 The next major milestone is integrating autonomous AI agents that can participate as players. These agents will learn game patterns, compete against human players, and eventually enable fully agent-vs-agent matches. All outcomes will be recorded on-chain, creating provably fair, transparent competition between humans and AI.
-
-
-

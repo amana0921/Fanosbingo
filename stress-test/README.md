@@ -2,8 +2,13 @@
 
 > ## Never run against the current infrastructure
 >
-> ✅ 2026-07-29: **this suite has never been run** on the AWS stack, so the
-> 400-concurrent target is an aspiration rather than a measurement.
+> ✅ Still true on 2026-08-02: **this suite has never been run** on the AWS
+> stack, so the 400-concurrent target is an aspiration rather than a measurement.
+>
+> Since it was written the instance has taken on more work — the ticker now also
+> publishes `queue_health()` once a minute, and the `functions` service carries
+> the bank deposit and withdrawal routes. Neither is heavy, but the untested
+> assumption has grown rather than shrunk.
 >
 > That matters because the whole architecture rests on one unvalidated
 > assumption: that a single `t4g.small` running five containers can carry the

@@ -1265,6 +1265,76 @@ tests were written carefully — `chain.test.mjs` runs a real HTTP server rather
 than stubbing `fetch`, specifically so it cannot pass against code that could not
 parse a real response — and then left unwired.
 
+### Handover, 2026-08-02 — state, and what is left
+
+dev is fully deployed and has been exercised by a real player with real money.
+Prod has never been applied and inherits every fix below.
+
+**Proven end to end, not just by test:** a TeleBirr deposit, approved by an
+operator, spent on a game, with a false BINGO correctly refused by
+`atomic_claim_bingo`. Each of those had previously only been exercised against
+`db/test/fixture.sql` or with `curl`.
+
+**THE ONE UNTESTED LEG is win → withdraw → operator pays.** It needs a non-zero
+`won_balance` — win a game, or set one through the SSM tunnel. Then **Withdraw**
+enables, and paying it from the admin queue exercises `request_bank_withdrawal`,
+the pending arithmetic in `WalletSummary`, `complete_bank_withdrawal`, and the
+unique payout-reference guard. **That is the gate before prod.**
+
+#### What changed on 2026-08-01/02
+
+| Area | Change |
+|---|---|
+| `db/20-post/008` | Closed a path where any authenticated player could mint an arbitrary `won_balance` with one `PATCH` on `games`. Reproduced against PG16 (5000 → 1,004,999) before the fix and blocked after |
+| `db/20-post/012` | Root cause of the above: clients can no longer write **any** table, now or in future. The allowlist is empty — every legitimate write already runs as the owner through a `SECURITY DEFINER` function |
+| `009`–`011`, `013` | Gave back the four capabilities the revokes took, each as a function the caller cannot pass its own identity to: end game, release card, file a payout, save a setting |
+| `014` | Refund now returns the stake to the balance that paid it. It always credited `deposited_balance`, silently converting withdrawable money into non-withdrawable |
+| `015` | `queue_health()` + two alarms, so money sitting in a manual queue is visible |
+| IAM | `ssm:StartSession` was `instance/*` with no condition — an interactive root shell on **any** instance in the account, reachable from a PR branch via dev's trust policy |
+| OIDC | prod's trust policy admitted `ref:refs/heads/main`, so two workflows reached the prod deploy role with **no reviewer asked** |
+| `modules/kms` | **No per-environment alarm had ever been able to deliver.** The key policy omitted `cloudwatch.amazonaws.com` |
+| `modules/monitoring` | The budget filter rendered as literal text and matched nothing, so cost alerts could never fire |
+| `requireAuth` | The **public** anon key — no `sub`, no `exp`, published in every bundle — authenticated as a player on every route |
+| SPA | Crypto deferred behind `VITE_CRYPTO_ENABLED` (168.6 → 100.0 KB gz); admin reachable from Telegram and from a browser; money shown in **whole birr** rather than divided by 100 and labelled BNB |
+
+#### Tasks left, in the order to do them
+
+1. **Close the withdrawal leg.** Above. Gate before prod.
+2. **Two stale `settings` rows** — `telegram_bot_username` says
+   `Habeshabingo91bot` (the bot is `BingoNovaaBot`); `game_url` points at
+   `multiplayer-bingo-we-5btk.bolt.host`. Editable in the admin Settings form.
+3. **Amharic labels** on the money actions. Deliberately not done — getting a
+   money verb subtly wrong in a language you do not speak is worse than English.
+   Ask the operator.
+4. **Prod's first apply**, after 1. Reviewers are configured;
+   `PROD_APPLY_ENABLED` is deliberately unset, so a merge plans prod and stops.
+5. **`POST /telegram/webhook`.** Requirements are in
+   `services/functions/src/index.js`. Needs a live bot token, so it cannot be
+   built blind, and registering a webhook at a route that does not exist takes
+   the bot down — build both halves together.
+6. **`db/20-post/001_rds_deltas.sql:121`**, the blanket write grant. `012`
+   neutralises it; removing it has a regression surface of the whole schema.
+7. **Admin auth is single-factor.** Cognito + TOTP and an `admin_audit_log`.
+8. **Stage 2 items** already documented in place: `unhealthy_status 5xx` in the
+   Caddyfile, a second instance, Multi-AZ RDS, and the crypto path.
+
+#### Traps a new reader will otherwise fall into
+
+- **Money is whole birr.** One integer = one birr, no sub-unit, no divisor.
+  `formatBalance.ts` used to divide by 100 and showed `0.40` for a balance of 40
+  while the operator's queue printed `40`. If crypto returns it needs a **real
+  rate**, not a compiled-in constant.
+- **Deploy order: migrations → `functions` → `caddy`.** Reversed at the first
+  step opens a window where a balance can be minted *and* cashed out.
+- **`terraform apply` against dev is also a deploy** — it rolls `caddy` and
+  `functions` onto whatever image the SSM pointer names.
+- **`db/20-post/010` must be deleted in the same change that sets
+  `VITE_CRYPTO_ENABLED=true`.** It closes `get_or_create_wallet_user` while the
+  wallet-login flow has no caller.
+- **`scripts/verify-alarms.sh <env|account>`** before trusting any alarm, and
+  `--fire <name>` to prove delivery to an inbox. An alarm at OK with no
+  datapoints is not healthy, it is **unarmed**.
+
 ### Two things measured on 2026-07-30 that are NOT working
 
 Recorded here rather than in a commit message, because a reader needs both
