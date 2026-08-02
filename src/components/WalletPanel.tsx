@@ -29,7 +29,7 @@
 import { useEffect, lazy, Suspense } from 'react';
 import { useAccount } from 'wagmi';
 import WalletConnect from './WalletConnect';
-import { formatBnb } from '../utils/formatBalance';
+import { formatBirr, CURRENCY_LABEL } from '../utils/formatBalance';
 
 const WalletDepositModal = lazy(() =>
   import('./WalletDepositModal').then((m) => ({ default: m.WalletDepositModal })),
@@ -115,7 +115,7 @@ export default function WalletPanel({
           <p className="text-sm font-semibold mb-2">Crypto (BNB) Deposits &amp; Withdrawals</p>
           <p className="text-xs mb-2 opacity-90">
             Deposit BNB to play or withdraw your winnings (
-            {stakeAmount !== null ? formatBnb(stakeAmount) : '0.10'} BNB per game)
+            {stakeAmount !== null ? formatBirr(stakeAmount) : '10'} {CURRENCY_LABEL} per game)
           </p>
           <div className="flex gap-2">
             <button

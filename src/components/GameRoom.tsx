@@ -5,7 +5,7 @@ import { BingoCard } from './BingoCard';
 import { getBingoLetter } from '../utils/bingoUtils';
 import { Trophy, Eye } from 'lucide-react';
 import { useConnectionManager } from '../hooks/useConnectionManager';
-import { formatBnb } from '../utils/formatBalance';
+import { formatBirr, CURRENCY_LABEL } from '../utils/formatBalance';
 
 interface GameRoomProps {
   gameId: string;
@@ -402,7 +402,7 @@ export function GameRoom({ gameId, playerId, onReturnToLobby }: GameRoomProps) {
         <div className="grid grid-cols-4 gap-1.5 sm:gap-2 mb-3">
           <div className={`rounded-lg p-1.5 sm:p-2 text-center transition-colors duration-300 ${isDarkMode ? 'bg-gray-700 border border-gray-600' : 'bg-white'}`}>
             <div className={`text-[10px] sm:text-xs ${isDarkMode ? 'text-gray-300' : 'text-gray-600'}`}>Derash (80%)</div>
-            <div className={`text-sm sm:text-lg font-bold ${isDarkMode ? 'text-white' : 'text-gray-900'}`}>{formatBnb(game.winner_prize || Math.floor(game.total_pot * 0.80))}</div>
+            <div className={`text-sm sm:text-lg font-bold ${isDarkMode ? 'text-white' : 'text-gray-900'}`}>{formatBirr(game.winner_prize || Math.floor(game.total_pot * 0.80))}</div>
           </div>
           <div className={`rounded-lg p-1.5 sm:p-2 text-center transition-colors duration-300 ${isDarkMode ? 'bg-gray-700 border border-gray-600' : 'bg-white'}`}>
             <div className={`text-[10px] sm:text-xs ${isDarkMode ? 'text-gray-300' : 'text-gray-600'}`}>Players</div>
@@ -410,7 +410,7 @@ export function GameRoom({ gameId, playerId, onReturnToLobby }: GameRoomProps) {
           </div>
           <div className={`rounded-lg p-1.5 sm:p-2 text-center transition-colors duration-300 ${isDarkMode ? 'bg-gray-700 border border-gray-600' : 'bg-white'}`}>
             <div className={`text-[10px] sm:text-xs ${isDarkMode ? 'text-gray-300' : 'text-gray-600'}`}>Bet</div>
-            <div className={`text-sm sm:text-lg font-bold ${isDarkMode ? 'text-white' : 'text-gray-900'}`}>{formatBnb(game.stake_amount)}</div>
+            <div className={`text-sm sm:text-lg font-bold ${isDarkMode ? 'text-white' : 'text-gray-900'}`}>{formatBirr(game.stake_amount)}</div>
           </div>
           <div className={`rounded-lg p-1.5 sm:p-2 text-center transition-colors duration-300 ${isDarkMode ? 'bg-gray-700 border border-gray-600' : 'bg-white'}`}>
             <div className={`text-[10px] sm:text-xs ${isDarkMode ? 'text-gray-300' : 'text-gray-600'}`}>Call</div>
@@ -475,7 +475,7 @@ export function GameRoom({ gameId, playerId, onReturnToLobby }: GameRoomProps) {
                           Total Pot
                         </div>
                         <div className="text-3xl sm:text-4xl font-bold text-gray-600">
-                          {formatBnb(game.total_pot)} BNB
+                          {formatBirr(game.total_pot)} {CURRENCY_LABEL}
                         </div>
                         <div className="text-xs text-gray-500 mt-1">Stakes refunded to all players</div>
                       </div>
@@ -488,9 +488,9 @@ export function GameRoom({ gameId, playerId, onReturnToLobby }: GameRoomProps) {
                       <div className="bg-green-50 border border-green-200 rounded-lg p-3 sm:p-4 mb-4 sm:mb-6 inline-block">
                         <div className="text-xs sm:text-sm text-gray-600 mb-1">Prize Won</div>
                         <div className="text-3xl sm:text-4xl font-bold text-green-600">
-                          {formatBnb(game.winner_prize)} BNB
+                          {formatBirr(game.winner_prize)} {CURRENCY_LABEL}
                         </div>
-                        <div className="text-xs text-gray-500 mt-1">80% of {formatBnb(game.total_pot)} BNB pot</div>
+                        <div className="text-xs text-gray-500 mt-1">80% of {formatBirr(game.total_pot)} {CURRENCY_LABEL} pot</div>
                       </div>
                     </>
                   ) : (
@@ -504,12 +504,12 @@ export function GameRoom({ gameId, playerId, onReturnToLobby }: GameRoomProps) {
                       <div className="bg-green-50 border border-green-200 rounded-lg p-3 sm:p-4 mb-4 sm:mb-6 inline-block">
                         <div className="text-xs sm:text-sm text-gray-600 mb-1">Prize Per Winner</div>
                         <div className="text-3xl sm:text-4xl font-bold text-green-600">
-                          {formatBnb(game.winner_prize_each)} BNB
+                          {formatBirr(game.winner_prize_each)} {CURRENCY_LABEL}
                         </div>
                         <div className="text-xs text-gray-500 mt-1">
                           Prize split {winners.length} ways
                         </div>
-                        <div className="text-xs text-gray-500 mt-1">80% of {formatBnb(game.total_pot)} BNB pot</div>
+                        <div className="text-xs text-gray-500 mt-1">80% of {formatBirr(game.total_pot)} {CURRENCY_LABEL} pot</div>
                       </div>
                     </>
                   )}

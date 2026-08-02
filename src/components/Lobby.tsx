@@ -14,7 +14,7 @@ import { CRYPTO_ENABLED } from '../lib/features';
 // chunk -- Lobby is imported statically by App. See src/components/WalletPanel.tsx.
 const WalletPanel = lazy(() => import('./WalletPanel'));
 import { Sun, Moon, Wallet, Timer, Hash } from 'lucide-react';
-import { formatBnb } from '../utils/formatBalance';
+import { formatBirr, CURRENCY_LABEL } from '../utils/formatBalance';
 
 interface LobbyProps {
   onJoinGame: (gameId: string, selectedNumber: number, telegramUser: TelegramUser, cardLayout?: number[][]) => void;
@@ -875,7 +875,8 @@ export function Lobby({ onJoinGame, onSpectateGame, telegramUser }: LobbyProps) 
             {activeGame && (
               <div className={`flex-1 flex items-center justify-center gap-1.5 py-2 ${isDarkMode ? 'text-blue-400' : 'text-blue-600'}`}>
                 <Wallet className="w-3.5 h-3.5 opacity-60" />
-                <span className="text-base font-bold tabular-nums">{formatBnb(activeGame.stake_amount)}</span>
+                <span className="text-base font-bold tabular-nums">{formatBirr(activeGame.stake_amount)}</span>
+                <span className="text-[10px] font-medium opacity-70">{CURRENCY_LABEL}</span>
               </div>
             )}
           </div>
