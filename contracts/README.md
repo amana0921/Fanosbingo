@@ -1,9 +1,29 @@
 # Fanos Bingo Smart Contract
 
-> ## Status: NOT DEPLOYED, and how you deploy it matters permanently
+> ## Status: NOT DEPLOYED, and NOT ON THE CRITICAL PATH
 >
-> `settings.deposit_contract_address` is empty. Nothing on the money path works
-> until this is deployed.
+> `settings.deposit_contract_address` is empty.
+>
+> **This used to say "nothing on the money path works until this is deployed".
+> That is no longer true and has not been since the bank rail landed.** Players
+> deposit by TeleBirr or CBE, an operator approves against their own statement,
+> and withdrawals are paid by hand — a complete money round trip with no contract
+> and no wallet anywhere in it.
+>
+> As of 2026-08-02 the crypto path is **deferred behind `VITE_CRYPTO_ENABLED`**,
+> off by default, because Ethiopian players overwhelmingly do not hold
+> cryptocurrency. Nothing here is deleted — this contract, the KMS signing key
+> and `services/functions/src/kms-signer.js` are all retained and tested — but
+> deploying it is a Stage-2 decision rather than a launch blocker.
+>
+> If you do bring it back, read `src/lib/features.ts` first: turning the flag on
+> is a **coupled pair** with deleting `db/20-post/010`, which closes
+> `get_or_create_wallet_user` while the wallet-login flow has no caller. And the
+> currency conversion needs a **real rate** — `formatBalance.ts` used to carry a
+> compiled-in `1 BNB = 100 credits`, which showed players one hundredth of their
+> actual birr balance.
+>
+> Everything below about ownership still applies, and matters permanently.
 >
 > **The constructor sets `owner = msg.sender`, and `addWinCredits` — the only
 > function the backend ever calls — is `onlyOwner`.** So the deploying wallet

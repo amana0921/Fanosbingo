@@ -523,3 +523,118 @@ service; task credentials come from the ECS agent at `169.254.170.2` and are
 unaffected. Changing it again requires an explicit
 `aws autoscaling start-instance-refresh` — Terraform will not trigger one,
 because the ASG references `version = "$Latest"` and therefore shows no diff.
+
+---
+
+## Infrastructure state, as of 2026-08-02
+
+Four defects were fixed here that had one property in common: **every signal said
+healthy.** None errored, none failed a plan, and none would have been found by
+reading the configuration. Recorded in full because the class matters more than
+the instances.
+
+### No per-environment alarm could ever deliver a notification
+
+`modules/monitoring` encrypts its SNS topic with the environment CMK.
+`modules/kms` admitted CloudWatch **Logs** and Auto Scaling to that key, and not
+`cloudwatch.amazonaws.com` — so an alarm transitioning to ALARM could not produce
+a data key to encrypt the message. The publish failed and the notification was
+**dropped silently**: state correct, console showing ALARM, subscription
+confirmed, metric publishing, nothing delivered.
+
+That included `game-loop-stalled`, which this repository calls "THE alarm ... the
+one that describes whether the game is running". It had never once reached a
+human.
+
+**The statement already existed on the audit key** in `environments/account`,
+with a comment saying precisely what its absence costs. It was never applied to
+`modules/kms`, so account-wide alarms delivered while every environment alarm did
+not. When a lesson gets written down, grep for the other place it applies.
+
+Found by firing an alarm deliberately and getting no email — after confirming the
+subscription, the alarm state, and the metric datapoints. Each link looked
+correct in isolation.
+
+### `scripts/verify-alarms.sh` — run this before trusting an alarm
+
+```bash
+./scripts/verify-alarms.sh dev                  # report; changes nothing
+./scripts/verify-alarms.sh account              # the account-wide detections
+./scripts/verify-alarms.sh dev --fire <alarm>   # force ALARM -> OK, prove the inbox
+```
+
+It checks four links, and the fourth is the one that was missing when it first
+shipped: confirmed subscribers, a topic whose CMK admits CloudWatch, non-empty
+alarm actions, and — for **continuous** metrics only — live datapoints.
+
+**An alarm at OK with no datapoints is not healthy, it is unarmed.** With
+`treat_missing_data = "notBreaching"` it will sit there forever saying nothing.
+
+`account` deliberately skips the datapoint assertion: `UnexpectedKmsSign` and
+`RootAccountUsage` are **event-driven**, so no datapoints is the goal. Demanding
+them would fail permanently and train everyone to ignore the script — the exact
+failure it exists to prevent, turned on itself. `--fire` refuses the account
+target for the same reason: those alarms mean "somebody used root", and firing
+one writes a false positive into the record you would read back during an
+incident.
+
+Wired into `verify.yml`, so it runs weekly alongside the other checks.
+
+### The budget alerts had never been able to fire
+
+```hcl
+values = ["user:Environment$${var.environment}"]     # WRONG
+```
+
+In HCL `$${` is the escape for a literal `${`, so the filter rendered as the
+literal text and matched no resource. The budget reported $0 actual and $0
+forecast permanently, and every notification below it was unreachable — in
+exactly the situation they exist to catch, since exhausting credits on a
+credit-based Free Tier plan **suspends resources**. Use
+`format("user:Environment$%s", var.environment)`.
+
+### The deploy role was wider than its comments claimed
+
+- **`ssm:StartSession` on `instance/*` with no condition** is an interactive root
+  shell on every instance in the account. Listing the port-forwarding document in
+  `Resource` constrains nothing — a session naming no document uses the default
+  `SSM-SessionManagerRunShell`, so only the instance ARN is evaluated. Combined
+  with dev's `pull_request` trust, PR-branch code could reach a shell on the
+  **prod** instance. Now conditioned on `ssm:resourceTag/Environment`.
+- **`ecs:UpdateService` on `*`** let the dev role set a prod service's
+  `desiredCount` to 0. Now scoped to the environment's cluster.
+- **The RDS master secret** was matched by the account-wide `rds!db-*` prefix.
+  Not exploitable — the CMK scoping caught it — but correct by accident. Now
+  passed by exact ARN from the `rds` module.
+
+### prod's trust policy was reachable without its reviewer gate
+
+It admitted `ref:refs/heads/main` alongside `environment:prod`. A
+`workflow_dispatch` from `main` emits that subject **whether or not the job
+declares an environment**, so any workflow building the role ARN from an input
+reached prod with no reviewer asked. Two did.
+
+**The rule this establishes: any workflow that interpolates an environment into a
+role ARN must declare that environment.** Audited across all ten; `db-migrate.yml`
+is split into two jobs because the PR dry run must *not* declare one (dev's
+deployment branch policy would refuse it) while the apply must.
+
+### Alarm budget
+
+`modules/monitoring` now defines **exactly ten alarms — the entire CloudWatch
+free-tier allowance.** There is no headroom. An eleventh costs $0.10/mo, which is
+trivial in isolation and worth knowing deliberately on a $32 budget whose point is
+that nothing is billed by accident. If you need another: pay for it, retire one
+that has never fired, or fold two signals into a metric-math alarm. Do not
+quietly add an eleventh.
+
+### Reading a plan on an ECS change
+
+A task definition is **immutable**, so Terraform expresses every change to one as
+destroy-and-create. "2 to add, 4 to change, 2 to destroy" on an infrastructure PR
+is usually the same two resources being revised, not a service being deleted.
+
+What *is* worth stopping for: a **service** replaced rather than updated in place,
+or `aws_db_instance` / `aws_kms_key` appearing in a destroy list. And image-tag
+churn nobody caused is the SSM pointer converging — fine, but it means **an
+infrastructure apply is also a deploy** of whatever the pointer names.
