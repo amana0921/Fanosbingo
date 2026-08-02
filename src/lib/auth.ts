@@ -130,6 +130,28 @@ export async function getAccessToken(): Promise<string | null> {
   return refreshed ? token : ANON_KEY || null;
 }
 
+/**
+ * Adopt a token minted by the WEB login, so the rest of the app cannot tell
+ * which door the player came through.
+ *
+ * Exported rather than letting the caller poke the module variable, because the
+ * expiry bookkeeping lives here and a session set without it would look valid
+ * forever to isAuthenticated().
+ *
+ * The token itself is not trusted here -- it was minted by the server from a
+ * signature the server checked, and every route verifies it again on arrival.
+ * This only decides which string the client sends.
+ */
+export function adoptSession(newToken: string): void {
+  token = newToken;
+
+  // Same 15 minutes the server issues, minus the module's own refresh margin so
+  // a request is never sent with a token that expires in flight. Reusing
+  // REFRESH_MARGIN_MS rather than restating a number keeps the two paths from
+  // drifting if the token lifetime ever changes.
+  expiresAt = Date.now() + 15 * 60 * 1000 - REFRESH_MARGIN_MS;
+}
+
 /** For sign-out and for tests. */
 export function clearSession(): void {
   token = null;
