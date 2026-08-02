@@ -1028,6 +1028,7 @@ project. That made it the cheapest moment the design will ever be changed.
 | Route | Auth |
 |---|---|
 | `POST /auth/telegram` | none — this is where identity is *proved*, via Telegram's `initData` HMAC |
+| `POST /auth/telegram/web` | none — the DESKTOP door, via the Telegram Login Widget. Signs the **same** identity, mints an indistinguishable session. Different key derivation from initData: `SHA256(bot_token)`, not `HMAC_SHA256("WebAppData", bot_token)` |
 | `GET /auth/whoami` | bearer token |
 | `GET /healthz`, `/readyz` | none |
 | `POST /select-card` · `/claim-bingo` · `/deselect-card` | bearer token |
@@ -1097,7 +1098,14 @@ on the new service must not reproduce it.
 
 ---
 
-#### The money path — written, tested, blocked on one faucet visit
+#### The ON-CHAIN money path — written, tested, and DEFERRED
+
+> **Read this heading twice.** It used to say "blocked on one faucet visit",
+> which implied the game could not take money until the contract existed. That
+> has been false since the bank rail landed: deposit, play and withdraw all work
+> by TeleBirr and CBE with no contract and no wallet. As of 2026-08-02 the crypto
+> path is deferred behind `VITE_CRYPTO_ENABLED`, off by default. Everything below
+> describes a path that is retained and not currently reachable.
 
 The design is **non-custodial**, and that is worth understanding before touching
 it. From the `20260216` migration:
@@ -1512,6 +1520,25 @@ db/
     001_rds_deltas            removes the 4s cron job, schedules cleanups, asserts wal_level
     002_game_tick             THE GAME LOOP — server-authoritative, one transaction
     003_settings_rls_hardening  deny-by-default RLS + anon assertions
+    004_authorization_hardening EXECUTE is an allowlist; telegram_users owner-scoped
+    005_admin_role              is_admin flag, and who may set it
+    006_deposit_requests        bank deposit queue + approve/reject
+    007_bank_withdrawals        payout queue. Row lock, no overdraft, frozen decisions
+    008_game_state_hardening    CLIENTS CANNOT WRITE games/players. Closed a path that
+                                let any player mint an arbitrary won_balance
+    009_admin_game_control      admin_end_game(). Touches NO payout column, by design
+    010_defer_wallet_login      closes get_or_create_wallet_user while crypto is off.
+                                DELETE THIS in the change that sets VITE_CRYPTO_ENABLED
+    011_release_card            /deselect-card. Own row only, while selection is open
+    012_deny_client_writes      the root cause of 008: no client writes ANY table,
+                                now or in future. The allowlist is empty
+    013_admin_settings          five presentation keys. NOT telegram_bot_token
+    014_refund_the_balance_that_paid  records the stake split, so a refund returns
+                                withdrawable money as withdrawable
+    015_queue_health            queue_health(), read by the ticker for the two
+                                money-queue alarms
+  test/fixture.sql              models the INHERITED (buggy) state, so migrations
+                                have something to fix. Must not be laxer than prod
 services/
   ticker/                     Node. Game loop
   postgrest/ realtime/ caddy/ Thin images over upstream (CA bundle, config)
@@ -1521,7 +1548,32 @@ services/
     src/telegram-auth.js      HMAC verification. PLAIN JS so the test imports it
     src/kms-signer.js         DER -> (r,s,v), EIP-2, recovery by checking
     src/chain.js              refuses to run if the RPC serves another chain
-    src/*.test.mjs            189 assertions across 8 suites, no AWS, no network
+    src/withdrawals.js        bank payout: request / list / complete / reject
+    src/deposits.js           bank deposit claim + the operator's decisions
+    src/deselect-card.js      release a card, via release_card()
+    src/admin.js              requireAdmin, bootstrap, end game, settings
+    src/*.test.mjs            276 assertions across 13 suites, no AWS, no network.
+                              auth.test.mjs pins that the PUBLIC anon key does not
+                              authenticate anybody; login-widget.test.mjs signs
+                              fixtures BOTH ways and asserts each verifier takes
+                              only its own
+src/  (the Mini App)
+  lib/features.ts             CRYPTO_ENABLED. Everything crypto is behind it,
+                              off by default. Turning it on is a COUPLED PAIR
+                              with deleting db/20-post/010
+  lib/auth.ts                 session, and adoptSession() for the web login
+  utils/formatBalance.ts      WHOLE BIRR. One integer = one birr. No divisor --
+                              it used to divide by 100 and showed 0.40 for 40
+  components/WalletSummary    the two named balances + pending + recent activity
+  components/CryptoProvider   WagmiProvider behind a dynamic import. The PROVIDER
+                              had to move, not just the modals -- it was in the
+                              entry chunk
+  components/WalletPanel      the lobby's crypto surface, lazily loaded
+  components/TelegramWebLogin the desktop door. Loads telegram.org's widget --
+                              the only third-party runtime code in the bundle
+  components/BankDepositQueue      operator: deposits
+  components/BankWithdrawalQueue   operator: payouts. Reference required, never
+                                   generated -- 007's unique index is the guard
 scripts/
   bootstrap-aws.sh            One-time. Idempotent. State bucket, OIDC, both roles
   bootstrap-github.sh         One-time. Idempotent. Variables, environments,
@@ -1533,6 +1585,14 @@ scripts/
   probe-public-access.sh      Anonymous exposure probe (verified against bait)
   verify-detections.sh        Proves the CloudTrail alarms fire AND stay quiet
   verify-cloudflare.sh        Asserts what Terraform cannot enforce (Bot Fight Mode)
+  verify-alarms.sh            Proves an alarm can REACH A HUMAN: confirmed
+                              subscribers, a topic whose CMK admits CloudWatch,
+                              non-empty actions, and live datapoints for
+                              continuous metrics. `--fire <name>` forces a
+                              transition to test delivery to an inbox.
+                              An alarm at OK with no data is UNARMED, not healthy
+  test-migrations.sh          Applies db/20-post twice against a throwaway
+                              PostgreSQL. Repeatable files must be idempotent
   derive-wallet-address.mjs   Address from the KMS public key
   cloudflare-import.sh        Emits import blocks for DNS that already exists
   deploy-contract.mjs         Deploys FROM the KMS key, then verifies owner()

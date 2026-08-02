@@ -186,6 +186,13 @@ check it, not so you can type it.
 | `ALERT_EMAIL` | where alarms go |
 | `CLOUDFLARE_ZONE_ID` | optional; enables `modules/cloudflare` |
 | `PROD_APPLY_ENABLED` | **leave unset.** Setting it to `true` is the second prod gate |
+| `TELEGRAM_BOT_USERNAME` | e.g. `BingoNovaaBot`, no `@`. Renders the Login Widget so the admin panel opens in a **browser**. Needs BotFather `/setdomain` pointed at `app.<domain>`, or Telegram refuses to render it. Unset = no button; the Mini App is unaffected |
+| `REOWN_PROJECT_ID` | optional; only read when the crypto path is enabled |
+
+The SPA build also reads `VITE_CRYPTO_ENABLED` from the environment. It is
+**unset**, so crypto is off: every wallet surface is gated and its chunk is never
+fetched. Turning it on is a coupled pair with deleting `db/20-post/010` — see
+`src/lib/features.ts`.
 
 Secrets, consumed by the *Sync secrets to SSM* workflow:
 
