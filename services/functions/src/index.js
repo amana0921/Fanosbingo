@@ -53,7 +53,7 @@
 import express from 'express';
 import pg from 'pg';
 import fs from 'node:fs';
-import { authenticateTelegram, requireAuth } from './auth.js';
+import { authenticateTelegram, authenticateTelegramWeb, requireAuth } from './auth.js';
 import { verifyChainId, chainName } from './chain.js';
 import { bodyParserErrorHandler } from './http-errors.js';
 import { createRateLimiter } from './rate-limit.js';
@@ -278,6 +278,71 @@ app.post('/auth/telegram', async (req, res) => {
     });
   } catch (err) {
     log('error', 'authentication error', { error: err.message, stack: err.stack });
+    return res.status(500).json({ error: 'internal error' });
+  }
+});
+
+/**
+ * POST /auth/telegram/web  { id, first_name, username, auth_date, hash, ... }
+ *
+ * The desktop door. Telegram's Login Widget signs the same identity for a web
+ * page that initData signs for a Mini App, so an operator can work the deposit
+ * and withdrawal queues from a keyboard instead of a phone.
+ *
+ * SAME IDENTITY, SAME SESSION. The token is indistinguishable from the Mini
+ * App's -- same uuid in `sub`, same 15-minute life, same role -- so there is no
+ * second kind of admin and no second thing for requireAdmin to understand. The
+ * flag on the telegram_users row is what decides, exactly as it does in the app.
+ *
+ * DIFFERENT SIGNATURE, THOUGH. The widget's secret key is SHA256(bot_token)
+ * where the Mini App's is HMAC_SHA256("WebAppData", bot_token). Separate
+ * verifier, separate entry point; see services/functions/src/telegram-auth.js.
+ *
+ * REQUIRES BotFather /setdomain. Telegram refuses to render the widget on a
+ * domain the bot has not claimed, which is what stops any site from collecting
+ * logins for this bot.
+ *
+ * Shares the rate limiter with the Mini App route: the limit is per verified
+ * telegram id, so it should not matter which door somebody came through.
+ */
+app.post('/auth/telegram/web', async (req, res) => {
+  const payload = req.body;
+
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    return res.status(400).json({ error: 'login payload is required' });
+  }
+
+  try {
+    const result = await authenticateTelegramWeb(
+      pool,
+      payload,
+      TELEGRAM_BOT_TOKEN,
+      JWT_SECRET,
+      authLimiter,
+    );
+
+    if (!result.ok) {
+      if (result.status === 429) {
+        res.set('Retry-After', String(result.retryAfterSeconds));
+        return res.status(429).json({
+          error: 'too many authentication attempts',
+          retry_after_seconds: result.retryAfterSeconds,
+        });
+      }
+
+      log('warn', 'web authentication rejected', { reason: result.reason });
+      return res.status(result.status).json({ error: 'authentication failed' });
+    }
+
+    log('info', 'authenticated on web', { telegram_user_id: result.user.telegram_user_id });
+
+    return res.json({
+      token: result.token,
+      expires_in: result.expires_in,
+      user: result.user,
+    });
+  } catch (err) {
+    log('error', 'web authentication error', { error: err.message, stack: err.stack });
     return res.status(500).json({ error: 'internal error' });
   }
 });

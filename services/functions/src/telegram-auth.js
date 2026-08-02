@@ -195,6 +195,109 @@ export async function verifyInitData(initData, botToken, maxAgeSeconds = 86400) 
 }
 
 /**
+ * Verify a Telegram LOGIN WIDGET payload and return the user it proves.
+ *
+ * This is the desktop counterpart to verifyInitData, and the two look almost
+ * identical while differing in the one line that matters:
+ *
+ *   Mini App        secret_key = HMAC_SHA256(key: "WebAppData", message: bot_token)
+ *   Login Widget    secret_key = SHA256(bot_token)
+ *
+ * A PLAIN HASH, not an HMAC, and no "WebAppData" anywhere. Reusing the Mini App
+ * derivation here produces a verifier that rejects every genuine login, and --
+ * far worse if the mistake went the other way -- reusing this one for initData
+ * would accept payloads Telegram never signed for a Mini App. They are separate
+ * functions rather than one with a flag for exactly that reason: a boolean
+ * parameter deciding which key derivation to use is a boolean somebody
+ * eventually passes wrong.
+ *
+ * The rest is the same algorithm: every field except `hash`, as "k=v", sorted
+ * by key, joined with newlines, HMAC'd under that secret.
+ *
+ * FIELDS ARE TOP-LEVEL HERE. initData nests the user as a JSON string under
+ * `user`; the widget sends id, first_name, username and so on directly. Parsing
+ * one as the other silently yields no user.
+ *
+ * A MUCH SHORTER FRESHNESS WINDOW than initData's, deliberately. A Mini App
+ * payload is minted once and reused for the whole session, so it needs a day. A
+ * widget payload is handed to the page and posted immediately, so anything older
+ * than a few minutes is a replay rather than a slow user. The window is the
+ * whole replay defence -- Telegram signs no nonce, so a captured payload is a
+ * permanent credential for that account until it expires.
+ *
+ * @param {Record<string, string|number>} payload
+ */
+export async function verifyLoginWidget(payload, botToken, maxAgeSeconds = 300) {
+  if (!payload || typeof payload !== "object") {
+    return { ok: false, reason: "no login payload supplied" };
+  }
+  if (!botToken) return { ok: false, reason: "no bot token configured" };
+
+  const hash = payload.hash;
+  if (typeof hash !== "string" || !hash) {
+    return { ok: false, reason: "login payload has no hash field" };
+  }
+
+  const dataCheckString = Object.keys(payload)
+    .filter((k) => k !== "hash")
+    .sort()
+    .map((k) => `${k}=${payload[k]}`)
+    .join("\n");
+
+  const enc = new TextEncoder();
+
+  // SHA256 of the bot token, used directly as the HMAC key. See the header --
+  // this is the line that differs from the Mini App path.
+  const secretKey = await crypto.subtle.digest("SHA-256", enc.encode(botToken));
+
+  const key = await crypto.subtle.importKey(
+    "raw",
+    secretKey,
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+
+  const signature = await crypto.subtle.sign("HMAC", key, enc.encode(dataCheckString));
+  const computed = [...new Uint8Array(signature)]
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+
+  if (!timingSafeEqual(computed, hash)) {
+    return { ok: false, reason: "login payload signature does not match" };
+  }
+
+  const authDate = Number(payload.auth_date ?? 0);
+  if (!authDate) return { ok: false, reason: "login payload has no auth_date" };
+
+  const age = Math.floor(Date.now() / 1000) - authDate;
+  if (age > maxAgeSeconds) {
+    return {
+      ok: false,
+      reason: `login payload is ${age}s old, older than the ${maxAgeSeconds}s window`,
+    };
+  }
+  if (age < -300) {
+    return { ok: false, reason: "login payload auth_date is in the future" };
+  }
+
+  const id = Number(payload.id);
+  if (!Number.isFinite(id) || id <= 0) {
+    return { ok: false, reason: "login payload has no numeric id" };
+  }
+
+  return {
+    ok: true,
+    user: {
+      id,
+      username: typeof payload.username === "string" ? payload.username : undefined,
+      first_name: typeof payload.first_name === "string" ? payload.first_name : undefined,
+      last_name: typeof payload.last_name === "string" ? payload.last_name : undefined,
+    },
+  };
+}
+
+/**
  * CORS headers locked to one origin.
  *
  * Every function in this project sent `Access-Control-Allow-Origin: *`,

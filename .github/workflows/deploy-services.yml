@@ -185,6 +185,15 @@ jobs:
           VITE_API_BASE_URL: https://api.${{ vars.DOMAIN_NAME }}
           VITE_SUPABASE_ANON_KEY: ${{ vars.SPA_ANON_KEY }}
           VITE_REOWN_PROJECT_ID: ${{ vars.REOWN_PROJECT_ID }}
+
+          # The bot whose Login Widget signs a WEB session, so the admin panel
+          # opens in a browser. Not secret -- a bot username is public. What
+          # gates the widget is BotFather /setdomain naming this origin.
+          #
+          # Unset is legitimate: the login button does not render and the Mini
+          # App is unaffected, which is the right failure for a build made
+          # before the domain has been claimed.
+          VITE_TELEGRAM_BOT_USERNAME: ${{ vars.TELEGRAM_BOT_USERNAME }}
         run: |
           set -euo pipefail
 

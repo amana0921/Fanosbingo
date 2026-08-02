@@ -35,7 +35,7 @@
  */
 
 import jwt from 'jsonwebtoken';
-import { verifyInitData } from './telegram-auth.js';
+import { verifyInitData, verifyLoginWidget } from './telegram-auth.js';
 
 /** Short. A stolen token should stop working before it is useful. */
 const TOKEN_TTL_SECONDS = 15 * 60;
@@ -54,6 +54,29 @@ const TOKEN_TTL_SECONDS = 15 * 60;
  *        Optional. See src/rate-limit.js for why the key is the telegram id and
  *        not the IP address.
  */
+/**
+ * The desktop counterpart, for the Telegram Login Widget.
+ *
+ * WHY A SECOND ENTRY POINT AND NOT A FLAG. The two payloads are signed under
+ * DIFFERENT key derivations -- see verifyLoginWidget -- and a boolean deciding
+ * which to use is a boolean somebody eventually passes wrong. Everything after
+ * verification is shared, so there is nothing to keep in step.
+ *
+ * The session it mints is identical: same uuid in `sub`, same 15-minute life,
+ * same role. A web operator and a Mini App player are the same identity to
+ * every route and every RLS policy, which is the property that lets the admin
+ * panel work in a browser without inventing a second kind of admin.
+ */
+export async function authenticateTelegramWeb(pool, payload, botToken, jwtSecret, limiter) {
+  const verified = await verifyLoginWidget(payload, botToken);
+
+  if (!verified.ok) {
+    return { ok: false, status: 401, reason: verified.reason };
+  }
+
+  return issueSession(pool, verified.user, jwtSecret, limiter);
+}
+
 export async function authenticateTelegram(pool, initData, botToken, jwtSecret, limiter) {
   const verified = await verifyInitData(initData, botToken);
 
@@ -68,7 +91,17 @@ export async function authenticateTelegram(pool, initData, botToken, jwtSecret, 
     return { ok: false, status: 401, reason: verified.reason };
   }
 
-  const tg = verified.user;
+  return issueSession(pool, verified.user, jwtSecret, limiter);
+}
+
+/**
+ * Everything after "we know who this is": rate limit, upsert, mint.
+ *
+ * Shared by the Mini App and the web login so the two cannot drift. The part
+ * worth not duplicating is the ORDERING -- the limiter runs after verification
+ * and before the write, and both of those placements are load-bearing.
+ */
+async function issueSession(pool, tg, jwtSecret, limiter) {
 
   // RATE LIMIT HERE: after the HMAC proved who this is, before the write.
   //

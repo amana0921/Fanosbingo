@@ -1,5 +1,15 @@
 import { useState, useEffect, lazy, Suspense } from 'react';
-import { getAccessToken } from '../lib/auth';
+
+// The bot whose Login Widget signs a web session. Compile-time, like every
+// VITE_ variable, and not secret -- a bot username is public.
+const TELEGRAM_BOT_USERNAME = import.meta.env.VITE_TELEGRAM_BOT_USERNAME ?? '';
+
+// Lazy: it injects a script from telegram.org, and a player who never opens
+// this page should never fetch it.
+const TelegramWebLogin = lazy(() =>
+  import('./TelegramWebLogin').then((m) => ({ default: m.TelegramWebLogin })),
+);
+import { getAccessToken, adoptSession, isAuthenticated as hasSession } from '../lib/auth';
 import { BankDepositQueue } from './BankDepositQueue';
 import { BankWithdrawalQueue } from './BankWithdrawalQueue';
 import { supabase, Game, Player } from '../lib/supabase';
@@ -386,8 +396,8 @@ export function Admin() {
   };
 
 
-  const handleLogin = async (e: React.FormEvent) => {
-    e.preventDefault();
+  const handleLogin = async (e?: React.FormEvent) => {
+    e?.preventDefault();
 
     // ASKS THE SERVER, and believes only a positive answer.
     //
@@ -503,6 +513,33 @@ export function Admin() {
         </div>
         <h1 className="text-3xl font-bold text-gray-900 text-center mb-2">Admin Panel</h1>
         <p className="text-gray-600 text-center mb-6">Enter your access key to continue</p>
+        {/* THE WEB DOOR. Shown only when there is no Telegram session, which is
+            exactly the desktop case: a browser has no initData, so the form
+            below has nothing to authenticate with and every admin route would
+            answer 401.
+
+            Inside the Mini App this is skipped -- the session already exists,
+            and rendering a login widget there would ask somebody to prove an
+            identity they have already proven. */}
+        {!hasSession() && TELEGRAM_BOT_USERNAME && (
+          <div className="mb-6">
+            <Suspense fallback={<p className="text-sm text-gray-500 text-center">Loading…</p>}>
+              <TelegramWebLogin
+                botUsername={TELEGRAM_BOT_USERNAME}
+                onAuthenticated={(t) => {
+                  adoptSession(t);
+                  void handleLogin();
+                }}
+              />
+            </Suspense>
+            <div className="flex items-center gap-3 my-4">
+              <span className="h-px flex-1 bg-gray-200" />
+              <span className="text-xs text-gray-400">or bootstrap the first admin</span>
+              <span className="h-px flex-1 bg-gray-200" />
+            </div>
+          </div>
+        )}
+
         <form onSubmit={handleLogin} className="space-y-4">
           <div>
             <label htmlFor="access-key" className="block text-sm font-medium text-gray-700 mb-2">
