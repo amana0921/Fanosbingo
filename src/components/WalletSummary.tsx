@@ -44,7 +44,7 @@
 
 import { useState, useEffect, useCallback } from 'react';
 import { supabase } from '../lib/supabase';
-import { formatBnb } from '../utils/formatBalance';
+import { formatBirr, CURRENCY_LABEL } from '../utils/formatBalance';
 
 interface WalletSummaryProps {
   telegramUserId: number | null;
@@ -182,7 +182,7 @@ export function WalletSummary({
             Play balance
           </p>
           <p className={`text-lg font-bold tabular-nums ${isDarkMode ? 'text-emerald-400' : 'text-emerald-600'}`}>
-            {formatBnb(depositedBalance)}
+            {formatBirr(depositedBalance)} <span className="text-xs font-medium">{CURRENCY_LABEL}</span>
           </p>
           <p className={`text-[10px] ${dim}`}>For joining games</p>
         </div>
@@ -192,12 +192,12 @@ export function WalletSummary({
             Winnings
           </p>
           <p className={`text-lg font-bold tabular-nums ${isDarkMode ? 'text-yellow-400' : 'text-yellow-600'}`}>
-            {formatBnb(available)}
+            {formatBirr(available)} <span className="text-xs font-medium">{CURRENCY_LABEL}</span>
           </p>
           {/* The line that stops "why is Withdraw greyed out?" being a support
               message. Shown at zero too -- that is when it is needed most. */}
           <p className={`text-[10px] ${dim}`}>
-            {pending > 0 ? `${formatBnb(pending)} awaiting payout` : 'Withdrawable'}
+            {pending > 0 ? `${formatBirr(pending)} ${CURRENCY_LABEL} awaiting payout` : 'Withdrawable'}
           </p>
         </div>
       </div>
@@ -216,7 +216,7 @@ export function WalletSummary({
                 </span>
                 <span className="flex shrink-0 items-baseline gap-2">
                   <span className={`tabular-nums ${isDarkMode ? 'text-gray-200' : 'text-gray-900'}`}>
-                    {formatBnb(a.amount)}
+                    {formatBirr(a.amount)}
                   </span>
                   <span
                     className={

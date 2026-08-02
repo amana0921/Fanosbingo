@@ -27,7 +27,7 @@ const DepositManagement = lazy(() =>
 const BnbWithdrawalManagement = lazy(() =>
   import('./BnbWithdrawalManagement').then((m) => ({ default: m.BnbWithdrawalManagement })),
 );
-import { formatBnb } from '../utils/formatBalance';
+import { formatBirr, CURRENCY_LABEL } from '../utils/formatBalance';
 
 interface UserSpending {
   id: string;
@@ -619,8 +619,8 @@ export function Admin() {
               {[
                 { label: 'Total Users', value: statistics.totalUsers, icon: Users, color: 'blue' },
                 { label: 'Games Played', value: statistics.totalGamesPlayed, icon: Trophy, color: 'emerald' },
-                { label: 'Total Revenue', value: `${formatBnb(statistics.totalRevenue)}`, suffix: ' BNB', icon: DollarSign, color: 'amber' },
-                { label: 'House Cut', value: `${formatBnb(statistics.houseCut)}`, suffix: ' BNB', icon: TrendingUp, color: 'teal' },
+                { label: 'Total Revenue', value: `${formatBirr(statistics.totalRevenue)}`, suffix: ` ${CURRENCY_LABEL}`, icon: DollarSign, color: 'amber' },
+                { label: 'House Cut', value: `${formatBirr(statistics.houseCut)}`, suffix: ` ${CURRENCY_LABEL}`, icon: TrendingUp, color: 'teal' },
                 { label: 'Active Games', value: statistics.activeGames, icon: Clock, color: 'rose' },
               ].map(({ label, value, suffix, icon: Icon, color }) => (
                 <div key={label} className="bg-white rounded-xl border border-slate-200/60 p-5 hover:shadow-md transition-shadow">
@@ -676,7 +676,13 @@ export function Admin() {
                       <th className="text-left py-3 px-4 font-semibold text-gray-700 text-sm">Username</th>
                       <th className="text-left py-3 px-4 font-semibold text-gray-700 text-sm">Wallet Address</th>
                       <th className="text-right py-3 px-4 font-semibold text-gray-700 text-sm">Balance</th>
-                      <th className="text-right py-3 px-4 font-semibold text-gray-700 text-sm">BNB Deposited</th>
+                      {/* GENUINELY BNB, not a mislabelled birr column -- so it
+                          is gated rather than relabelled. Renaming it would be a
+                          lie; with crypto deferred it is simply a column of
+                          zeros in a currency nobody here uses. */}
+                      {CRYPTO_ENABLED && (
+                        <th className="text-right py-3 px-4 font-semibold text-gray-700 text-sm">BNB Deposited</th>
+                      )}
                       <th className="text-right py-3 px-4 font-semibold text-gray-700 text-sm">Deposit Count</th>
                       <th className="text-right py-3 px-4 font-semibold text-gray-700 text-sm">Total Spent</th>
                       <th className="text-right py-3 px-4 font-semibold text-gray-700 text-sm">Total Won</th>
@@ -714,14 +720,16 @@ export function Admin() {
                           </td>
                           <td className="py-3 px-4 text-sm text-right">
                             <span className="font-semibold text-green-600">
-                              {formatBnb(user.balance)} BNB
+                              {formatBirr(user.balance)} {CURRENCY_LABEL}
                             </span>
                           </td>
-                          <td className="py-3 px-4 text-sm text-right">
+                          {CRYPTO_ENABLED && (
+                            <td className="py-3 px-4 text-sm text-right">
                             <span className="font-semibold text-yellow-600">
                               {user.total_bnb_deposited.toFixed(4)} BNB
                             </span>
                           </td>
+                          )}
                           <td className="py-3 px-4 text-sm text-right">
                             <span className="font-semibold text-blue-600">
                               {user.deposit_count}
@@ -729,12 +737,12 @@ export function Admin() {
                           </td>
                           <td className="py-3 px-4 text-sm text-right">
                             <span className="font-semibold text-red-600">
-                              {formatBnb(user.total_spent)} BNB
+                              {formatBirr(user.total_spent)} {CURRENCY_LABEL}
                             </span>
                           </td>
                           <td className="py-3 px-4 text-sm text-right">
                             <span className="font-semibold text-green-600">
-                              {formatBnb(user.total_won)} BNB
+                              {formatBirr(user.total_won)} {CURRENCY_LABEL}
                             </span>
                           </td>
                           <td className="py-3 px-4 text-sm text-right">
@@ -774,17 +782,17 @@ export function Admin() {
                     </div>
                     <div className="text-gray-600">
                       Total Spending: <span className="font-semibold text-red-600">
-                        {formatBnb(users.reduce((sum, user) => sum + user.total_spent, 0))} BNB
+                        {formatBirr(users.reduce((sum, user) => sum + user.total_spent, 0))} {CURRENCY_LABEL}
                       </span>
                     </div>
                     <div className="text-gray-600">
                       Total Winnings: <span className="font-semibold text-green-600">
-                        {formatBnb(users.reduce((sum, user) => sum + user.total_won, 0))} BNB
+                        {formatBirr(users.reduce((sum, user) => sum + user.total_won, 0))} {CURRENCY_LABEL}
                       </span>
                     </div>
                     <div className="text-gray-600">
                       Total Balance: <span className="font-semibold text-green-600">
-                        {formatBnb(users.reduce((sum, user) => sum + user.balance, 0))} BNB
+                        {formatBirr(users.reduce((sum, user) => sum + user.balance, 0))} {CURRENCY_LABEL}
                       </span>
                     </div>
                   </div>
@@ -798,7 +806,7 @@ export function Admin() {
           <>
             <div className="bg-white rounded-2xl shadow-xl p-6 mb-6">
               <div className="flex items-center justify-between mb-4">
-                <h2 className="text-2xl font-bold text-gray-900">BNB Deposit Management</h2>
+                <h2 className="text-2xl font-bold text-gray-900">Deposit Management</h2>
                 <button
                   onClick={() => setCurrentPage('dashboard')}
                   className="text-sm text-gray-600 hover:text-gray-800 font-medium"
@@ -1095,15 +1103,15 @@ export function Admin() {
                       <div className="flex flex-wrap gap-3">
                         <div className="bg-green-50 border border-green-200 rounded-lg px-4 py-2">
                           <div className="text-xs text-gray-600">Total Pot</div>
-                          <div className="text-lg font-bold text-green-600">{formatBnb(game.total_pot)} BNB</div>
+                          <div className="text-lg font-bold text-green-600">{formatBirr(game.total_pot)} {CURRENCY_LABEL}</div>
                         </div>
                         <div className="bg-blue-50 border border-blue-200 rounded-lg px-4 py-2">
                           <div className="text-xs text-gray-600">Winner Prize (80%)</div>
-                          <div className="text-lg font-bold text-blue-600">{formatBnb(game.winner_prize)} BNB</div>
+                          <div className="text-lg font-bold text-blue-600">{formatBirr(game.winner_prize)} {CURRENCY_LABEL}</div>
                         </div>
                         <div className="bg-gray-50 border border-gray-200 rounded-lg px-4 py-2">
                           <div className="text-xs text-gray-600">Stake Per Player</div>
-                          <div className="text-lg font-bold text-gray-600">{formatBnb(game.stake_amount)} BNB</div>
+                          <div className="text-lg font-bold text-gray-600">{formatBirr(game.stake_amount)} {CURRENCY_LABEL}</div>
                         </div>
                       </div>
                     </div>
