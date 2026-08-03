@@ -201,27 +201,29 @@ data "aws_iam_policy_document" "github_deploy" {
     }
   }
 
-  statement {
-    sid    = "SpaPublish"
-    effect = "Allow"
-    actions = [
-      "s3:ListBucket",
-      "s3:GetObject",
-      "s3:PutObject",
-      "s3:DeleteObject",
-    ]
-    resources = [
-      "arn:${local.partition}:s3:::${var.spa_bucket_name}",
-      "arn:${local.partition}:s3:::${var.spa_bucket_name}/*",
-    ]
-  }
-
-  statement {
-    sid       = "CdnInvalidate"
-    effect    = "Allow"
-    actions   = ["cloudfront:CreateInvalidation", "cloudfront:GetInvalidation"]
-    resources = ["*"]
-  }
+  # SpaPublish AND CdnInvalidate WERE HERE, and both were grants to an
+  # architecture this project chose not to build.
+  #
+  # They date from a design where the SPA lived in S3 behind CloudFront. That was
+  # deliberately abandoned -- see the comment on the app.<domain> block in
+  # services/caddy/Caddyfile: the build is baked into the Caddy image and served
+  # from the instance, because putting CloudFront behind Cloudflare is a second
+  # CDN in front of the first.
+  #
+  # So the bucket named by spa_bucket_name has never existed in any environment,
+  # and there is no CloudFront distribution to invalidate. Confirmed by listing
+  # the account: two buckets, the CloudTrail one and the Terraform state one.
+  #
+  # A grant to a resource that does not exist is not harmless, it is DORMANT.
+  # `cloudfront:CreateInvalidation` was on "*" -- no distribution constrains it
+  # because there are none -- so the day somebody adds a distribution for an
+  # unrelated reason, the deploy role can already invalidate it, and nobody
+  # decided that. The S3 statement is the same shape: it names a bucket by a
+  # predictable, account-scoped pattern, and whoever creates a bucket at that
+  # name inherits a writer.
+  #
+  # Reinstate them in the change that actually introduces S3 + CloudFront, if it
+  # ever happens, rather than leaving them ahead of it.
 
   # ---------------------------------------------------------------------
   # Parameter Store
