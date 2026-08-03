@@ -97,6 +97,17 @@ module "rds" {
   # Modifications wait for the maintenance window rather than interrupting play.
   apply_immediately = false
 
+  # REQUIRES A PAID ACCOUNT PLAN. On the FREE plan this account is currently on,
+  # any value above 1 is refused outright:
+  #
+  #   FreeTierRestrictionError: The specified backup retention period exceeds
+  #   the maximum available to free tier customers.
+  #
+  # Measured against the live dev instance, which is on the same account, so it
+  # will fail here too. Left at 7 deliberately rather than lowered to match dev:
+  # prod is not applyable today for other reasons, and quietly weakening the
+  # ledger's recovery window to make a plan succeed would be the wrong direction
+  # to resolve the conflict. Upgrade the plan before the first prod apply.
   backup_retention_period = 7
 
   # Stage 2 upgrade: multi_az = true (roughly doubles the instance cost).

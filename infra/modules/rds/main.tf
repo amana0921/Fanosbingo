@@ -89,6 +89,40 @@ resource "aws_db_parameter_group" "this" {
   }
 }
 
+# ---------------------------------------------------------------------------
+# Where the exported logs land
+#
+# RDS creates /aws/rds/instance/<identifier>/<type> ITSELF the first time it has
+# something to write there, and the group it creates has NO RETENTION and no
+# customer key. That is not a default anybody chose -- it is what you get by
+# saying nothing.
+#
+# Found by listing the account rather than reading the code: /ecs/fanosbingo-dev
+# was 7 days and /aws/cloudtrail/fanosbingo was 14, while
+# /aws/rds/instance/fanosbingo-dev-pg/postgresql had `retentionInDays: None`.
+# Never expires, and log_min_duration_statement = 1000 above means it grows
+# every time the database is slow. It is also the one log group holding query
+# text from the database that holds player balances, and it was the only one not
+# encrypted with this environment's CMK.
+#
+# Declaring the groups here takes ownership: retention and encryption become
+# properties of the environment rather than of whichever service happened to
+# create the group first.
+#
+# ORDER MATTERS. These must exist before the instance starts exporting, or RDS
+# wins the race and creates them unmanaged -- hence the depends_on below. On an
+# environment where RDS already made them, adopt them with an import block in
+# the environment root; see infra/environments/dev/main.tf.
+resource "aws_cloudwatch_log_group" "exports" {
+  for_each = toset(var.enabled_cloudwatch_logs_exports)
+
+  name              = "/aws/rds/instance/${var.name_prefix}-pg/${each.value}"
+  retention_in_days = var.log_retention_days
+  kms_key_id        = var.kms_key_arn
+
+  tags = merge(var.tags, { Name = "${var.name_prefix}-pg-${each.value}-logs" })
+}
+
 resource "aws_db_instance" "this" {
   identifier     = "${var.name_prefix}-pg"
   engine         = "postgres"
@@ -138,7 +172,11 @@ resource "aws_db_instance" "this" {
 
   # Surface Postgres logs in CloudWatch so slow queries and errors are visible
   # without shelling into anything.
-  enabled_cloudwatch_logs_exports = ["postgresql", "upgrade"]
+  enabled_cloudwatch_logs_exports = var.enabled_cloudwatch_logs_exports
 
   tags = merge(var.tags, { Name = "${var.name_prefix}-pg" })
+
+  # So the managed groups above win the race against RDS creating its own
+  # unretained ones. See the comment on aws_cloudwatch_log_group.exports.
+  depends_on = [aws_cloudwatch_log_group.exports]
 }
