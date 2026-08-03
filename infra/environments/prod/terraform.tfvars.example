@@ -22,3 +22,26 @@ alert_emails = ["amanaman091451@gmail.com"]
 # Leave false. scripts/bootstrap-aws.sh creates the OIDC provider, and Terraform
 # authenticates through it — so Terraform cannot be what creates it.
 create_github_oidc_provider = false
+
+# A SECOND alerting channel, on a second device, so "a player is owed money and
+# nobody has paid them" is not an email and nothing else.
+#
+# LEAVE THIS EMPTY HERE. This file is COMMITTED -- .gitignore excludes *.tfvars
+# but explicitly re-includes *.tfvars.example -- and a phone number is personal
+# data that does not belong in a repository. It is also not the number's value
+# that is sensitive so much as its permanence: a committed number stays in the
+# history after the person changes it.
+#
+# CI reads it from the ALERT_SMS_NUMBERS repository SECRET and passes it as
+# TF_VAR_alert_sms_numbers. A secret rather than a variable because GitHub masks
+# secrets in job logs and does not mask variables. See .github/workflows/terraform.yml.
+#
+# Locally, put the real number in terraform.tfvars, which IS gitignored:
+#
+#   alert_sms_numbers = ["+2517XXXXXXXX"]
+#
+# SMS subscriptions need no confirmation click, so a wrong number fails silently
+# forever. Prove delivery rather than assuming it:
+#
+#   ./scripts/verify-alarms.sh <env> --fire <alarm-name>
+alert_sms_numbers = []

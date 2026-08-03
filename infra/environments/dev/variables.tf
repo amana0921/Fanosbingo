@@ -110,3 +110,15 @@ variable "manage_cloudflare" {
   type        = bool
   default     = true
 }
+
+variable "alert_sms_numbers" {
+  description = <<-EOT
+    E.164 numbers for a SECOND alerting channel, e.g. ["+251911234567"].
+
+    Empty means every alarm -- including "money owed to a player" -- reaches one
+    email inbox and nothing else. See modules/monitoring/variables.tf for the
+    SNS SMS caveats that are not visible from a clean apply.
+  EOT
+  type        = list(string)
+  default     = []
+}

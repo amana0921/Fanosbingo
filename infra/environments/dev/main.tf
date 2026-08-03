@@ -357,10 +357,28 @@ module "monitoring" {
   # watches nothing. Sourced from iam rather than restated, so it cannot drift.
   metric_namespace = module.iam.metric_namespace
 
+  # The external health check probes api.<domain_name>. Passed from the same
+  # variable the app_stack and cloudflare modules use, so the thing being checked
+  # cannot drift from the thing being served.
+  #
+  # ON here, unlike prod, for the reason the rds block above spells out: this
+  # environment is what api.<domain> actually resolves to, so this is where a
+  # player-visible outage happens.
+  domain_name                  = var.domain_name
+  enable_external_health_check = true
+
   alert_emails = var.alert_emails
 
-  # Dev should be near-free most of the time, since it only exists while you are
-  # actively testing. A sustained spend here means you forgot to destroy it.
+  # Second channel, second device. Empty until a number is set in tfvars --
+  # see the variable for why an empty list is a known gap and not a choice.
+  alert_sms_numbers = var.alert_sms_numbers
+
+  # $10 is a testing ceiling and this environment stopped being a testing
+  # environment -- it is what serves players. Left as it is on purpose, though:
+  # the current footprint bills nothing like $10, so the headroom is real, and a
+  # low ceiling on the environment that must not surprise anybody is the right
+  # direction to be wrong in. Raise it when prod exists and this is disposable
+  # again, not before.
   monthly_budget_usd   = 10
   alert_thresholds_usd = [3, 6]
 
