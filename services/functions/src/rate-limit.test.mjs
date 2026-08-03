@@ -17,7 +17,7 @@
  * Run: node src/rate-limit.test.mjs
  */
 
-import { createRateLimiter } from './rate-limit.js';
+import { createRateLimiter, limitByPlayer } from './rate-limit.js';
 
 let failures = 0;
 const check = (label, cond) => {
@@ -157,6 +157,81 @@ console.log('\ncreateRateLimiter');
   // Without a limiter the behaviour is unchanged, so this stays optional.
   const noLimiter = await authenticateTelegram(pool, initData, BOT_TOKEN, 'sekret');
   check('omitting the limiter leaves authentication working', noLimiter.ok === true);
+}
+
+// --- limitByPlayer, the middleware over the authenticated routes ----------
+//
+// What is being asserted here is not "it returns 429". It is the three
+// properties that decide whether this can be trusted in front of a route that
+// spends money:
+//
+//   - it keys on the PROVEN uid, so one player's flood cannot spend another's
+//     budget -- the same property the auth limiter has, one layer up
+//   - a request with no req.auth is REFUSED, not waved through. A limiter that
+//     silently stops limiting when it is mounted wrong is worse than none,
+//     because the wiring mistake never surfaces
+//   - `next` is called exactly once on the allowed path, so the handler behind
+//     it runs once and only once
+{
+  console.log('\nlimitByPlayer');
+
+  /** Minimal Express double: records status, body and headers. */
+  const makeRes = () => {
+    const res = {
+      statusCode: null,
+      body: null,
+      headers: {},
+      set(k, v) {
+        res.headers[k] = v;
+        return res;
+      },
+      status(c) {
+        res.statusCode = c;
+        return res;
+      },
+      json(b) {
+        res.body = b;
+        return res;
+      },
+    };
+    return res;
+  };
+
+  const makeReq = (uid) => ({ auth: uid ? { uid } : undefined, log: { warn() {}, error() {} } });
+
+  const run = (mw, req) => {
+    const res = makeRes();
+    let nexts = 0;
+    mw(req, res, () => nexts++);
+    return { res, nexts };
+  };
+
+  {
+    const mw = limitByPlayer({ limiter: createRateLimiter({ limit: 2, windowMs: 60_000 }), name: 't' });
+    const a = run(mw, makeReq('uid-a'));
+    const b = run(mw, makeReq('uid-a'));
+    const c = run(mw, makeReq('uid-a'));
+
+    check('passes requests inside the budget to the handler', a.nexts === 1 && b.nexts === 1);
+    check('the one past the budget never reaches the handler', c.nexts === 0);
+    check('and is answered 429', c.res.statusCode === 429);
+    check('with a Retry-After header a client can act on', Number(c.res.headers['Retry-After']) >= 1);
+    check('and a retry_after_seconds in the body', c.res.body?.retry_after_seconds >= 1);
+
+    // The property that matters most: one player exhausting their budget must
+    // not touch anybody else's.
+    const other = run(mw, makeReq('uid-b'));
+    check('a different uid has its own budget', other.nexts === 1 && other.res.statusCode === null);
+  }
+
+  {
+    const mw = limitByPlayer({ limiter: createRateLimiter({ limit: 5, windowMs: 60_000 }), name: 't' });
+    const noAuth = run(mw, makeReq(null));
+
+    check('an unauthenticated request is refused, not waved through', noAuth.nexts === 0);
+    check('and it is a 500 -- reaching here without req.auth is a wiring bug', noAuth.res.statusCode === 500);
+    check('which does not leak the reason to the caller', noAuth.res.body?.error === 'internal error');
+  }
 }
 
 console.log(failures ? `\n${failures} assertion(s) failed.` : '\nAll assertions passed.');

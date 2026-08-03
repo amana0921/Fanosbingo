@@ -150,3 +150,70 @@ export function createRateLimiter({ limit = 10, windowMs = 60_000, maxKeys = 10_
     },
   };
 }
+
+/**
+ * Express middleware applying a limiter to an ALREADY AUTHENTICATED route.
+ *
+ * WHAT THIS IS FOR, and it is not authentication abuse.
+ *
+ * /auth/telegram was the only route on this service with any limit at all, on
+ * the reasoning that it is the only unauthenticated one. That reasoning covers
+ * who may call, and misses what a caller may then do: a token lives fifteen
+ * minutes, and for those fifteen minutes /select-card, /claim-bingo,
+ * /deselect-card, /deposits/claim and /withdrawals/request accepted work as fast
+ * as one client could send it.
+ *
+ * The authorization is sound -- db/20-post/004 revoked EXECUTE on the
+ * money-moving functions from anon and authenticated, so none of this is a path
+ * to spending somebody else's balance. The exposure is RESOURCE, not privilege:
+ * `pool` here is max 5, on a t4g.small shared with four other containers, and
+ * every one of these routes takes a connection and most take a row lock. One
+ * authenticated player looping /withdrawals/request exhausts the pool, and what
+ * fails is not their request -- it is everybody's, including the ticker's own
+ * queries. The same shape as the Caddy `unhealthy_status 5xx` incident the
+ * Caddyfile documents: one caller, no credentials worth having, everyone down.
+ *
+ * KEYED ON req.auth.uid. The uuid comes from a verified JWT, so it identifies
+ * one player and cannot be forged, and it inherits the whole argument in this
+ * file's header for why an identity beats an IP against carrier-NAT.
+ *
+ * MUST BE MOUNTED AFTER requireAuth. Without req.auth there is no key, and
+ * rather than silently letting the request through -- a limiter that quietly
+ * stops limiting is worse than none -- this answers 500, because reaching it
+ * unauthenticated means the route is wired wrong.
+ *
+ * @param {object}   opts
+ * @param {{check: (key: string) => {allowed: boolean, retryAfterSeconds: number}}} opts.limiter
+ * @param {string}   opts.name  identifies the limiter in the log, so a 429 says
+ *                              WHICH budget was spent rather than just that one was
+ */
+export function limitByPlayer({ limiter, name }) {
+  return function rateLimitByPlayer(req, res, next) {
+    const uid = req.auth?.uid;
+
+    if (!uid) {
+      req.log?.error?.({ event: 'rate_limit_misconfigured', limiter: name });
+      return res.status(500).json({ error: 'internal error' });
+    }
+
+    const result = limiter.check(uid);
+
+    if (result.allowed) return next();
+
+    // Answered as 429 with Retry-After for the same reason /auth/telegram is:
+    // a client told "failed" retries immediately and adds load, where one told
+    // to wait can. Nothing is leaked -- the caller already proved who they are.
+    req.log?.warn?.({
+      event: 'rate_limited',
+      limiter: name,
+      uid,
+      retry_after_seconds: result.retryAfterSeconds,
+    });
+
+    res.set('Retry-After', String(result.retryAfterSeconds));
+    return res.status(429).json({
+      error: 'too many requests',
+      retry_after_seconds: result.retryAfterSeconds,
+    });
+  };
+}
