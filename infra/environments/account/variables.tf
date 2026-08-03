@@ -39,3 +39,32 @@ variable "alert_emails" {
     error_message = "At least one address, or the detections have nowhere to report to."
   }
 }
+
+variable "monthly_account_budget_usd" {
+  description = <<-EOT
+    Ceiling for the WHOLE account, untagged and unfiltered.
+
+    Deliberately above the sum of the per-environment budgets (dev $10, prod
+    $32), because it also covers what a tag filter structurally cannot see:
+    data transfer, KMS requests, the CloudTrail and Terraform state buckets, and
+    anything created outside Terraform. Set so that crossing it means something
+    is genuinely wrong, not that both environments are merely running.
+  EOT
+  type        = number
+  default     = 50
+}
+
+variable "account_alert_thresholds_usd" {
+  description = <<-EOT
+    Absolute dollar amounts at which to notify, expressed against
+    monthly_account_budget_usd. Two is enough: one that means "look at this
+    week", one that means "act today".
+  EOT
+  type        = list(number)
+  default     = [30, 42]
+
+  validation {
+    condition     = length(var.account_alert_thresholds_usd) > 0
+    error_message = "At least one threshold, or the budget only ever reports after the fact."
+  }
+}
