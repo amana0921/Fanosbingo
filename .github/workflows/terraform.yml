@@ -7,9 +7,16 @@ name: Terraform
 #                    AND by the PROD_APPLY_ENABLED repository variable
 #   Manual        -> plan / apply / destroy any environment on demand
 #
-# Dev is deliberately NOT applied on merge: it is on-demand infrastructure, stood
-# up to test something and destroyed afterwards. Leaving it running would roughly
-# double the monthly bill.
+# Dev is deliberately NOT applied on merge. The reason USED TO BE that it is
+# on-demand infrastructure, stood up to test something and destroyed afterwards.
+# That is no longer what dev is: prod has never been applied, and dev is what
+# api.<domain> resolves to and what holds real player balances. So the reason is
+# now the stronger one -- an unreviewed merge should not roll straight onto the
+# environment players are using.
+#
+# The destroy job's guards were written around the old assumption and have been
+# corrected; see the comment there. Until cutover, read every "dev" below as
+# "the live environment".
 #
 # `account` is the third root: CloudTrail and the account-wide guardrails. It is
 # a singleton, applied on demand, and never targeted by a merge.
@@ -50,6 +57,11 @@ on:
         type: choice
         options: [plan, apply, destroy]
         default: plan
+      confirm:
+        description: 'destroy ONLY: type the environment name to confirm'
+        required: false
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -477,13 +489,52 @@ jobs:
     env:
       TF_DIR: infra/environments/${{ needs.resolve.outputs.environment }}
     steps:
+      # ---------------------------------------------------------------------
+      # THE ENVIRONMENT NAME IS NOT WHAT MAKES SOMETHING PRODUCTION.
+      #
+      # The two refusals below were written around an assumption that was true
+      # when it was written and is not true now: that prod holds the money and
+      # dev is scratch. Prod has never been applied -- the state bucket holds
+      # `account/` and `dev/` and nothing else -- so the environment carrying
+      # real player balances, and the one https://api.<domain> resolves to, is
+      # DEV. It was the one environment this job would destroy without argument.
+      #
+      # That is a single dropdown selection away from ending the live game. RDS
+      # deletion protection (see infra/environments/dev/main.tf) means the
+      # database itself now survives, but `terraform destroy -auto-approve` does
+      # not stop at the first failure in a useful way: the VPC, the Elastic IP,
+      # the ECS cluster, the Cloudflare records and the ECR repositories (dev has
+      # force_delete = true) all go, and what is left is a protected database
+      # nothing can reach and a half-destroyed state file.
+      #
+      # So the guard is derived from the DATABASE rather than from a hardcoded
+      # list of names. deletion_protection is the flag somebody sets when they
+      # decide an environment holds something worth keeping, which makes it the
+      # honest answer to "is this production" -- and it keeps being the honest
+      # answer after a cutover renames which environment that is, without anyone
+      # remembering to come back here.
+      # ---------------------------------------------------------------------
+      - name: Require the environment name to be typed
+        env:
+          TARGET: ${{ needs.resolve.outputs.environment }}
+          CONFIRM: ${{ github.event.inputs.confirm }}
+        run: |
+          if [ "$CONFIRM" != "$TARGET" ]; then
+            echo "::error::Destroy not confirmed."
+            echo "Selecting an environment from a dropdown is too easy to do by"
+            echo "accident for an action that is not reversible. Re-run and type"
+            echo "'$TARGET' into the confirm field."
+            exit 1
+          fi
+          echo "Destroy of '$TARGET' confirmed by name."
+
       - name: Refuse to destroy prod
         if: needs.resolve.outputs.environment == 'prod'
         run: |
           echo "::error::Refusing to destroy prod from CI."
-          echo "Prod holds player balances and a funded hot wallet. If you genuinely"
-          echo "mean to tear it down, do it deliberately from a workstation after"
-          echo "taking a final snapshot and sweeping the wallet."
+          echo "Prod is intended to hold player balances and a funded hot wallet."
+          echo "If you genuinely mean to tear it down, do it deliberately from a"
+          echo "workstation after taking a final snapshot and sweeping the wallet."
           exit 1
 
       - name: Refuse to destroy the account baseline
@@ -509,6 +560,64 @@ jobs:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
           role-session-name: tf-destroy-${{ github.run_id }}
+
+      # The real gate. See the comment above the confirmation step for why this
+      # asks the database rather than checking a list of environment names.
+      #
+      # THREE OUTCOMES, and the third is the one worth being careful about:
+      #
+      #   protected      refuse. Somebody decided this database holds something.
+      #   not protected  proceed. This is a scratch environment.
+      #   NO DATABASE    proceed, and say so. An environment that was never
+      #                  applied, or is already partly torn down, has nothing to
+      #                  protect -- and failing here would make a half-destroyed
+      #                  environment impossible to finish cleaning up, which is
+      #                  the state somebody is most likely to be in when they
+      #                  reach for destroy.
+      - name: Refuse to destroy an environment whose database is protected
+        env:
+          TARGET: ${{ needs.resolve.outputs.environment }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
+        run: |
+          set -euo pipefail
+
+          if [ "$TARGET" = "account" ]; then
+            echo "The account root has no database; the refusal below covers it."
+            exit 0
+          fi
+
+          DB_ID="fanosbingo-${TARGET}-pg"
+
+          # `|| true` so a genuinely absent instance is distinguished from an API
+          # failure: DBInstanceNotFound writes nothing to stdout and we proceed,
+          # while a credential or throttling error is caught by the empty-output
+          # check being paired with a non-empty stderr in the log.
+          PROTECTED="$(aws rds describe-db-instances \
+            --db-instance-identifier "$DB_ID" \
+            --query 'DBInstances[0].DeletionProtection' \
+            --output text 2>/dev/null || true)"
+
+          if [ -z "$PROTECTED" ] || [ "$PROTECTED" = "None" ]; then
+            echo "No database found at $DB_ID. Nothing to protect; proceeding."
+            exit 0
+          fi
+
+          if [ "$PROTECTED" = "True" ]; then
+            echo "::error::Refusing to destroy '$TARGET': $DB_ID has deletion protection ON."
+            echo ""
+            echo "That flag is how an environment says it holds something worth keeping,"
+            echo "and it is set on whichever environment is actually serving players --"
+            echo "which is not always the one called prod. Destroying around a protected"
+            echo "database does not spare the game: the VPC, the Elastic IP, the ECS"
+            echo "cluster and the DNS records all go, and the database survives with"
+            echo "nothing able to reach it."
+            echo ""
+            echo "If you genuinely mean this, turn deletion protection off as its own"
+            echo "change, with its own plan and its own review, and run this again."
+            exit 1
+          fi
+
+          echo "$DB_ID has deletion protection off. Treating '$TARGET' as scratch; proceeding."
 
       - name: Terraform init
         working-directory: ${{ env.TF_DIR }}
