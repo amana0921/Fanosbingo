@@ -321,6 +321,70 @@ until somebody reads the dashboard analytics.
 served from that instance, so a replacement blanks it for anyone who misses
 Cloudflare's cache.
 
+### Because dev is the live environment, dev now carries prod's protections
+
+This section of the README has said since 2026-08-01 that dev holds real player
+money and prod has never been applied. The **configuration had not caught up with
+that sentence**, which is a different failure from not knowing:
+
+- `infra/environments/dev/main.tf` still read `deletion_protection = false`,
+  `skip_final_snapshot = true`, under a comment saying dev is disposable. The
+  environment holding real balances was the one set up to be deleted without a
+  final snapshot. **Deletion protection is now ON** — set directly on the live
+  instance on 2026-08-03, not merely declared — and a final snapshot is required.
+
+> **The 24-hour recovery window could not be closed, and this is the reason.**
+> Raising `backup_retention_period` above 1 is refused by the account plan:
+>
+> ```
+> FreeTierRestrictionError: The specified backup retention period exceeds the
+> maximum available to free tier customers. Upgrade your account plan.
+> ```
+>
+> Retried with 2 and refused identically — the ceiling is exactly 1. So **the
+> real RPO on real player money is 24 hours**, and no Terraform change alters
+> that. It is a billing decision: `aws freetier get-account-plan-state` reports
+> `FREE / ACTIVE`, **$154.48 credits remaining, expiring 2027-01-14**. On a Free
+> plan, exhausting credits *suspends* resources rather than billing for them — so
+> a real-money game is currently scheduled to stop on a date nobody chose.
+> Upgrading to Paid lifts the cap and removes the suspension risk in one step.
+- `terraform.yml`'s destroy job refused `prod` and `account` and waved `dev`
+  through, on the same assumption. Destroy now requires the environment name to
+  be **typed**, and refuses any environment whose database has deletion
+  protection on — a check that follows where the money is rather than which name
+  somebody chose, so it stays correct after cutover without being revisited.
+- Nothing checked the site was reachable **from outside AWS**. Every alarm read a
+  metric published from inside it, so a failed Elastic IP re-association — the
+  documented recovery path after an instance replacement, which only `echo`s on
+  failure — leaves every alarm green while no player can connect. There is now a
+  Route 53 health check on `api.<domain>/healthz`. It creates no DNS; Cloudflare
+  stays authoritative.
+- The `$10` budget could not have alerted regardless of its threshold: the
+  `Environment` cost allocation tag was **Inactive**, and Budgets cannot filter
+  on an unactivated tag. `infra/environments/account` now activates it and adds
+  an unfiltered account-wide budget, because a tag filter cannot see data
+  transfer, KMS requests, or the two `Scope=account` buckets.
+- Only `/auth/telegram*` was rate limited. Every authenticated route — including
+  `/deposits/claim` and `/withdrawals/request` — accepted work as fast as one
+  client could send it, against a connection pool of five. Per-player limits now
+  cover them, keyed on the verified uid.
+
+**Deferred by decision, not oversight:**
+
+- **GuardDuty is off, on cost.** It is the detection that would catch credential
+  misuse — including of the admin IAM user below, which every control in
+  `infra/environments/account` is bypassed by. At this footprint it is a few
+  dollars a month, which is real against a $10 budget on an account currently
+  billing ~$0. Revisit when the budget has room; it is a one-resource change.
+- **The `AdministratorAccess` IAM user is untouched.** Worth periodically
+  checking what `aws iam get-credential-report` says about its MFA state, since
+  it is the shortest path around everything else here.
+
+**Still open:** SMS alerting is wired but delivers nothing until the
+`ALERT_SMS_NUMBERS` repository secret is set — and because an SNS SMS
+subscription needs no confirmation click, a wrong number fails silently forever.
+Prove it with `./scripts/verify-alarms.sh dev --fire fanosbingo-dev-game-loop-stalled`.
+
 ---
 
 ## Overview
