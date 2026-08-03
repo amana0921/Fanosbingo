@@ -110,13 +110,102 @@ module "rds" {
   security_group_id = module.security_groups.rds_security_group_id
   kms_key_arn       = module.kms.main_key_arn
 
-  # Dev is disposable: allow destroy without ceremony. Prod inverts all three.
-  deletion_protection = false
-  skip_final_snapshot = true
-  apply_immediately   = true
+  # DEV IS NOT DISPOSABLE. It is the production database.
+  #
+  # These four used to read false / true / true / 1, under the comment "Dev is
+  # disposable: allow destroy without ceremony. Prod inverts all three." That
+  # was true when it was written and stopped being true the moment players
+  # arrived, which nothing here noticed.
+  #
+  # What is actually the case, verified in the account rather than read from a
+  # document: the state bucket holds `account/` and `dev/` and nothing else, and
+  # https://api.<domain>/healthz is answered by fanosbingo-dev. Prod has never
+  # been applied. So the environment carrying real player balances was the one
+  # configured to be deleted without a final snapshot and to keep 24 hours of
+  # point-in-time recovery.
+  #
+  # The prod root's protections are correct and protect nothing while prod does
+  # not exist. Until the cutover happens, THIS root is the one that needs them,
+  # so it now carries prod's values verbatim:
+  #
+  #   deletion_protection  the RDS API refuses a delete outright. Terraform
+  #                        cannot destroy this instance, deliberately -- a
+  #                        `terraform destroy` here now fails loudly instead of
+  #                        succeeding quietly. Turning it off is its own change
+  #                        with its own plan, which is the point.
+  #   skip_final_snapshot  a delete that somehow gets past the above still
+  #                        leaves a snapshot behind.
+  #   apply_immediately    schema and parameter changes wait for the maintenance
+  #                        window (Tue 02:30 UTC) rather than interrupting play.
+  #
+  # deletion_protection IS ALREADY TRUE ON THE LIVE INSTANCE. It was set out of
+  # band on 2026-08-03 rather than waiting for an apply, because it is a
+  # control-plane flag -- instant, no downtime, instantly reversible -- and it
+  # was the one thing standing between a stray destroy and the balance ledger.
+  # This declaration now matches reality rather than proposing it.
+  deletion_protection = true
+  skip_final_snapshot = false
+  apply_immediately   = false
 
-  # Shorter retention in dev — PITR here is a convenience, not a safety net.
+  # ONE DAY, AND IT IS NOT A CHOICE. THE ACCOUNT PLAN FORBIDS MORE.
+  #
+  # This read `= 7` for about an hour, to match prod, on the reasoning that the
+  # environment holding real balances should not have a 24-hour recovery window.
+  # That reasoning is right and the value was still wrong, because it cannot be
+  # applied:
+  #
+  #   aws rds modify-db-instance --backup-retention-period 7 --apply-immediately
+  #   An error occurred (FreeTierRestrictionError):
+  #     The specified backup retention period exceeds the maximum available to
+  #     free tier customers. To remove all limitations, upgrade your account plan.
+  #
+  # Retried with 2 and refused identically, so the ceiling is exactly 1. Had this
+  # been left at 7 it would not have failed quietly -- it would have failed the
+  # whole `terraform apply`, and the first anyone knew of it would have been a
+  # red pipeline on an unrelated change.
+  #
+  #   aws freetier get-account-plan-state
+  #   { accountPlanType: FREE, accountPlanStatus: ACTIVE,
+  #     accountPlanRemainingCredits: 154.48 USD,
+  #     accountPlanExpirationDate: 2027-01-14 }
+  #
+  # SO THE REAL RPO ON REAL PLAYER MONEY IS 24 HOURS, and no amount of Terraform
+  # changes that. The fix is a billing decision, not a code one: upgrading to a
+  # Paid account plan lifts the cap, and this line becomes 7 in the same change.
+  #
+  # That upgrade is worth doing for a second reason the monitoring module already
+  # documents from the other side -- on a FREE plan, exhausting credits SUSPENDS
+  # resources rather than billing for them. With $154.48 left and a 2027-01-14
+  # expiry, a real-money game is currently scheduled to be suspended on a date
+  # nobody chose. The account-wide budget added in infra/environments/account is
+  # what makes the credit burn visible before then.
   backup_retention_period = 1
+}
+
+# Adopt the log group RDS already created for itself.
+#
+# The rds module now declares its export log groups so retention and encryption
+# are chosen rather than inherited. This instance predates that, so RDS made
+# /aws/rds/instance/fanosbingo-dev-pg/postgresql on its own -- with no retention
+# at all -- and a plain create would fail with ResourceAlreadyExistsException.
+#
+# ONLY postgresql. The `upgrade` group does not exist in the account: nothing has
+# triggered a version upgrade yet, and RDS creates each group lazily on first
+# write. An import block for an absent resource fails the whole plan, so that one
+# is left to be created normally.
+#
+# Verified before writing this, rather than assumed:
+#
+#   aws logs describe-log-groups --log-group-name-prefix /aws/rds/instance/
+#     -> /aws/rds/instance/fanosbingo-dev-pg/postgresql   retentionInDays: None
+#
+# Safe to leave here permanently: once the resource is in state Terraform treats
+# the block as satisfied and does nothing. Remove it whenever this environment is
+# next rebuilt from scratch, at which point the group will be Terraform's from
+# the start.
+import {
+  to = module.rds.aws_cloudwatch_log_group.exports["postgresql"]
+  id = "/aws/rds/instance/${local.name_prefix}-pg/postgresql"
 }
 
 module "iam" {

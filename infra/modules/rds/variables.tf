@@ -152,6 +152,30 @@ variable "performance_insights_enabled" {
   default     = false
 }
 
+variable "enabled_cloudwatch_logs_exports" {
+  description = <<-EOT
+    Postgres log types exported to CloudWatch. Each one gets a Terraform-managed
+    log group so retention and encryption are set deliberately rather than left
+    at the "never expires, no CMK" group RDS creates on its own.
+
+    Adding a type here creates its group on the next apply. Removing one leaves
+    the group behind on purpose -- the logs already written should outlive the
+    decision to stop writing more.
+  EOT
+  type        = list(string)
+  default     = ["postgresql", "upgrade"]
+}
+
+variable "log_retention_days" {
+  description = <<-EOT
+    Retention for the exported Postgres logs. 7 matches /ecs/<prefix>, which is
+    long enough to investigate an incident over a weekend and short enough that
+    a chatty log_min_duration_statement cannot become a line item.
+  EOT
+  type        = number
+  default     = 7
+}
+
 variable "tags" {
   description = "Tags applied to every resource in this module."
   type        = map(string)
