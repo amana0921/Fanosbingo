@@ -56,7 +56,7 @@ import fs from 'node:fs';
 import { authenticateTelegram, authenticateTelegramWeb, requireAuth } from './auth.js';
 import { verifyChainId, chainName } from './chain.js';
 import { bodyParserErrorHandler } from './http-errors.js';
-import { createRateLimiter } from './rate-limit.js';
+import { createRateLimiter, limitByPlayer } from './rate-limit.js';
 import { createSelectCardHandler } from './select-card.js';
 import { createClaimBingoHandler } from './claim-bingo.js';
 import { createDeselectCardHandler } from './deselect-card.js';
@@ -160,6 +160,64 @@ const authLimiter = createRateLimiter({
   limit: Number(process.env.AUTH_RATE_LIMIT ?? 10),
   windowMs: Number(process.env.AUTH_RATE_WINDOW_MS ?? 60_000),
 });
+
+// Per-player limits on the AUTHENTICATED routes.
+//
+// The limiter above was the only one on this service, on the reasoning that
+// /auth/telegram is the only unauthenticated route. That covers who may call and
+// not what they may then do: a token lives fifteen minutes, and for those
+// fifteen minutes every route below accepted work as fast as one client could
+// send it, against a pool of five. See limitByPlayer() in src/rate-limit.js for
+// why the exposure is resource exhaustion rather than privilege -- and why the
+// blast radius of one caller doing it is everybody, including the ticker.
+//
+// TWO BUDGETS, because the routes differ by an order of magnitude in what
+// legitimate use looks like:
+//
+//   play    joining, releasing and claiming, plus the available-balance read the
+//           withdrawal form calls. Bursty and legitimate -- a player pressing
+//           join on a lobby that is about to close, or a form re-reading a
+//           balance -- so this is set well above anything a person produces and
+//           only bites a script.
+//
+//   money   filing a deposit claim or requesting a withdrawal. Legitimate use is
+//           once or twice a session, so six a minute is already thirty times
+//           what a person does, and it is the tighter of the two because these
+//           are the rows an operator has to read and act on by hand. A flood
+//           here does not just cost connections, it costs the queue that
+//           OldestPendingDepositMinutes alarms on.
+//
+// Overridable by environment variable rather than baked in, matching the auth
+// limiter: changing a threshold should not need a Terraform apply, and there is
+// nothing secret about the numbers.
+//
+// SINGLE PROCESS, IN MEMORY, and the same Stage 2 caveat applies as to the auth
+// limiter above -- two instances would each permit the full budget. At one
+// instance and one container it is exact.
+const playLimiter = createRateLimiter({
+  limit: Number(process.env.PLAY_RATE_LIMIT ?? 30),
+  windowMs: Number(process.env.PLAY_RATE_WINDOW_MS ?? 60_000),
+});
+
+const moneyLimiter = createRateLimiter({
+  limit: Number(process.env.MONEY_RATE_LIMIT ?? 6),
+  windowMs: Number(process.env.MONEY_RATE_WINDOW_MS ?? 60_000),
+});
+
+const limitPlay = limitByPlayer({ limiter: playLimiter, name: 'play' });
+const limitMoney = limitByPlayer({ limiter: moneyLimiter, name: 'money' });
+
+// NOT APPLIED TO /admin/*, deliberately.
+//
+// An admin is a flag on a row, held by one or two people, and the work they do
+// is a BACKLOG: approving fourteen deposits that accumulated overnight is
+// exactly the burst any threshold worth having would block. Throttling that
+// produces the failure the deposit alarm exists to catch -- a queue nobody can
+// clear -- in the name of preventing a caller who already has the operator's
+// token, at which point rate limiting is not the problem they present.
+//
+// The population is small enough that the honest control is the audit trail:
+// db/20-post/006 records decided_by on every approval.
 
 const app = express();
 app.disable('x-powered-by');
@@ -377,7 +435,7 @@ app.get('/auth/whoami', requireAuth(JWT_SECRET), (req, res) => {
  * See src/select-card.js for why neither the identity nor the CARD LAYOUT is
  * taken from the request body.
  */
-app.post('/select-card', requireAuth(JWT_SECRET), createSelectCardHandler(pool));
+app.post('/select-card', requireAuth(JWT_SECRET), limitPlay, createSelectCardHandler(pool));
 
 /**
  * POST /claim-bingo  { playerId }  ->  atomic_claim_bingo's result
@@ -390,7 +448,7 @@ app.post('/select-card', requireAuth(JWT_SECRET), createSelectCardHandler(pool))
  * checked to be yours. See src/claim-bingo.js for what claiming on somebody
  * else's behalf would let you do to them.
  */
-app.post('/claim-bingo', requireAuth(JWT_SECRET), createClaimBingoHandler(pool));
+app.post('/claim-bingo', requireAuth(JWT_SECRET), limitPlay, createClaimBingoHandler(pool));
 
 /**
  * POST /deselect-card  { playerId }  ->  release_card's result
@@ -404,7 +462,7 @@ app.post('/claim-bingo', requireAuth(JWT_SECRET), createClaimBingoHandler(pool))
  * db/20-post/011 checks it under a row lock; db/20-post/008 revoked the DELETE
  * privilege that would let a client go around it.
  */
-app.post('/deselect-card', requireAuth(JWT_SECRET), createDeselectCardHandler(pool));
+app.post('/deselect-card', requireAuth(JWT_SECRET), limitPlay, createDeselectCardHandler(pool));
 
 /**
  * Admin.
@@ -446,7 +504,7 @@ app.get('/admin/ping', requireAuth(JWT_SECRET), requireAdmin(pool), (_req, res) 
  * a SELECT policy scoped to player_id = auth.uid(), so the Mini App fetches its
  * history straight from PostgREST.
  */
-app.post('/deposits/claim', requireAuth(JWT_SECRET), createDepositClaimHandler(pool));
+app.post('/deposits/claim', requireAuth(JWT_SECRET), limitMoney, createDepositClaimHandler(pool));
 
 app.get(
   '/admin/deposits',
@@ -488,9 +546,19 @@ app.post(
  * the number the player is shown and the number request_bank_withdrawal()
  * enforces must come from one expression. See src/withdrawals.js.
  */
-app.get('/withdrawals/available', requireAuth(JWT_SECRET), createAvailableBalanceHandler(pool));
+app.get(
+  '/withdrawals/available',
+  requireAuth(JWT_SECRET),
+  limitPlay,
+  createAvailableBalanceHandler(pool),
+);
 
-app.post('/withdrawals/request', requireAuth(JWT_SECRET), createRequestWithdrawalHandler(pool));
+app.post(
+  '/withdrawals/request',
+  requireAuth(JWT_SECRET),
+  limitMoney,
+  createRequestWithdrawalHandler(pool),
+);
 
 app.get(
   '/admin/withdrawals',
