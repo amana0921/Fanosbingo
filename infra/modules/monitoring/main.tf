@@ -19,14 +19,28 @@
  * liveness is asserted here instead, from the outside, on the thing that
  * actually matters.
  *
- * ALARM BUDGET: this module now defines exactly TEN alarms, which is the whole
- * CloudWatch free-tier allowance. There is no headroom left. An eleventh starts
- * costing $0.10/mo -- trivial in isolation, and worth knowing deliberately on a
- * $32 budget where the point is that nothing is billed by accident.
+ * The EXTERNAL health check is the third layer, and it exists because the first
+ * two share a blind spot: both observe the system from inside AWS. Nothing here
+ * used to answer "can a player actually load the site". The instance can be
+ * healthy, the ticker can be calling numbers, every alarm below can read OK, and
+ * the site can be unreachable -- see the comment on the Route 53 check for the
+ * specific way that happens after an instance replacement.
+ *
+ * ALARM BUDGET: this module defines ELEVEN alarms. Ten was the whole CloudWatch
+ * free-tier allowance, so the eleventh costs $0.10/mo, and the health check
+ * itself is $0.75/mo -- the NON-AWS endpoint rate, because the hostname resolves
+ * to Cloudflare rather than to an AWS address. About $0.85 against a $32 budget,
+ * spent deliberately, to cover the only failure mode nothing else can see.
+ *
+ * A previous version of this comment claimed ten alarms fit exactly and left it
+ * there. Two things were already untrue when it was written: the ECS capacity
+ * provider creates two target-tracking alarms of its own
+ * (TargetTracking-<asg>-AlarmHigh/AlarmLow), which bill identically and which
+ * this module does not manage, so the account was at twelve. Counting only what
+ * one file declares is how a budget comment goes stale without anyone lying.
  *
  * If you need another, the honest options are to pay for it, to retire one that
  * has never fired, or to fold two related signals into a metric math alarm.
- * Do not quietly add an eleventh and leave this comment saying it fits.
  */
 
 resource "aws_sns_topic" "alerts" {
@@ -45,6 +59,49 @@ resource "aws_sns_topic_subscription" "email" {
 
   topic_arn = aws_sns_topic.alerts.arn
   protocol  = "email"
+  endpoint  = each.value
+}
+
+# A SECOND CHANNEL, on a second device.
+#
+# Every alarm in this file delivered to exactly one Gmail address, which is one
+# inbox, on one phone, behind one set of push settings. That is fine for the
+# infrastructure alarms -- an RDS CPU credit warning can wait for morning. It is
+# not fine for the three that are about a person waiting:
+#
+#   game-loop-stalled            players are watching a frozen board
+#   deposits-waiting-too-long    a player cannot join a game at all
+#   withdrawals-waiting-too-long money owed to a player
+#
+# The whole argument for those alarms is that a support ticket should have been
+# a page. Email is not a page. It is the same delivery mechanism as everything
+# else in an inbox, and at 03:00 it is indistinguishable from a newsletter.
+#
+# SMS rather than a Telegram message, despite this being a Telegram product,
+# because SNS speaks SMS natively and speaks Telegram not at all -- a Telegram
+# alert needs a Lambda to reshape the SNS envelope into a sendMessage call, and
+# a new function whose own failure is silent is a poor trade for a delivery path
+# that must work when other things do not. Revisit if the operator bot gets
+# built for other reasons; it is then a small addition.
+#
+# THREE THINGS TO KNOW BEFORE SETTING THIS, none of which are visible from a
+# clean apply:
+#
+#   * The default SNS SMS spend limit on a new account is $1/month, and messages
+#     beyond it are DROPPED rather than queued. A handful of alarms a month fits;
+#     raise it through a support request before relying on this for volume.
+#   * Ethiopian (+251) destinations are reachable but may require a registered
+#     origination identity depending on carrier. Confirm delivery with
+#     scripts/verify-alarms.sh --fire rather than assuming.
+#   * Unlike email, an SMS subscription needs no confirmation click -- so it
+#     starts working immediately, and a wrong number fails silently forever.
+#
+# E.164 with the country code, e.g. "+251911234567".
+resource "aws_sns_topic_subscription" "sms" {
+  for_each = toset(var.alert_sms_numbers)
+
+  topic_arn = aws_sns_topic.alerts.arn
+  protocol  = "sms"
   endpoint  = each.value
 }
 
@@ -354,6 +411,137 @@ resource "aws_cloudwatch_metric_alarm" "pending_deposits_stale" {
   alarm_actions      = [aws_sns_topic.alerts.arn]
   ok_actions         = [aws_sns_topic.alerts.arn]
   treat_missing_data = "notBreaching"
+
+  tags = var.tags
+}
+
+# ---------------------------------------------------------------------------
+# Is the site actually reachable?
+#
+# THE BLIND SPOT THIS CLOSES. Every other alarm in this file reads a metric
+# published from inside AWS, about a component. None of them can tell you that a
+# player cannot open the app, because none of them looks from outside.
+#
+# The concrete way that happens, and it is not hypothetical -- it is the
+# documented recovery path:
+#
+#   the ASG replaces the instance (AMI bump, status check failure, refresh)
+#   the new instance boots and runs user_data.sh.tftpl
+#   `aws ec2 associate-address` fails -- a permission change, a throttle, a
+#     transient API error
+#   user_data ECHOES AN ERROR and carries on
+#
+# Now: EC2 status check passes, ECS reports every service running, the ticker
+# holds its advisory lock and keeps calling numbers, SecondsSinceLastNumberCalled
+# stays at 3.5, the game-loop alarm reads OK -- and Cloudflare is still
+# resolving to an Elastic IP attached to nothing. Total outage, every alarm
+# green. The same shape covers an expired Cloudflare Origin Certificate, a Caddy
+# config that fails to load, and a Cloudflare zone setting changed by hand.
+#
+# THIS DOES NOT PUT ANY DNS IN AWS, and the resource name says otherwise loudly
+# enough to be worth answering here.
+#
+# Cloudflare is the authoritative DNS for this domain and stays that way. A
+# Route 53 HEALTH CHECK is a standalone uptime monitor that happens to be sold
+# under the Route 53 brand, because its original purpose was DNS failover --
+# "stop answering with this IP when it stops responding". Used without a record
+# pointing at it, which is how it is used here, it is only a prober and a
+# CloudWatch metric. There is no aws_route53_zone and no aws_route53_record
+# anywhere in this repository; grep for `route53` and this file is the only hit.
+#
+# What the probers actually do is resolve api.<domain> through PUBLIC DNS -- so
+# through Cloudflare, exactly as a player's phone does -- and request /healthz
+# over HTTPS from about fifteen locations. The path under test is therefore
+# Cloudflare DNS -> Cloudflare edge -> the origin lock -> Caddy, which is the
+# whole player path rather than the last hop of it.
+#
+# WHY NOT CLOUDFLARE'S OWN HEALTH CHECKS, which would be the obvious answer:
+# they are a Pro-and-above feature and this zone is on the free plan. The rate
+# limiting block in modules/cloudflare records the same ceiling from the other
+# side -- one rule, one permitted period, both entitlement-gated.
+#
+# The remaining alternatives are worse. A CloudWatch Synthetics canary at a
+# five-minute cadence is roughly $10/mo, a third of this environment's entire
+# budget for a check that answers one boolean. An external service like
+# UptimeRobot is free but delivers to its own inbox, so the one alarm that says
+# "players cannot reach the game" would be the one alarm that does not arrive
+# where every other alarm arrives.
+#
+# /healthz is served by Caddy itself and touches no upstream, so this stays a
+# statement about reachability and does not double as a database check.
+# Readiness has its own endpoint.
+#
+# FIRST THING TO DO AFTER APPLYING THIS: confirm the check reports Healthy.
+#
+#   aws route53 get-health-check-status --health-check-id <id>
+#
+# The zone runs Browser Integrity Check and a rate-limiting rule, and the Route
+# 53 checkers arrive from many addresses at once with a non-browser user agent.
+# If Cloudflare decides to challenge or block them, this alarm becomes a
+# permanent false positive -- which is worse than not having it, because an
+# alarm that is always red is an alarm nobody reads. If that happens, add a
+# Cloudflare skip rule for the checker ranges rather than deleting this.
+# ---------------------------------------------------------------------------
+resource "aws_route53_health_check" "api" {
+  count = var.enable_external_health_check ? 1 : 0
+
+  type = "HTTPS"
+  fqdn = "api.${var.domain_name}"
+  port = 443
+
+  resource_path = var.health_check_path
+
+  # 30s interval, three consecutive failures: roughly 90 seconds to alarm. Fast
+  # enough to matter on a real-money game, slow enough that one slow edge
+  # response does not page anybody.
+  request_interval  = 30
+  failure_threshold = 3
+
+  # Latency measurement is a paid add-on and answers a question this check is
+  # not being asked. Reachability only.
+  measure_latency = false
+
+  # Off for the same reason. The check either completes or it does not.
+  enable_sni = true
+
+  tags = merge(var.tags, { Name = "${var.name_prefix}-api-reachable" })
+}
+
+# us-east-1 ONLY, and this module is already there.
+#
+# Route 53 publishes HealthCheckStatus exclusively to us-east-1 regardless of
+# where anything else lives. An alarm on it created in another region finds no
+# metric and sits at INSUFFICIENT_DATA forever -- silent, in exactly the
+# situation it exists to catch.
+resource "aws_cloudwatch_metric_alarm" "api_unreachable" {
+  count = var.enable_external_health_check ? 1 : 0
+
+  alarm_name        = "${var.name_prefix}-api-unreachable"
+  alarm_description = "api.${var.domain_name}${var.health_check_path} is not answering from outside AWS. Players cannot reach the game, whatever the component alarms say."
+
+  namespace   = "AWS/Route53"
+  metric_name = "HealthCheckStatus"
+  statistic   = "Minimum"
+
+  period              = 60
+  evaluation_periods  = 2
+  datapoints_to_alarm = 2
+  comparison_operator = "LessThanThreshold"
+  threshold           = 1
+
+  dimensions = { HealthCheckId = aws_route53_health_check.api[0].id }
+
+  alarm_actions = [aws_sns_topic.alerts.arn]
+
+  # Recovery is as worth knowing as failure here: this is the alarm that says
+  # the outage is over.
+  ok_actions = [aws_sns_topic.alerts.arn]
+
+  # Same reasoning as the game-loop alarm. A monitor that stops reporting is
+  # indistinguishable, from where the player stands, from the thing it monitors
+  # being down -- and treating absent data as fine is how a check goes quiet in
+  # the one situation it was bought for.
+  treat_missing_data = "breaching"
 
   tags = var.tags
 }

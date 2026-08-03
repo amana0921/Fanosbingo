@@ -232,11 +232,28 @@ module "monitoring" {
   environment = var.environment
   kms_key_arn = module.kms.main_key_arn
 
+  # The external health check probes api.<domain_name>. Passed from the same
+  # variable the app_stack and cloudflare modules use, so the thing being checked
+  # cannot drift from the thing being served.
+  domain_name = var.domain_name
+
+  # OFF until cutover. This root does not own the Cloudflare zone
+  # (manage_cloudflare defaults false), so api.<domain> resolves to DEV's origin.
+  # A health check created here would either report on dev -- an alarm in the
+  # wrong environment's inbox -- or, once prod has its own hostname and before
+  # DNS moves, report Unhealthy from birth. Turn this on in the same change that
+  # moves DNS.
+  enable_external_health_check = false
+
   # Must match the namespace the containers publish to, or the game-loop alarm
   # watches nothing. Sourced from iam rather than restated, so it cannot drift.
   metric_namespace = module.iam.metric_namespace
 
   alert_emails = var.alert_emails
+
+  # Second channel, second device. Empty until a number is set in tfvars --
+  # see the variable for why an empty list is a known gap and not a choice.
+  alert_sms_numbers = var.alert_sms_numbers
 
   # Ceiling of $32 with alerts at $20 and $27, plus a forecast alert. On a
   # credit-based Free Tier plan, exhausting credits on a Free account plan

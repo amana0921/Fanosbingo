@@ -83,6 +83,71 @@ variable "autoscaling_group_name" {
   type        = string
 }
 
+variable "alert_sms_numbers" {
+  description = <<-EOT
+    E.164 phone numbers for a SECOND alerting channel, e.g. ["+251911234567"].
+
+    Empty by default, and the default is a known gap rather than a choice: with
+    it empty, every alarm -- including "money owed to a player" -- reaches one
+    Gmail inbox and nothing else.
+
+    See the comment on aws_sns_topic_subscription.sms for the three things that
+    bite here: the $1/month default spend limit that DROPS messages rather than
+    queueing them, +251 origination requirements, and the fact that an SMS
+    subscription needs no confirmation -- so a mistyped number fails silently
+    forever. Prove delivery with:
+
+      ./scripts/verify-alarms.sh <env> --fire <alarm-name>
+  EOT
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition     = alltrue([for n in var.alert_sms_numbers : can(regex("^\\+[1-9][0-9]{7,14}$", n))])
+    error_message = "Each number must be E.164: a leading +, country code, digits only. A number SNS cannot parse is a subscription that never delivers and never says so."
+  }
+}
+
+variable "domain_name" {
+  description = <<-EOT
+    Apex domain. The external health check probes api.<domain_name>, which is
+    the hostname the Mini App actually calls -- so the check covers DNS, the
+    Cloudflare edge, the origin lock and the origin, not merely the last hop.
+  EOT
+  type        = string
+}
+
+variable "enable_external_health_check" {
+  description = <<-EOT
+    Whether to create the Route 53 health check and its alarm.
+
+    On by default: it is the only signal in this module that looks at the system
+    from where a player stands, and about $0.85/mo all in ($0.75 for the check at
+    the non-AWS endpoint rate, $0.10 for the alarm).
+
+    It creates NO DNS. Cloudflare remains authoritative for the domain -- a
+    Route 53 health check used without a record pointing at it is only a prober
+    and a CloudWatch metric. See the comment on the resource itself.
+
+    Turn it OFF for an environment with no public DNS -- a health check against
+    a hostname that does not resolve reports Unhealthy forever, which is an
+    alarm that cries wolf from the moment it is created.
+  EOT
+  type        = bool
+  default     = true
+}
+
+variable "health_check_path" {
+  description = <<-EOT
+    Path the external check requests. Caddy answers /healthz itself without
+    touching an upstream, which is what keeps this a statement about
+    reachability rather than a second, worse database check -- the functions
+    service has /readyz for that.
+  EOT
+  type        = string
+  default     = "/healthz"
+}
+
 variable "tags" {
   description = "Tags applied to every resource in this module."
   type        = map(string)
