@@ -244,3 +244,99 @@ resource "aws_accessanalyzer_analyzer" "this" {
 
   tags = { Name = "${local.name_prefix}-external-access" }
 }
+
+# ---------------------------------------------------------------------------
+# Cost allocation tags
+#
+# WITHOUT THIS, EVERY TAG-FILTERED BUDGET REPORTS ZERO FOREVER.
+#
+# A user-defined tag is not usable as a cost dimension until it is ACTIVATED in
+# Billing. Until then Cost Explorer and Budgets can see the tag key exists and
+# still attribute nothing to it, so a budget whose cost_filter names it matches
+# no spend, sits at $0.00 actual with no forecast, and never crosses a threshold.
+#
+# MEASURED, not inferred:
+#
+#   aws ce list-cost-allocation-tags   -> Environment: Inactive
+#   aws budgets describe-budgets       -> fanosbingo-dev-monthly
+#                                         Actual 0.0, Forecast None
+#
+# modules/monitoring carries a long comment about the `$${` HCL escape that used
+# to render this same filter as a literal, and about that being "the same class
+# of defect as a statement that reports success and changes nothing". The escape
+# was genuinely fixed. The behaviour did not change, because the cause was never
+# only in the HCL -- it was here, one layer down, and the fix looked like it had
+# worked because the symptom is identical either way: a budget reading zero.
+#
+# ACTIVATION IS NOT RETROACTIVE. Costs incurred before this applies stay
+# unattributed permanently; only spend from the activation date forward carries
+# the tag. So the per-environment budgets become meaningful roughly a day after
+# this lands, not immediately -- do not read the first day's $0 as proof it is
+# still broken.
+#
+# Environment is the one the budgets filter on. The other three are activated
+# because the cost of doing so is nothing and the question "what is this
+# environment spending on, and which of it is account-wide rather than dev"
+# cannot be answered later for a period when the tags were off.
+resource "aws_ce_cost_allocation_tag" "this" {
+  for_each = toset(["Environment", "Project", "Scope", "ManagedBy"])
+
+  tag_key = each.value
+  status  = "Active"
+}
+
+# ---------------------------------------------------------------------------
+# The backstop budget
+#
+# UNFILTERED, and that is the whole point of it existing alongside the
+# per-environment ones.
+#
+# A tag-filtered budget can only ever see spend that carries the tag, and a
+# meaningful amount of what this account bills for cannot carry one:
+#
+#   - data transfer and NAT-style charges, which are not tagged resources
+#   - KMS request charges
+#   - the CloudTrail and Terraform state buckets, tagged Scope=account and
+#     therefore invisible to a filter on Environment
+#   - anything created outside Terraform, by definition
+#
+# So the per-environment budgets answer "is dev costing more than it should",
+# and this one answers "is the account costing more than it should" -- which is
+# the question that matters when the failure mode is credit exhaustion
+# SUSPENDING resources on a Free account plan, as modules/monitoring describes.
+#
+# It publishes to the security topic rather than an environment's, for the same
+# reason the trail does: this must keep working when dev has been destroyed.
+resource "aws_budgets_budget" "account_total" {
+  name         = "${local.name_prefix}-account-total"
+  budget_type  = "COST"
+  limit_amount = tostring(var.monthly_account_budget_usd)
+  limit_unit   = "USD"
+  time_unit    = "MONTHLY"
+
+  # No cost_filter at all. Every dollar the account bills counts.
+
+  dynamic "notification" {
+    for_each = var.account_alert_thresholds_usd
+
+    content {
+      comparison_operator        = "GREATER_THAN"
+      threshold                  = (notification.value / var.monthly_account_budget_usd) * 100
+      threshold_type             = "PERCENTAGE"
+      notification_type          = "ACTUAL"
+      subscriber_sns_topic_arns  = [aws_sns_topic.security.arn]
+      subscriber_email_addresses = var.alert_emails
+    }
+  }
+
+  # Catches a trend while there is still time to act on it, rather than
+  # reporting the money after it is spent.
+  notification {
+    comparison_operator        = "GREATER_THAN"
+    threshold                  = 100
+    threshold_type             = "PERCENTAGE"
+    notification_type          = "FORECASTED"
+    subscriber_sns_topic_arns  = [aws_sns_topic.security.arn]
+    subscriber_email_addresses = var.alert_emails
+  }
+}
