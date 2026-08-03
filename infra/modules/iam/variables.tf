@@ -18,11 +18,6 @@ variable "wallet_signing_key_arn" {
   type        = string
 }
 
-variable "spa_bucket_name" {
-  description = "S3 bucket holding the built SPA, so the deploy role can be scoped to it."
-  type        = string
-}
-
 variable "github_repository" {
   description = "GitHub repository permitted to assume the deploy role, as owner/name."
   type        = string

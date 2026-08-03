@@ -15,13 +15,8 @@
  * Environment's required reviewers.
  */
 
-data "aws_caller_identity" "current" {}
-
 locals {
   name_prefix = "${var.project_name}-${var.environment}"
-
-  # S3 bucket names are globally unique across all AWS accounts.
-  spa_bucket_name = "${local.name_prefix}-spa-${data.aws_caller_identity.current.account_id}"
 }
 
 module "vpc" {
@@ -116,7 +111,6 @@ module "iam" {
 
   kms_key_arn            = module.kms.main_key_arn
   wallet_signing_key_arn = module.kms.wallet_signing_key_arn
-  spa_bucket_name        = local.spa_bucket_name
 
   # This environment's master secret, by exact ARN. Sourced from the rds module
   # rather than pattern-matched, so the dev deploy role cannot request it.

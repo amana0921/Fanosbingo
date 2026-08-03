@@ -90,11 +90,6 @@ output "github_oidc_provider_arn" {
   value       = module.iam.github_oidc_provider_arn
 }
 
-output "spa_bucket_name" {
-  description = "S3 bucket the built SPA is published to (created in Phase 5)."
-  value       = local.spa_bucket_name
-}
-
 output "alerts_topic_arn" {
   description = "SNS topic for budget and alarm notifications."
   value       = module.monitoring.alerts_topic_arn
