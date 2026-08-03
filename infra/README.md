@@ -107,8 +107,24 @@ Manual      ──▶  plan / apply / destroy any environment (workflow_dispatch
 ```
 
 Authentication is OIDC — there is no AWS access key anywhere in this repository.
-Dev is deliberately not applied on merge; it is on-demand infrastructure you
-stand up to test something and destroy afterwards.
+Dev is deliberately not applied on merge.
+
+> **`dev` is currently the live environment.** Prod has never been applied — the
+> state bucket holds `account/` and `dev/` and nothing else, and
+> `https://api.<domain>` is served by `fanosbingo-dev`. Until cutover, dev holds
+> real player balances, and it carries prod's RDS protections — deletion
+> protection and a required final snapshot — for that reason.
+>
+> **PITR is capped at 1 day by the account plan**, not by choice:
+> `FreeTierRestrictionError` refuses any higher value, including 2. The real RPO
+> on player money is 24 hours until the account moves off the Free plan. See the
+> comment on the `rds` module call in `environments/dev/main.tf`.
+>
+> This matters most at `destroy`. That job used to refuse `prod` and `account`
+> and wave `dev` through, which was one dropdown selection away from ending the
+> live game. It now requires the environment name to be typed, and refuses any
+> environment whose database has deletion protection on — a flag that follows
+> where the money actually is, rather than which name somebody chose.
 
 ### Two roles, and the split is load-bearing
 
