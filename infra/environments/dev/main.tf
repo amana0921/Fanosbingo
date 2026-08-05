@@ -278,10 +278,9 @@ module "app_stack" {
   wallet_signing_key_id   = module.kms.wallet_signing_key_id
   metric_namespace        = module.iam.metric_namespace
 
-  # The SNS topic /alerts/sns will accept messages from, and the chat they are
-  # forwarded to. Sourced from the monitoring module rather than restated, so
-  # the allowlist cannot drift from the topic the alarms actually publish on.
-  alerts_topic_arn       = module.monitoring.alerts_topic_arn
+  # The chat alarms are forwarded to. The TOPIC they are accepted from is
+  # constructed inside the module rather than passed from monitoring -- see the
+  # comment on local.alerts_topic_arn there for the failed apply that caused it.
   telegram_alert_chat_id = var.telegram_alert_chat_id
 
   # Must match what the ssm module publishes, and what the RPC actually serves.
@@ -391,4 +390,23 @@ module "monitoring" {
   rds_instance_id          = module.rds.instance_id
   rds_allocated_storage_gb = 20
   autoscaling_group_name   = module.ecs.autoscaling_group_name
+  # SUBSCRIBE ONLY ONCE THERE IS SOMETHING TO ANSWER.
+  #
+  # SNS confirms an HTTPS subscription by CALLING the endpoint, and that endpoint
+  # is a route on the functions container. Without this edge Terraform is free to
+  # create the subscription first, SNS calls a service that has not yet restarted
+  # with ALERT_TOPIC_ARNS, the handler drops the confirmation as an unknown
+  # topic, and the apply fails after a five-minute wait:
+  #
+  #   Error: waiting for SNS Topic Subscription (...) confirmation:
+  #          timeout while waiting for state to become 'false'
+  #
+  # That is not hypothetical -- it happened on 2026-08-05 and passed on the
+  # retry, which is precisely what makes it worth pinning down rather than
+  # shrugging at.
+  #
+  # Expressible only because app_stack no longer reads this module's outputs; it
+  # constructs the topic arn itself. See local.alerts_topic_arn there.
+  depends_on = [module.app_stack]
+
 }
