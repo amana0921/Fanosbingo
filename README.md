@@ -379,11 +379,51 @@ that sentence**, which is a different failure from not knowing:
 - **The `AdministratorAccess` IAM user is untouched.** Worth periodically
   checking what `aws iam get-credential-report` says about its MFA state, since
   it is the shortest path around everything else here.
+- **AWS SMS alerting stays off, on cost and enrolment.** It was built, applied,
+  reported active by SNS, and delivered nothing — see below. Making it work
+  means enrolling in AWS End User Messaging, requesting production access to
+  leave the SMS sandbox, and registering a `+251` origination identity, and each
+  SMS is then billed. Deferred deliberately until there is budget for it. The
+  subscription is left in place and empty so it becomes correct the moment the
+  account is enrolled.
 
-**Still open:** SMS alerting is wired but delivers nothing until the
-`ALERT_SMS_NUMBERS` repository secret is set — and because an SNS SMS
-subscription needs no confirmation click, a wrong number fails silently forever.
-Prove it with `./scripts/verify-alarms.sh dev --fire fanosbingo-dev-game-loop-stalled`.
+  It is worth revisiting despite the cost, for one reason the Telegram channel
+  cannot match: **SMS is the only alert path that does not depend on this
+  system's own infrastructure.** Telegram alerts are forwarded by the `functions`
+  container, so if that container is what breaks, that channel breaks with it.
+  Email covers the gap today, and SMS would cover it better.
+
+### The SMS channel was built and does not deliver
+
+Recorded because the symptom is indistinguishable from working, and the obvious
+diagnosis is wrong.
+
+An SNS **SMS subscription needs no confirmation click**, so it reports as active
+whether or not anything arrives. Firing a real alarm produced emails and no SMS.
+The cause is not the phone number and not Ethiopia — all three SMS APIs refuse at
+the **account level, before any number is read**:
+
+```
+aws sns get-sms-sandbox-account-status
+UserError: The AWS Access Key Id needs a subscription for the service
+           (Service: PinpointSmsVoiceV2)
+```
+
+SNS SMS is delivered by AWS End User Messaging, which this account is not
+enrolled in, so it would have failed for a US number identically. The same shape
+appears on GuardDuty and Security Hub here (`SubscriptionRequiredException`) —
+several services are simply not switched on for this account.
+
+**The lesson generalises past SMS:** a channel that reports healthy is not a
+channel that delivers. Prove any alerting change against the receiving device:
+
+```
+./scripts/verify-alarms.sh dev --fire fanosbingo-dev-game-loop-stalled
+```
+
+Alarms now reach Telegram instead, forwarded by the `functions` service — chosen
+over a Lambda precisely because a Lambda is another AWS service to be enrolled
+in, which is the failure being worked around.
 
 ---
 
