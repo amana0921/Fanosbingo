@@ -72,6 +72,47 @@ data "aws_ssm_parameters_by_path" "images" {
 }
 
 # ---------------------------------------------------------------------------
+# The alerts topic, CONSTRUCTED rather than taken from the monitoring module.
+#
+# THIS IS AN ORDERING FIX, AND IT COST A FAILED APPLY TO FIND.
+#
+# The functions service needs the topic arn as an allowlist for /alerts/sns;
+# the monitoring module needs the functions service to EXIST before it
+# subscribes, because SNS confirms an HTTPS subscription by calling the
+# endpoint. Those are opposite dependencies, and taking the arn as a module
+# output picked the wrong one:
+#
+#   app_stack -> monitoring   (for the arn)
+#   so Terraform may create the subscription BEFORE the ECS service has
+#   restarted with ALERT_TOPIC_ARNS set
+#   SNS calls the endpoint, the handler sees a topic not on its (empty)
+#   allowlist, drops it, and never confirms
+#
+#   Error: waiting for SNS Topic Subscription (...) confirmation:
+#          timeout while waiting for state to become 'false'
+#
+# Observed on the dev apply of 2026-08-05. It resolved on a second apply --
+# by then the container had the variable -- which is the worst kind of bug:
+# self-healing on retry, so it looks like a flake instead of an ordering error,
+# and it would have reappeared at prod cutover with nobody expecting it.
+#
+# An SNS arn is fully determined by region, account and topic name, so it can be
+# built here instead of imported. That removes the app_stack -> monitoring edge
+# entirely, which lets the environment roots declare the edge that is actually
+# wanted -- `depends_on = [module.app_stack]` on the monitoring module -- with
+# no cycle.
+#
+# If the topic is ever renamed, this and modules/monitoring must change
+# together. They are named from the same var.name_prefix, so that is one
+# variable rather than two literals.
+data "aws_region" "current" {}
+data "aws_caller_identity" "current" {}
+
+locals {
+  alerts_topic_arn = "arn:aws:sns:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:${var.name_prefix}-alerts"
+}
+
+# ---------------------------------------------------------------------------
 # ticker -- the game's heartbeat
 #
 # Deployed first of the five: no ingress, no TLS, no dependency on Caddy, so it
@@ -412,7 +453,7 @@ module "functions" {
     # authenticates the Amazon signature and then checks the topic -- because a
     # valid signature only proves AWS sent it, and any AWS account can sign a
     # message with a topic of their own.
-    ALERT_TOPIC_ARNS = var.alerts_topic_arn
+    ALERT_TOPIC_ARNS = local.alerts_topic_arn
 
     # Plain env, deliberately NOT an SSM secret. ECS fails a task outright when
     # a secret parameter is absent, so an unset optional value would turn a

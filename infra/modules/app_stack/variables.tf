@@ -127,21 +127,6 @@ variable "bsc_rpc_primary" {
   type        = string
 }
 
-variable "alerts_topic_arn" {
-  description = <<-EOT
-    SNS topic the alarms publish to. The functions service uses it as an
-    ALLOWLIST on /alerts/sns: a valid Amazon signature only proves AWS sent a
-    message, not that it is ours, so the topic arn is what establishes that.
-
-    Empty disables forwarding without disabling the route. The route must keep
-    existing whenever SNS is subscribed to it -- SNS confirms a subscription by
-    calling the endpoint, so a 404 there leaves the channel permanently
-    unconfirmed.
-  EOT
-  type        = string
-  default     = ""
-}
-
 variable "telegram_alert_chat_id" {
   description = <<-EOT
     Chat the operator receives alarms in. Get it by messaging the bot and
