@@ -400,6 +400,24 @@ module "functions" {
     # this against the RPC at startup and refuses to run on a mismatch.
     BSC_CHAIN_ID    = tostring(var.bsc_chain_id)
     BSC_RPC_PRIMARY = var.bsc_rpc_primary
+
+    # Alarms, forwarded to Telegram from POST /alerts/sns.
+    #
+    # This route exists because SMS does not deliver on this account -- AWS End
+    # User Messaging is not enrolled, so SNS accepted the subscription and
+    # dropped every message. See modules/monitoring.
+    #
+    # ALERT_TOPIC_ARNS is an allowlist, not a destination. The route is
+    # unauthenticated by necessity (SNS cannot present a bearer token), so it
+    # authenticates the Amazon signature and then checks the topic -- because a
+    # valid signature only proves AWS sent it, and any AWS account can sign a
+    # message with a topic of their own.
+    ALERT_TOPIC_ARNS = var.alerts_topic_arn
+
+    # Plain env, deliberately NOT an SSM secret. ECS fails a task outright when
+    # a secret parameter is absent, so an unset optional value would turn a
+    # missing alert into an outage of the whole functions service.
+    TELEGRAM_ALERT_CHAT_ID = var.telegram_alert_chat_id
   }
 
   secrets = {

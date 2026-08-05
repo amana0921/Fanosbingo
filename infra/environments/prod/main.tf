@@ -193,6 +193,12 @@ module "app_stack" {
   wallet_signing_key_id   = module.kms.wallet_signing_key_id
   metric_namespace        = module.iam.metric_namespace
 
+  # The SNS topic /alerts/sns will accept messages from, and the chat they are
+  # forwarded to. Sourced from the monitoring module rather than restated, so
+  # the allowlist cannot drift from the topic the alarms actually publish on.
+  alerts_topic_arn       = module.monitoring.alerts_topic_arn
+  telegram_alert_chat_id = var.telegram_alert_chat_id
+
   # Must match what the ssm module publishes, and what the RPC actually serves.
   # The service checks the latter at startup and refuses to run on a mismatch.
   bsc_chain_id    = var.bsc_chain_id
@@ -244,6 +250,12 @@ module "monitoring" {
   # DNS moves, report Unhealthy from birth. Turn this on in the same change that
   # moves DNS.
   enable_external_health_check = false
+
+  # OFF for the same reason: SNS confirms a subscription by CALLING the
+  # endpoint, and prod has no functions service running to answer. Subscribing
+  # now would leave it `pending confirmation` and deliver nothing. Turn both on
+  # in the change that stands prod up.
+  enable_telegram_alerts = false
 
   # Must match the namespace the containers publish to, or the game-loop alarm
   # watches nothing. Sourced from iam rather than restated, so it cannot drift.

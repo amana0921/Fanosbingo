@@ -254,6 +254,14 @@ jobs:
           # modules/monitoring and takes the whole plan with it. Unset must mean
           # an EMPTY LIST, not a list of nothing.
           TF_VAR_alert_sms_numbers: ${{ secrets.ALERT_SMS_NUMBERS && format('["{0}"]', secrets.ALERT_SMS_NUMBERS) || '[]' }}
+          # Where alarms actually land. SMS does not deliver on this account --
+          # AWS End User Messaging is not enrolled, so SNS accepts the
+          # subscription and drops every message. See modules/monitoring.
+          #
+          # A secret for the same reason the number is: GitHub masks secrets in
+          # job logs and does not mask variables, and a chat id identifies a
+          # person. Unset is fine and means "verify, then do not forward".
+          TF_VAR_telegram_alert_chat_id: ${{ secrets.TELEGRAM_ALERT_CHAT_ID }}
           TF_VAR_cloudflare_zone_id: ${{ vars.CLOUDFLARE_ZONE_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           # Legacy fallback only. Which build runs is read from SSM at
@@ -430,6 +438,14 @@ jobs:
           # modules/monitoring and takes the whole plan with it. Unset must mean
           # an EMPTY LIST, not a list of nothing.
           TF_VAR_alert_sms_numbers: ${{ secrets.ALERT_SMS_NUMBERS && format('["{0}"]', secrets.ALERT_SMS_NUMBERS) || '[]' }}
+          # Where alarms actually land. SMS does not deliver on this account --
+          # AWS End User Messaging is not enrolled, so SNS accepts the
+          # subscription and drops every message. See modules/monitoring.
+          #
+          # A secret for the same reason the number is: GitHub masks secrets in
+          # job logs and does not mask variables, and a chat id identifies a
+          # person. Unset is fine and means "verify, then do not forward".
+          TF_VAR_telegram_alert_chat_id: ${{ secrets.TELEGRAM_ALERT_CHAT_ID }}
           TF_VAR_cloudflare_zone_id: ${{ vars.CLOUDFLARE_ZONE_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           # Legacy fallback only. Which build runs is read from SSM at
@@ -649,6 +665,14 @@ jobs:
           # modules/monitoring and takes the whole plan with it. Unset must mean
           # an EMPTY LIST, not a list of nothing.
           TF_VAR_alert_sms_numbers: ${{ secrets.ALERT_SMS_NUMBERS && format('["{0}"]', secrets.ALERT_SMS_NUMBERS) || '[]' }}
+          # Where alarms actually land. SMS does not deliver on this account --
+          # AWS End User Messaging is not enrolled, so SNS accepts the
+          # subscription and drops every message. See modules/monitoring.
+          #
+          # A secret for the same reason the number is: GitHub masks secrets in
+          # job logs and does not mask variables, and a chat id identifies a
+          # person. Unset is fine and means "verify, then do not forward".
+          TF_VAR_telegram_alert_chat_id: ${{ secrets.TELEGRAM_ALERT_CHAT_ID }}
           TF_VAR_cloudflare_zone_id: ${{ vars.CLOUDFLARE_ZONE_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           # Legacy fallback only. Which build runs is read from SSM at
