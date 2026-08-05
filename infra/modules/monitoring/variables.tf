@@ -108,6 +108,22 @@ variable "alert_sms_numbers" {
   }
 }
 
+variable "enable_telegram_alerts" {
+  description = <<-EOT
+    Subscribe the functions service to this topic, so alarms reach Telegram.
+
+    ON by default: it is the only second channel that delivers on this account.
+    SMS was the intended one and is refused before a phone number is even
+    considered -- see the comment on aws_sns_topic_subscription.sms.
+
+    Turn it OFF for an environment whose functions service is not deployed yet.
+    SNS confirms a subscription by calling the endpoint, so subscribing to a
+    host that 404s leaves it `pending confirmation` and delivers nothing.
+  EOT
+  type        = bool
+  default     = true
+}
+
 variable "domain_name" {
   description = <<-EOT
     Apex domain. The external health check probes api.<domain_name>, which is

@@ -122,3 +122,15 @@ variable "alert_sms_numbers" {
   type        = list(string)
   default     = []
 }
+
+variable "telegram_alert_chat_id" {
+  description = <<-EOT
+    Telegram chat the operator receives alarms in. Empty means alarms are
+    verified and then not forwarded, which is logged rather than silent.
+
+    Supplied by CI from the TELEGRAM_ALERT_CHAT_ID repository secret, never from
+    terraform.tfvars.example -- that file is committed.
+  EOT
+  type        = string
+  default     = ""
+}

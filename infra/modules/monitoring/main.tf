@@ -64,6 +64,35 @@ resource "aws_sns_topic_subscription" "email" {
 
 # A SECOND CHANNEL, on a second device.
 #
+# !! SMS DOES NOT DELIVER ON THIS ACCOUNT, AND DID NOT SAY SO.
+# !!
+# !! This subscription was created, reported active by SNS, and silently
+# !! dropped every message. The send path refuses at the ACCOUNT level, before
+# !! any phone number is considered:
+# !!
+# !!   aws sns get-sms-sandbox-account-status
+# !!   UserError: The AWS Access Key Id needs a subscription for the service
+# !!              (Service: PinpointSmsVoiceV2)
+# !!
+# !! SNS SMS is delivered by AWS End User Messaging, which this account is not
+# !! enrolled in -- so this would have failed for a US number identically. It is
+# !! NOT a restriction on Ethiopian numbers, and diagnosing it as one would send
+# !! somebody looking for a second SIM instead of a console setting. The same
+# !! shape appears on GuardDuty and Security Hub here: SubscriptionRequiredException.
+# !!
+# !! Enrolling is not the end of it: a new account then lands in the SMS
+# !! sandbox, where only pre-verified numbers receive anything, and +251 wants a
+# !! registered origination identity on top.
+# !!
+# !! Kept, defaulted to empty, because it becomes correct the moment the account
+# !! is enrolled -- and because deleting it would erase the record of why the
+# !! obvious answer was not taken. The channel that actually works is the
+# !! Telegram delivery below.
+# !!
+# !! An SMS subscription needs no confirmation click, so nothing anywhere
+# !! reports this as broken. Prove any alerting change with
+# !! scripts/verify-alarms.sh --fire, and believe the handset, not the console.
+#
 # Every alarm in this file delivered to exactly one Gmail address, which is one
 # inbox, on one phone, behind one set of push settings. That is fine for the
 # infrastructure alarms -- an RDS CPU credit warning can wait for morning. It is
@@ -103,6 +132,63 @@ resource "aws_sns_topic_subscription" "sms" {
   topic_arn = aws_sns_topic.alerts.arn
   protocol  = "sms"
   endpoint  = each.value
+}
+
+# ---------------------------------------------------------------------------
+# The channel that actually delivers: Telegram, via the functions service.
+#
+# NOT A LAMBDA, and that is the whole point rather than a shortcut. A Lambda is
+# another AWS service to be enrolled in, and the failure being worked around is
+# exactly "a service was not enabled and nothing said so". The functions
+# container already holds the bot token, already runs, and Caddy already routes
+# /functions/v1/* to it -- so this adds a route, not a dependency.
+#
+# It is also where the operator already is. This is a Telegram product; an alert
+# arriving in the same app as the game is likelier to be read at 03:00 than one
+# in an inbox.
+#
+# EMAIL STAYS. This is a second channel, not a replacement. If the functions
+# container is the thing that is broken, email is what still arrives -- which is
+# the property that makes two channels worth having at all.
+#
+# ENDPOINT AUTHENTICATION is the Amazon signature, checked in
+# services/functions/src/alerts.js before anything else happens, plus a topic
+# allowlist -- a valid signature only proves AWS sent it, not that it is ours.
+# The route is necessarily unauthenticated: SNS cannot present a bearer token.
+#
+# endpoint_auto_confirms = true because the handler fetches SubscribeURL itself
+# (after pinning its host, or the confirmation is an SSRF primitive). Without
+# it Terraform reports the subscription as `pending confirmation` forever.
+#
+# raw_message_delivery stays FALSE: the handler reads TopicArn, Signature and
+# SigningCertURL from the SNS envelope, and raw delivery strips exactly those.
+# Turning it on would silently disable every check above.
+# ---------------------------------------------------------------------------
+resource "aws_sns_topic_subscription" "telegram" {
+  count = var.enable_telegram_alerts ? 1 : 0
+
+  topic_arn = aws_sns_topic.alerts.arn
+  protocol  = "https"
+  endpoint  = "https://api.${var.domain_name}/functions/v1/alerts/sns"
+
+  endpoint_auto_confirms = true
+  raw_message_delivery   = false
+
+  # SNS gives up and DISABLES a subscription that keeps failing. A container
+  # restart during a deploy is a normal, expected gap, so retry across it rather
+  # than losing the channel to a routine rollout.
+  confirmation_timeout_in_minutes = 5
+
+  delivery_policy = jsonencode({
+    healthyRetryPolicy = {
+      numRetries         = 5
+      minDelayTarget     = 5
+      maxDelayTarget     = 60
+      numMinDelayRetries = 2
+      numMaxDelayRetries = 2
+      backoffFunction    = "exponential"
+    }
+  })
 }
 
 # ---------------------------------------------------------------------------

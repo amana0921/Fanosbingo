@@ -57,6 +57,7 @@ import { authenticateTelegram, authenticateTelegramWeb, requireAuth } from './au
 import { verifyChainId, chainName } from './chain.js';
 import { bodyParserErrorHandler } from './http-errors.js';
 import { createRateLimiter, limitByPlayer } from './rate-limit.js';
+import { createSnsAlertHandler } from './alerts.js';
 import { createSelectCardHandler } from './select-card.js';
 import { createClaimBingoHandler } from './claim-bingo.js';
 import { createDeselectCardHandler } from './deselect-card.js';
@@ -92,6 +93,14 @@ const {
   BSC_CHAIN_ID,
   BSC_RPC_PRIMARY,
   ADMIN_BOOTSTRAP_KEY,
+
+  // Alerting. Both optional: with either absent the route still exists and
+  // still verifies, it just has nowhere to forward to and says so in the log.
+  // That is deliberate -- the subscription is created by Terraform, and a route
+  // that 404s while SNS is subscribed to it would fail the subscription
+  // confirmation and quietly disable the channel before anyone configured it.
+  TELEGRAM_ALERT_CHAT_ID,
+  ALERT_TOPIC_ARNS = '',
 } = process.env;
 
 /** Structured JSON, so CloudWatch Logs Insights can query the fields. */
@@ -609,6 +618,35 @@ app.post(
   requireAuth(JWT_SECRET),
   requireAdmin(pool),
   createUpdateSettingHandler(pool),
+);
+
+/**
+ * POST /alerts/sns — CloudWatch alarms, forwarded to Telegram.
+ *
+ * UNAUTHENTICATED, and necessarily so: SNS cannot present a bearer token. The
+ * Amazon signature is the authentication, the topic allowlist is the
+ * authorization, and src/alerts.js does both before anything else happens.
+ *
+ * SMS was meant to be this channel. It was wired, applied, and does not
+ * deliver -- AWS End User Messaging is not enabled on this account, so the send
+ * path refuses before a phone number is even considered. Telegram is served
+ * from here rather than a Lambda precisely because a Lambda is another AWS
+ * service to be enrolled in, and "the service was not enabled and nothing said
+ * so" is the failure being fixed.
+ *
+ * express.text() ON THIS ROUTE ONLY. SNS posts Content-Type: text/plain, which
+ * the app-wide express.json() correctly ignores -- so without this the handler
+ * receives an empty body and every alarm is dropped as unparseable. Registered
+ * here rather than globally so no other route's parsing changes.
+ */
+app.post(
+  '/alerts/sns',
+  express.text({ type: '*/*', limit: '256kb' }),
+  createSnsAlertHandler({
+    botToken: TELEGRAM_BOT_TOKEN,
+    chatId: TELEGRAM_ALERT_CHAT_ID,
+    allowedTopicArns: ALERT_TOPIC_ARNS.split(',').map((s) => s.trim()),
+  }),
 );
 
 app.use((req, res) => res.status(404).json({ error: 'not found', path: req.path }));
