@@ -152,6 +152,18 @@ against PostgREST, not routes. See §7.
 - ten alarms `OK`, CloudTrail logging, twelve detector assertions passing
 - a dev plan reporting no changes
 
+> **Superseded 2026-08-05.** The alarm count is now **fifteen** in the account:
+> eleven from `modules/monitoring` (the eleventh is `api-unreachable`), two
+> created by the ECS capacity provider, and two account-wide detections. The
+> "ten fits the CloudWatch free tier exactly" claim was already wrong when
+> written — the capacity-provider pair was never counted, because the comment
+> counted what one file declares rather than what the account holds.
+>
+> Alarms now reach **email and Telegram**. SMS was built, applied, reported
+> active by SNS, and delivers nothing; see "The SMS channel was built and does
+> not deliver" in README.md. `dev` also now carries prod's RDS protections,
+> because `dev` **is** production until cutover.
+
 | Change | Why |
 |---|---|
 | `modules/app_stack`, called by dev **and prod** | Prod defined no services at all. Applying it would have produced infrastructure with no application |
@@ -874,6 +886,9 @@ Every one of these cost real time.
 | An alarm fires and **no email arrives** | The SNS topic is KMS-encrypted and the key policy does not admit `cloudwatch.amazonaws.com`. CloudWatch cannot produce a data key, the publish fails, and the notification is **dropped silently** — alarm state correct, console shows ALARM, subscription confirmed, metric publishing. Every individual signal says healthy. `modules/kms` needs `kms:GenerateDataKey*` + `kms:Decrypt` for that service principal, same as the audit key in `environments/account`. Cost: every per-environment alarm, including `game-loop-stalled`, could never deliver |
 | An alarm at **OK** that has never had data | Not healthy — **unarmed**. With `treat_missing_data = "notBreaching"` a metric that never publishes leaves the alarm at OK forever, and OK is indistinguishable from working. `scripts/verify-alarms.sh` exists to tell the two apart; run it before trusting any alarm |
 | A verifier that passes on a broken system | Worse than no verifier: it converts "we do not know" into "we checked". `verify-alarms.sh` shipped checking confirmed subscribers, live metrics and non-empty actions — three of the four links — and passed an environment where every notification was being dropped by the fourth. When writing a check, enumerate the links in the chain and say which ones it does **not** cover |
+| An SMS alert that **never arrives, and never complains** | An SNS SMS subscription needs **no confirmation click**, so it reports active whether or not anything is delivered — Terraform, the console and `list-subscriptions` all agree it is fine. SNS SMS is delivered by **AWS End User Messaging**, and if the account is not enrolled the send path refuses before a phone number is read: `UserError: The AWS Access Key Id needs a subscription for the service (Service: PinpointSmsVoiceV2)`. It looks like a country restriction and is not — it would fail for a US number identically. Diagnosing it as "Ethiopian numbers are not supported" sends somebody hunting for a second SIM instead of a console setting. Same shape as GuardDuty and Security Hub here. **Believe the handset, not the console:** `verify-alarms.sh --fire` |
+| A budget that reports **$0 forever**, after the HCL was fixed | Two independent causes, and fixing the first hides the second. The `$${` escape is one. The other is that a user-defined tag is unusable as a cost dimension until **activated in Billing** — `aws ce list-cost-allocation-tags` showed `Environment: Inactive` while the filter naming it looked correct. Activation is **not retroactive**. Because the symptom is identical either way, the first fix appeared to work and stopped anyone checking. `aws_ce_cost_allocation_tag` in `environments/account` |
+| An SNS **HTTPS** subscription that times out confirming | SNS confirms by **calling the endpoint**. If the route lives on a container that Terraform is updating in the same apply, the call can land before the new configuration does, and a handler that correctly rejects an unknown topic never confirms: `waiting for SNS Topic Subscription (...) confirmation: timeout`. It **passes on retry**, which is why it reads as a flake rather than an ordering error. Fixed by constructing the topic arn in `app_stack` instead of importing it, so the roots can declare `depends_on = [module.app_stack]` without a cycle |
 | A budget that reports **$0 forever** | `"user:Environment$${var.environment}"` — in HCL `$${` is the escape for a literal `${`, so the filter renders as the literal text and matches nothing. Both threshold alerts and the forecast alert are unreachable, silently. Use `format("user:Environment$%s", var.environment)`. Verified with `terraform console` |
 | `ssm:StartSession` scoped to a document is **not** scoped | Listing `AWS-StartPortForwardingSessionToRemoteHost` in `Resource` constrains nothing: a session naming **no** document uses the default `SSM-SessionManagerRunShell`, so only the instance ARN is evaluated. `instance/*` is therefore an interactive root shell on every instance in the account. Add a tag condition (`ssm:resourceTag/Environment`) or `ssm:SessionDocumentAccessCheck` |
 | A plan reporting "2 to destroy" on an ECS change | A task definition is **immutable**, so Terraform expresses every change to one as destroy-and-create. The two destroyed and the two added are the same two resources. What *is* worth stopping for: a **service** being replaced rather than updated in-place, or `aws_db_instance` / `aws_kms_key` in a destroy list |
