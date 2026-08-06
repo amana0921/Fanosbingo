@@ -341,13 +341,32 @@ that sentence**, which is a different failure from not knowing:
 > maximum available to free tier customers. Upgrade your account plan.
 > ```
 >
-> Retried with 2 and refused identically — the ceiling is exactly 1. So **the
-> real RPO on real player money is 24 hours**, and no Terraform change alters
-> that. It is a billing decision: `aws freetier get-account-plan-state` reports
+> Retried with 2 and refused identically — the ceiling is exactly 1. Lifting it
+> is a billing decision: `aws freetier get-account-plan-state` reports
 > `FREE / ACTIVE`, **$154.48 credits remaining, expiring 2027-01-14**. On a Free
 > plan, exhausting credits *suspends* resources rather than billing for them — so
 > a real-money game is currently scheduled to stop on a date nobody chose.
 > Upgrading to Paid lifts the cap and removes the suspension risk in one step.
+>
+> **AWS caps retention. It does not stop us keeping our own copies.**
+> `.github/workflows/db-backup.yml` takes a nightly `pg_dump` through the
+> existing SSM tunnel into an S3 bucket in the **account** root, kept 30 days.
+> The database holds a few MB of real data, so thirty compressed dumps sit inside
+> the 5 GB S3 free tier — this costs approximately nothing and is the reason the
+> plan cap is no longer the whole story.
+>
+> The two answer different questions and neither replaces the other. PITR undoes
+> *the last 24 hours* to any second. The dumps undo *last Monday*, at nightly
+> granularity — which is the range that matters for the failures that actually
+> cost money here: a bad migration, a fraudulent approval, a wrong `UPDATE`.
+> Those are quiet, and they surface in days.
+>
+> Two things make it a backup rather than a cron job. The archive is **parsed
+> back** with `pg_restore --list` before it counts, because a truncated dump
+> uploads perfectly happily. And a heartbeat metric drives
+> `<prefix>-backup-did-not-run`, which treats **absent data as breaching** — so
+> the workflow being disabled, or GitHub never firing the cron, alarms. A failure
+> notification alone cannot cover that: nothing fails, so nothing reports.
 - `terraform.yml`'s destroy job refused `prod` and `account` and waved `dev`
   through, on the same assumption. Destroy now requires the environment name to
   be **typed**, and refuses any environment whose database has deletion

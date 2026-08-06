@@ -632,6 +632,65 @@ resource "aws_cloudwatch_metric_alarm" "api_unreachable" {
   tags = var.tags
 }
 
+# ---------------------------------------------------------------------------
+# Did last night's backup happen?
+#
+# THE CASE A FAILURE NOTIFICATION CANNOT COVER.
+#
+# db-backup.yml publishes to this topic when it fails, which handles the dump
+# erroring. It cannot handle the workflow being disabled, the schedule being
+# edited out, the repository being archived, or GitHub simply not firing a cron.
+# In every one of those, nothing fails, so nothing reports, and the backups stop
+# silently -- discovered during a restore, which is the worst possible moment.
+#
+# So the workflow publishes a HEARTBEAT on success and this alarms on its
+# ABSENCE. Identical reasoning to game_loop_stalled above, and the same failure
+# shape: a heartbeat that stops without complaining.
+#
+# treat_missing_data = "breaching" is therefore the entire alarm, not a detail.
+#
+# 30 HOURS, against a 24-hour schedule. Wide enough that a slow runner, a queued
+# job or an hour of GitHub trouble does not page anybody; narrow enough that two
+# consecutive missed nights cannot pass unnoticed.
+#
+# WHY THIS MATTERS MORE HERE THAN IT WOULD ELSEWHERE: RDS point-in-time recovery
+# is capped at ONE DAY by the account plan, so these dumps are the only recovery
+# point older than 24 hours that exists. If they stop, the system silently
+# returns to a state where a problem found on Friday about Monday is
+# unrecoverable -- and nothing else would say so.
+#
+# This is the twelfth alarm, $0.10/mo past the CloudWatch free tier. Named
+# rather than absorbed, because the point of the header comment is that nothing
+# here is billed by accident.
+# ---------------------------------------------------------------------------
+resource "aws_cloudwatch_metric_alarm" "backup_missing" {
+  count = var.enable_backup_alarm ? 1 : 0
+
+  alarm_name        = "${var.name_prefix}-backup-did-not-run"
+  alarm_description = "No successful database backup in ${var.backup_alarm_hours}h. RDS PITR is capped at 1 day on this account, so these dumps are the ONLY recovery point older than 24 hours."
+
+  namespace   = var.metric_namespace
+  metric_name = "HoursSinceLastBackup"
+  statistic   = "Maximum"
+
+  # One period of the full window: the metric is published once a day, so a
+  # shorter period would spend most of its life with no datapoint and alarm on
+  # ordinary quiet rather than on a missed backup.
+  period              = var.backup_alarm_hours * 3600
+  evaluation_periods  = 1
+  datapoints_to_alarm = 1
+  comparison_operator = "GreaterThanThreshold"
+  threshold           = 0
+
+  dimensions = { Environment = var.environment }
+
+  alarm_actions      = [aws_sns_topic.alerts.arn]
+  ok_actions         = [aws_sns_topic.alerts.arn]
+  treat_missing_data = "breaching"
+
+  tags = var.tags
+}
+
 resource "aws_cloudwatch_metric_alarm" "pending_withdrawals_stale" {
   alarm_name        = "${var.name_prefix}-withdrawals-waiting-too-long"
   alarm_description = "A withdrawal has been unpaid for ${var.pending_withdrawal_alarm_minutes} minutes. This is money owed to a player."

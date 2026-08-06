@@ -68,3 +68,25 @@ variable "account_alert_thresholds_usd" {
     error_message = "At least one threshold, or the budget only ever reports after the fact."
   }
 }
+
+variable "backup_retention_days" {
+  description = <<-EOT
+    How long a nightly logical dump is kept.
+
+    THIRTY, and the number answers a different question from RDS's
+    backup_retention_period. That one is capped at 1 by the account plan and
+    covers "undo the last 24 hours". This covers "undo something we only noticed
+    on Friday" -- a bad migration, a fraudulent approval, a wrong UPDATE. Those
+    are the failures that actually cost money, and they surface in days.
+
+    Cheap enough not to optimise: the database holds a few MB of real data, so
+    thirty compressed dumps sit inside the 5 GB S3 free tier.
+  EOT
+  type        = number
+  default     = 30
+
+  validation {
+    condition     = var.backup_retention_days > 1
+    error_message = "Below 2 days this buys nothing RDS point-in-time recovery does not already provide."
+  }
+}

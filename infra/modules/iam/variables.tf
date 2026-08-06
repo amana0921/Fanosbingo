@@ -80,3 +80,15 @@ variable "rds_master_secret_arn" {
   type        = string
   default     = ""
 }
+
+variable "project_name" {
+  description = <<-EOT
+    Project slug, used to construct the account-level backups bucket name.
+
+    Constructed rather than passed as an arn, so this module keeps no dependency
+    on the account root. The two sides agree by naming rule; if the bucket is
+    ever renamed, environments/account and this must change together.
+  EOT
+  type        = string
+  default     = "fanosbingo"
+}

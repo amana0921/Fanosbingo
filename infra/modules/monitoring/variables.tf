@@ -212,3 +212,32 @@ variable "pending_withdrawal_alarm_minutes" {
   type        = number
   default     = 480
 }
+
+variable "enable_backup_alarm" {
+  description = <<-EOT
+    Alarm when no nightly logical backup has been recorded.
+
+    ON where db-backup.yml runs. Turn it OFF for an environment that has no
+    backup schedule, or it alarms from creation -- the metric is absent and
+    absence is deliberately treated as breaching.
+  EOT
+  type        = bool
+  default     = true
+}
+
+variable "backup_alarm_hours" {
+  description = <<-EOT
+    Hours without a successful backup before alerting.
+
+    THIRTY, against a 24-hour schedule. Wide enough that a queued runner or an
+    hour of GitHub trouble does not page anybody, narrow enough that two missed
+    nights cannot pass unnoticed.
+  EOT
+  type        = number
+  default     = 30
+
+  validation {
+    condition     = var.backup_alarm_hours > 24
+    error_message = "Must exceed the 24-hour backup interval, or the alarm fires between normal runs."
+  }
+}
