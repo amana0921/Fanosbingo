@@ -1,0 +1,241 @@
+name: Database backup
+
+# A recovery point older than 24 hours, which nothing else in this system has.
+#
+# WHY THIS EXISTS WHEN RDS ALREADY TAKES BACKUPS.
+#
+# It does, and they are capped at ONE DAY. Not by choice -- raising
+# backup_retention_period is refused on this account:
+#
+#   FreeTierRestrictionError: The specified backup retention period exceeds
+#   the maximum available to free tier customers.
+#
+# Retried with 2 and refused identically, so the ceiling is exactly 1. Lifting
+# it is a billing decision, deliberately deferred.
+#
+# That leaves point-in-time recovery answering "undo the last 24 hours" and
+# nothing answering "undo last Monday". For a system holding real player
+# balances that is the wrong way round. Disk failure is loud and immediate; the
+# failures that actually cost money -- a bad migration, a fraudulent approval, a
+# wrong UPDATE -- are quiet and surface days later. db-restore-drill.yml passes
+# monthly and proves only that you can recover from something you noticed today.
+#
+# AWS caps retention. It does not stop us keeping our own copies.
+#
+# THE FAILURE MODE THIS WORKFLOW IS BUILT AROUND is not "the dump fails". It is
+# "the dump fails and nobody finds out until they need it". Every design choice
+# below follows from that:
+#
+#   * the archive is VERIFIED after upload, by parsing it back, because a
+#     truncated or empty dump uploads perfectly happily
+#   * a failure PUBLISHES TO THE ALERTS TOPIC, which now reaches email and
+#     Telegram, rather than colouring a tab red where nobody is looking
+#   * a heartbeat metric is published on success, so an alarm can catch this
+#     workflow being DISABLED or never running at all -- the case a failure
+#     notification structurally cannot cover
+#
+# WHY 04:00 UTC. RDS takes its automated backup 01:00-02:00 and its maintenance
+# window is Tue 02:30-03:30; the restore drill runs 03:00 on the 1st. 04:00 is
+# clear of all three, and it is 07:00 in Addis -- long after the evening play
+# that the game-loop alarm exists to protect.
+
+on:
+  schedule:
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to back up'
+        required: true
+        type: choice
+        options: [dev, prod]
+        default: dev
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  # Not a choice for correctness so much as for restore: pg_restore refuses an
+  # archive written by a NEWER pg_dump than itself, so the client major version
+  # must track the server. RDS is PostgreSQL 16.
+  PG_MAJOR: '16'
+
+jobs:
+  backup:
+    name: Dump ${{ github.event.inputs.environment || 'dev' }}
+    runs-on: ubuntu-latest
+
+    # Declaring the environment is what puts this behind its protection rules
+    # and gives the OIDC subject `environment:<name>`. infra/modules/iam is
+    # explicit that `ref:refs/heads/main` must NOT be enough to reach a role
+    # that can read the database.
+    environment: ${{ github.event.inputs.environment || 'dev' }}
+
+    # A second copy running while the first holds a tunnel would fight over the
+    # local port and produce two objects for one night.
+    concurrency:
+      group: db-backup-${{ github.event.inputs.environment || 'dev' }}
+      cancel-in-progress: false
+
+    env:
+      ENVIRONMENT: ${{ github.event.inputs.environment || 'dev' }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assume AWS role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: db-backup-${{ github.run_id }}
+
+      # The runner image ships a psql, but not necessarily one matching the
+      # server. Pinning the PGDG client is what makes the resulting archive
+      # restorable rather than merely produced.
+      - name: Install PostgreSQL ${{ env.PG_MAJOR }} client
+        run: |
+          set -euo pipefail
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] \
+            https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list > /dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq "postgresql-client-${PG_MAJOR}"
+          pg_dump --version
+
+      - name: Install session-manager-plugin
+        run: |
+          curl -fsSL -o /tmp/session-manager-plugin.deb \
+            "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_64bit/session-manager-plugin.deb"
+          sudo dpkg -i /tmp/session-manager-plugin.deb
+          session-manager-plugin --version
+
+      - name: Dump, upload and verify
+        id: dump
+        run: |
+          set -euo pipefail
+
+          ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
+          BUCKET="fanosbingo-backups-${ACCOUNT}"
+          STAMP="$(date -u +%Y-%m-%dT%H-%M-%SZ)"
+          KEY="${ENVIRONMENT}/${STAMP}.dump"
+          LOCAL="/tmp/${ENVIRONMENT}-${STAMP}.dump"
+
+          echo "bucket=$BUCKET" >> "$GITHUB_OUTPUT"
+          echo "key=$KEY"       >> "$GITHUB_OUTPUT"
+
+          # Same tunnel every other database workflow uses: SSM port-forwarding
+          # through the container instance. RDS has no public endpoint and no
+          # bastion exists.
+          source scripts/db-tunnel.sh "$ENVIRONMENT"
+          trap stop_db_tunnel EXIT
+
+          # CUSTOM FORMAT (-Fc), not plain SQL, for two reasons that both matter
+          # at restore time: it is compressed, and pg_restore can read it
+          # SELECTIVELY. Recovering one wrongly-updated table at 3am should not
+          # require replaying the whole ledger.
+          #
+          # --no-owner / --no-privileges because a restore target will not have
+          # this cluster's roles. db/00-bootstrap creates them; the dump should
+          # not fight it.
+          pg_dump "$DATABASE_URL" \
+            --format=custom \
+            --compress=9 \
+            --no-owner \
+            --no-privileges \
+            --file="$LOCAL"
+
+          SIZE="$(stat -c%s "$LOCAL")"
+          echo "dump size: ${SIZE} bytes"
+
+          # A DUMP THAT IS TOO SMALL TO BE REAL IS A FAILURE, not a small
+          # database. pg_dump exits 0 on an empty schema, so size is the only
+          # thing standing between "backed up" and "backed up nothing".
+          if [ "$SIZE" -lt 4096 ]; then
+            echo "::error::Dump is ${SIZE} bytes -- implausibly small. Refusing to treat this as a backup."
+            exit 1
+          fi
+
+          # VERIFY BEFORE UPLOAD, by parsing the archive back. This is what
+          # catches a truncated or corrupt dump, which uploads perfectly happily
+          # and is discovered only when someone needs it.
+          if ! pg_restore --list "$LOCAL" > /tmp/toc.txt; then
+            echo "::error::pg_restore could not read the archive. It is not a usable backup."
+            exit 1
+          fi
+          echo "archive contains $(wc -l < /tmp/toc.txt) entries"
+
+          aws s3 cp "$LOCAL" "s3://${BUCKET}/${KEY}" --only-show-errors
+
+          # Confirm from the SERVICE, not from the exit code of the upload.
+          REMOTE="$(aws s3api head-object --bucket "$BUCKET" --key "$KEY" \
+            --query ContentLength --output text)"
+          if [ "$REMOTE" != "$SIZE" ]; then
+            echo "::error::Uploaded ${REMOTE} bytes but the dump is ${SIZE}."
+            exit 1
+          fi
+
+          echo "verified s3://${BUCKET}/${KEY} (${SIZE} bytes)"
+          echo "size=$SIZE" >> "$GITHUB_OUTPUT"
+
+      # A HEARTBEAT, not a success message.
+      #
+      # A failure notification cannot cover the case this catches: the workflow
+      # being disabled, the schedule being removed, or GitHub simply not firing
+      # it. Nothing fails, so nothing reports, and the backups quietly stop.
+      #
+      # Publishing 0 on every success lets an alarm with
+      # treat_missing_data = "breaching" alarm on ABSENCE -- exactly the
+      # reasoning modules/monitoring gives for the game-loop alarm, and the same
+      # failure shape: a heartbeat that stops without complaining.
+      - name: Publish backup heartbeat
+        run: |
+          set -euo pipefail
+          aws cloudwatch put-metric-data \
+            --namespace "FanosBingo/fanosbingo-${ENVIRONMENT}" \
+            --metric-name HoursSinceLastBackup \
+            --dimensions "Environment=${ENVIRONMENT}" \
+            --value 0 \
+            --unit Count
+
+      # Reaches email AND Telegram, because that topic now has both. A red tab
+      # on a scheduled workflow is seen by nobody; this is the difference
+      # between a backup gap that is noticed tonight and one noticed during a
+      # restore.
+      - name: Report failure to the alerts topic
+        if: failure()
+        run: |
+          set -euo pipefail
+          ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
+          aws sns publish \
+            --topic-arn "arn:aws:sns:${AWS_REGION}:${ACCOUNT}:fanosbingo-${ENVIRONMENT}-alerts" \
+            --subject "Database backup FAILED (${ENVIRONMENT})" \
+            --message "$(printf '%s\n' \
+              'The nightly logical backup did not complete.' \
+              '' \
+              'RDS point-in-time recovery is capped at 1 day on this account, so' \
+              'until this succeeds there is no recovery point older than 24 hours.' \
+              '' \
+              'Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}')"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Database backup — ${ENVIRONMENT}"
+            echo
+            if [ "${{ steps.dump.outcome }}" = "success" ]; then
+              echo "- \`s3://${{ steps.dump.outputs.bucket }}/${{ steps.dump.outputs.key }}\`"
+              echo "- ${{ steps.dump.outputs.size }} bytes, archive parsed back with \`pg_restore --list\`"
+              echo "- kept 30 days by the bucket lifecycle rule"
+            else
+              echo "- **FAILED.** No recovery point older than 24 hours exists until this succeeds."
+            fi
+            echo
+            echo "Restore: \`pg_restore --clean --if-exists -d \"\$DATABASE_URL\" <file>\`"
+          } >> "$GITHUB_STEP_SUMMARY"

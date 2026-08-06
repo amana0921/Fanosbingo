@@ -404,6 +404,69 @@ data "aws_iam_policy_document" "github_deploy" {
   }
 
   # ---------------------------------------------------------------------
+  # Nightly logical backups
+  #
+  # The bucket lives in the ACCOUNT root, because a backup stored inside the
+  # thing it backs up is not a backup. Its name is constructed here rather than
+  # passed in, so this module keeps no dependency on that root -- the same
+  # technique modules/app_stack uses for the alerts topic, and for the same
+  # reason: a cross-root reference buys nothing when the name is deterministic.
+  #
+  # WRITE-ONLY, AND SCOPED TO THIS ENVIRONMENT'S PREFIX.
+  #
+  # No s3:DeleteObject and no DeleteObjectVersion. A principal that can erase
+  # the backups cannot be trusted to be the one that writes them: ransomware and
+  # a panicking operator both reach for delete, and expiry is the lifecycle
+  # rule's job, not this role's. Versioning on the bucket covers overwrite.
+  #
+  # No s3:GetObject either. Restoring is a deliberate act performed by a human
+  # with credentials, not something a nightly job needs the ability to do -- and
+  # a role that cannot read the dumps cannot exfiltrate the ledger if the
+  # workflow is ever compromised. ListBucket is granted only so the job can
+  # verify its own upload landed.
+  statement {
+    sid    = "WriteNightlyBackups"
+    effect = "Allow"
+    actions = [
+      "s3:PutObject",
+    ]
+    resources = [
+      "arn:${local.partition}:s3:::${var.project_name}-backups-${local.account_id}/${var.environment}/*",
+    ]
+  }
+
+  statement {
+    sid       = "ConfirmBackupLanded"
+    effect    = "Allow"
+    actions   = ["s3:ListBucket"]
+    resources = ["arn:${local.partition}:s3:::${var.project_name}-backups-${local.account_id}"]
+
+    condition {
+      test     = "StringLike"
+      variable = "s3:prefix"
+      values   = ["${var.environment}/*"]
+    }
+  }
+
+  # So a FAILING backup can say so.
+  #
+  # Without this the failure branch of db-backup.yml is itself denied, and the
+  # notification about a missed backup is the thing that goes missing -- the
+  # exact failure shape the whole workflow is built to avoid, one level up.
+  # Found by reading this policy rather than by watching a backup fail quietly.
+  #
+  # Scoped to this environment's alerts topic, so the role cannot publish to the
+  # ACCOUNT security topic, which carries root-usage and unexpected-kms-sign.
+  # Being able to forge those would let a compromised deploy role bury the
+  # detections that exist to catch it.
+  statement {
+    sid       = "ReportBackupFailure"
+    effect    = "Allow"
+    actions   = ["sns:Publish"]
+    resources = ["arn:${local.partition}:sns:*:${local.account_id}:${var.name_prefix}-alerts"]
+  }
+
+  # ---------------------------------------------------------------------
   # Security control verification
   #
   # verify-detections.sh reads the DEPLOYED metric filters back and tests them

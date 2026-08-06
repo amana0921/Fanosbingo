@@ -340,3 +340,116 @@ resource "aws_budgets_budget" "account_total" {
     subscriber_email_addresses = var.alert_emails
   }
 }
+
+# ---------------------------------------------------------------------------
+# Logical backups
+#
+# WHY THIS EXISTS WHEN RDS ALREADY TAKES BACKUPS.
+#
+# It does, and they are capped at ONE DAY. Not by choice --
+# `backup_retention_period` above 1 is refused outright on this account:
+#
+#   FreeTierRestrictionError: The specified backup retention period exceeds
+#   the maximum available to free tier customers.
+#
+# Retried with 2 and refused identically, so the ceiling is exactly 1. Lifting
+# it is a billing decision, deliberately deferred.
+#
+# So point-in-time recovery answers "undo what happened in the last 24 hours",
+# and nothing answers "undo what happened last Monday". For a system holding
+# real player balances that is the WRONG WAY ROUND: disk failure is loud and
+# immediate, while the failures that actually cost money -- a bad migration, a
+# fraudulent approval, a wrong UPDATE -- are quiet and found days later. The
+# monthly restore drill passes and proves only that you can recover from
+# something you noticed today.
+#
+# AWS caps retention. It does not stop us keeping our own copies. A nightly
+# pg_dump to this bucket turns a 1-day window into 30 days for approximately
+# nothing: the database holds a few MB of actual data, and thirty compressed
+# dumps sit inside the 5 GB S3 free tier.
+#
+# IN THE ACCOUNT ROOT, NOT THE ENVIRONMENT, and that is the whole point of the
+# placement. A backup stored inside the thing it backs up is not a backup. The
+# same argument the audit key above makes for CloudTrail: these must outlive the
+# environment they describe, including the case where that environment was
+# destroyed by the incident.
+#
+# SSE-S3 RATHER THAN A CMK, deliberately, and this inverts the usual advice.
+# Every environment CMK is destroyed with its environment -- dev's has a 7-day
+# window. A backup encrypted with a key that dies alongside the database is
+# ciphertext, not a recovery point. SSE-S3 is managed by AWS, outlives every
+# key here, and costs nothing. Confidentiality still rests on the bucket policy
+# and IAM, which is where it rested with a CMK too.
+# ---------------------------------------------------------------------------
+resource "aws_s3_bucket" "backups" {
+  bucket = "${local.name_prefix}-backups-${data.aws_caller_identity.current.account_id}"
+
+  # No force_destroy. `terraform destroy` FAILING on a bucket with objects in it
+  # is the correct outcome for the only copy of the ledger that is not inside
+  # the environment being destroyed.
+  tags = { Name = "${local.name_prefix}-backups" }
+}
+
+resource "aws_s3_bucket_public_access_block" "backups" {
+  bucket = aws_s3_bucket.backups.id
+
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "backups" {
+  bucket = aws_s3_bucket.backups.id
+
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+    bucket_key_enabled = true
+  }
+}
+
+# Versioning protects against the failure this bucket exists to survive: a
+# principal that can write here can also overwrite. A version cannot be
+# silently replaced, only added to.
+resource "aws_s3_bucket_versioning" "backups" {
+  bucket = aws_s3_bucket.backups.id
+
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "backups" {
+  bucket = aws_s3_bucket.backups.id
+
+  # Explicit dependency: S3 rejects a lifecycle rule referencing noncurrent
+  # versions on a bucket where versioning is still being enabled.
+  depends_on = [aws_s3_bucket_versioning.backups]
+
+  rule {
+    id     = "expire-old-dumps"
+    status = "Enabled"
+
+    filter {}
+
+    # THIRTY DAYS is the number that matters, and it is chosen against how long
+    # a quiet failure takes to surface rather than against storage cost. A
+    # disputed balance or a bad migration is typically noticed within days, not
+    # hours -- which is precisely the range RDS's 1-day cap cannot reach.
+    expiration {
+      days = var.backup_retention_days
+    }
+
+    noncurrent_version_expiration {
+      noncurrent_days = 7
+    }
+
+    # Housekeeping: a failed multipart upload otherwise bills forever while
+    # being invisible in the object listing.
+    abort_incomplete_multipart_upload {
+      days_after_initiation = 3
+    }
+  }
+}

@@ -256,6 +256,11 @@ module "monitoring" {
   # in the change that stands prod up.
   enable_telegram_alerts = false
 
+  # OFF until prod has a backup schedule. The alarm treats absent data as
+  # breaching, deliberately, so enabling it before db-backup.yml runs here would
+  # alarm from the moment it is created.
+  enable_backup_alarm = false
+
   # Must match the namespace the containers publish to, or the game-loop alarm
   # watches nothing. Sourced from iam rather than restated, so it cannot drift.
   metric_namespace = module.iam.metric_namespace
