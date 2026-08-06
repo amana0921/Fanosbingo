@@ -111,8 +111,26 @@ if [ "${2:-}" = "--fire" ]; then
   echo "  ${GREEN}sent${NC} OK"
 
   echo
-  echo "Expect TWO emails. If neither arrives, the alarm's actions or its SNS"
-  echo "subscription are the problem, not the metric."
+  echo "Expect TWO messages on EVERY confirmed channel: two emails, and two"
+  echo "Telegram messages from the bot."
+  echo
+  echo "CHECK THE DEVICE, NOT THE CONSOLE. That is the whole point of this"
+  echo "command. An SNS SMS subscription needs no confirmation click, so it"
+  echo "reports active whether or not anything is delivered -- Terraform, the"
+  echo "console and list-subscriptions all called the SMS channel healthy while"
+  echo "every message was dropped, because the account is not enrolled in AWS"
+  echo "End User Messaging. It was found by firing this and asking whether the"
+  echo "handset rang."
+  echo
+  echo "If a channel is silent, the fault is its subscription or its delivery"
+  echo "path, not the metric -- the metric is what this command bypassed."
+  echo
+  echo "Telegram silent but email fine?  The forwarder is a route on the"
+  echo "functions container, so check its log for alert_forwarded /"
+  echo "alert_forward_failed before suspecting SNS:"
+  echo
+  echo "  aws logs filter-log-events --log-group-name /ecs/${PREFIX} \\"
+  echo "    --filter-pattern '\"alert_\"' --start-time \$(( (\$(date +%s) - 600) * 1000 ))"
   exit 0
 fi
 
