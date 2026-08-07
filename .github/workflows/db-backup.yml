@@ -235,23 +235,46 @@ jobs:
           export PGPASSWORD='verify-only-never-leaves-this-runner'
           VERIFY="postgresql://postgres@127.0.0.1:5433/verify"
 
+          # THE THREE ROLES THE POLICIES NAME, created before the restore.
+          #
+          # --no-privileges skips GRANTs. It does NOT skip RLS POLICIES, and
+          # every policy in this schema names anon, authenticated or
+          # service_role. A bare container has none of them, so without this the
+          # restore emits 32 "role does not exist" errors and every policy is
+          # silently dropped -- meaning the check would pass on a restore that
+          # had lost its entire authorization layer.
+          #
+          # Creating them mirrors db/00-bootstrap and makes this a faithful
+          # rehearsal rather than a data-only load. MEASURED: 37 unexpected
+          # errors before, 0 after.
+          psql "$VERIFY" -q -c "CREATE ROLE anon NOLOGIN;" \
+                            -c "CREATE ROLE authenticated NOLOGIN;" \
+                            -c "CREATE ROLE service_role NOLOGIN;"
+
           # NOT --exit-on-error, and this is a judgement rather than laziness.
           #
-          # The dump contains CREATE EXTENSION pg_cron, which RDS provides and a
-          # stock postgres:16 image does not. That single statement will fail
-          # here and means nothing about the backup. Failing the whole restore on
-          # it would make this check permanently red and therefore ignored.
+          # pg_cron is provided by RDS and not by a stock postgres:16, so six
+          # statements fail here and mean nothing about the backup: the two
+          # CREATE EXTENSION lines, and the four objects in the `cron` schema
+          # that follow from them. Failing on those would make this check
+          # permanently red and therefore ignored.
           #
-          # So errors are captured and CLASSIFIED instead: anything mentioning an
-          # extension is expected, anything else is a real restore failure. That
-          # keeps the check strict without making it a liar.
+          # Errors are CLASSIFIED instead, and the allowlist is deliberately
+          # narrow -- extension and cron only. An earlier version also excused
+          # "must be owner" and "already exists", which would have hidden real
+          # restore failures.
           set +e
           pg_restore --dbname="$VERIFY" --no-owner --no-privileges "$LOCAL" 2> /tmp/restore.err
           set -e
 
-          UNEXPECTED="$(grep -i 'error' /tmp/restore.err | grep -viE 'extension|pg_cron|must be owner|already exists' || true)"
+          # `^pg_restore: error:` -- its own prefix for a genuine failure -- and
+          # NOT `grep -i error`, which also matches the summary line
+          # "pg_restore: warning: errors ignored on restore: 6" and would fail
+          # the run on a successful restore. Found by running this against a real
+          # archive rather than by reading it.
+          UNEXPECTED="$(grep '^pg_restore: error:' /tmp/restore.err | grep -viE 'extension|cron' || true)"
           if [ -n "$UNEXPECTED" ]; then
-            echo "::error::Restore produced errors that are not about extensions:"
+            echo "::error::Restore produced errors beyond the expected pg_cron ones:"
             echo "$UNEXPECTED" | head -20
             exit 1
           fi
