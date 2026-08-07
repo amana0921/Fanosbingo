@@ -33,3 +33,33 @@ AVD-AWS-0104
 # ---------------------------------------------------------------------------
 AWS-0164
 AVD-AWS-0164
+
+# ---------------------------------------------------------------------------
+# Backups bucket is not encrypted with a customer managed key
+#
+# DELIBERATE, AND IT INVERTS THE USUAL ADVICE. The finding is correct in general
+# and wrong for this specific bucket.
+#
+# A CMK buys key rotation, access policy and auditability. It also creates a
+# dependency: the object is unreadable without the key. Every key in this account
+# belongs to an ENVIRONMENT and is destroyed with it -- dev's deletion window is
+# 7 days, prod's 30.
+#
+# This bucket exists to survive the loss of an environment, including the case
+# where that environment was destroyed BY the incident being recovered from. A
+# backup encrypted with a key that died alongside the database is not a recovery
+# point, it is ciphertext. That is the exact failure this bucket is meant to
+# prevent, reintroduced by the control meant to harden it.
+#
+# The alternative -- an account-level CMK, like the audit key -- would work, and
+# is worth revisiting if these ever hold anything beyond a single account's own
+# ledger. It was not taken here because it adds a cross-root dependency for a
+# benefit that access control already provides: confidentiality rests on the
+# bucket policy and IAM either way, and those are unchanged by the choice of key.
+#
+# Compensating controls, all present: account-wide public access block plus a
+# bucket-level one, versioning, no s3:GetObject or s3:DeleteObject in the writing
+# role, and a lifecycle rule rather than a principal deciding what expires.
+# ---------------------------------------------------------------------------
+AWS-0132
+AVD-AWS-0132
