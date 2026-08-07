@@ -218,6 +218,11 @@ jobs:
           # RDS to 15432 and walks upward from there, so the two cannot converge
           # -- and they must not, because a restore aimed at the tunnel would
           # load the backup INTO THE LIVE DATABASE.
+          # PULLED FIRST, so the download is not inside the readiness window.
+          # `docker run` returns as soon as the container is created, so a pull
+          # counted against the wait below and helped exhaust it.
+          docker pull -q postgres:16 > /dev/null
+
           docker run -d --rm --name verifydb --network host \
             -e POSTGRES_PASSWORD=verify-only-never-leaves-this-runner \
             -e POSTGRES_DB=verify \
@@ -228,9 +233,20 @@ jobs:
           export PGPASSWORD='verify-only-never-leaves-this-runner'
           VERIFY="postgresql://postgres@127.0.0.1:5433/verify"
 
-          for i in $(seq 1 30); do
+          # 120 SECONDS, NOT 60, and the reason is specific.
+          #
+          # The postgres entrypoint does not start listening on TCP when the
+          # container starts. It runs initdb against a UNIX SOCKET ONLY, applies
+          # any init scripts, shuts that temporary server down, and only then
+          # starts the real one. Until "PostgreSQL init process complete; ready
+          # for start up" appears, port 5433 does not exist and pg_isready
+          # correctly reports "no response".
+          #
+          # A previous run failed on exactly this: the container log showed the
+          # real server starting 0.1s AFTER the sixty-second wait gave up.
+          for i in $(seq 1 60); do
             if pg_isready -h 127.0.0.1 -p 5433 -U postgres -q; then break; fi
-            if [ "$i" = "30" ]; then
+            if [ "$i" = "60" ]; then
               echo "::error::Verification database never accepted connections."
               pg_isready -h 127.0.0.1 -p 5433 -U postgres || true
               docker logs verifydb 2>&1 | tail -20 || true
