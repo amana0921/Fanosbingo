@@ -70,46 +70,9 @@ jobs:
     name: Dump ${{ github.event.inputs.environment || 'dev' }}
     runs-on: ubuntu-latest
 
-    # A THROWAWAY POSTGRES TO RESTORE INTO, so this workflow proves the dump is
-    # RESTORABLE rather than merely parseable.
-    #
-    # `pg_restore --list` reads the table of contents. That catches truncation
-    # and corruption and nothing else -- an archive can list perfectly and still
-    # fail to load. The only way to know a backup works is to restore it, and
-    # until that happens "we have backups" is a belief rather than a fact.
-    #
-    # A SERVICE CONTAINER rather than the RDS restore-drill instance, for three
-    # reasons that all point the same way: it costs nothing, it needs no tunnel,
-    # and -- most importantly -- it requires NO s3:GetObject. The dump is still
-    # on local disk at this point, so it is verified before it is uploaded and
-    # the deploy role never gains the ability to read the ledger back out of S3.
-    #
-    # The alternative shapes were both worse. Passing the dump between jobs
-    # needs upload-artifact, and on a PUBLIC repository an artifact containing
-    # player balances is downloadable by anyone. Restoring from S3 in a later job
-    # needs read access this role is deliberately denied.
-    #
-    # db-restore-drill.yml still exists and still matters: it proves the RDS
-    # SNAPSHOT path and the tunnel. This proves the dump path. Different
-    # artefacts, different failure modes, both worth exercising.
-    services:
-      verify:
-        image: postgres:16
-        env:
-          POSTGRES_PASSWORD: verify-only-never-leaves-this-runner
-          POSTGRES_DB: verify
-        # 5433 on the host. scripts/db-tunnel.sh forwards RDS to 15432 (and
-        # walks upward if that is taken), so there is no collision either way --
-        # but the two must never converge, because a restore aimed at the tunnel
-        # would load the backup INTO THE LIVE DATABASE. Checked rather than
-        # assumed: scripts/db-tunnel.sh:41.
-        ports:
-          - 5433:5432
-        options: >-
-          --health-cmd "pg_isready -U postgres"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
+    # The throwaway PostgreSQL this job restores into is started INSIDE the
+    # step with `docker run --network host`, not declared as a `services:`
+    # container. See the restore block for why.
 
     # Declaring the environment is what puts this behind its protection rules
     # and gives the OIDC subject `environment:<name>`. infra/modules/iam is
@@ -234,46 +197,49 @@ jobs:
           trap - EXIT
           echo "  tunnel closed"
 
+          # STARTED HERE, NOT AS A `services:` CONTAINER, and that is a fix
+          # rather than a preference.
+          #
+          # As a service container this was unreachable, and the evidence was
+          # unambiguous: postgres logged "ready to accept connections", docker
+          # published 5432/tcp -> 0.0.0.0:5433, `ss -ltn` showed 5433 LISTENING
+          # on the runner -- and pg_isready got "no response" for sixty seconds.
+          # The port was bound and nothing was behind it, so the fault was in the
+          # publishing layer between the runner and the container, not in either
+          # end.
+          #
+          # --network host removes that layer completely: postgres binds the
+          # runner's own 5433 with no docker-proxy in the path. It also puts the
+          # container's lifecycle in this script, where it can be waited on and
+          # torn down explicitly instead of hoping the health check means what it
+          # appears to mean.
+          #
+          # PGPORT=5433 rather than the default: scripts/db-tunnel.sh forwards
+          # RDS to 15432 and walks upward from there, so the two cannot converge
+          # -- and they must not, because a restore aimed at the tunnel would
+          # load the backup INTO THE LIVE DATABASE.
+          docker run -d --rm --name verifydb --network host \
+            -e POSTGRES_PASSWORD=verify-only-never-leaves-this-runner \
+            -e POSTGRES_DB=verify \
+            -e PGPORT=5433 \
+            postgres:16 > /dev/null
+          trap 'docker rm -f verifydb >/dev/null 2>&1 || true' EXIT
+
           export PGPASSWORD='verify-only-never-leaves-this-runner'
           VERIFY="postgresql://postgres@127.0.0.1:5433/verify"
 
-          # WAIT FOR THE SERVICE, rather than assuming Docker's health check and
-          # readiness for CONNECTIONS are the same moment. They are not: the
-          # container reports healthy as soon as pg_isready passes inside it,
-          # while the published port can still refuse for a beat afterwards.
-          #
-          # An earlier version went straight to psql here and the step died with
-          # exit 2 -- psql's "connection went bad" -- and printed nothing at all,
-          # which is a remarkably unhelpful way to spend a debugging session.
-          for i in $(seq 1 15); do
+          for i in $(seq 1 30); do
             if pg_isready -h 127.0.0.1 -p 5433 -U postgres -q; then break; fi
-            if [ "$i" = "15" ]; then
-              # Say WHY, rather than only that it timed out. A silent timeout
-              # here cost two runs to narrow down; these three commands
-              # distinguish "the container is gone", "the port is not published"
-              # and "it is published and refusing" from each other immediately.
+            if [ "$i" = "30" ]; then
               echo "::error::Verification database never accepted connections."
-              echo "--- pg_isready ---";  pg_isready -h 127.0.0.1 -p 5433 -U postgres || true
-              echo "--- listening ---";   ss -ltnp 2>/dev/null | head -20 || true
-              echo "--- containers ---";  docker ps --format '{{.Names}} {{.Status}} {{.Ports}}' || true
+              pg_isready -h 127.0.0.1 -p 5433 -U postgres || true
+              docker logs verifydb 2>&1 | tail -20 || true
               exit 1
             fi
             sleep 2
           done
           echo "  verify database is accepting connections"
 
-          # THE THREE ROLES THE POLICIES NAME, created before the restore.
-          #
-          # --no-privileges skips GRANTs. It does NOT skip RLS POLICIES, and
-          # every policy in this schema names anon, authenticated or
-          # service_role. A bare container has none of them, so without this the
-          # restore emits 32 "role does not exist" errors and every policy is
-          # silently dropped -- meaning the check would pass on a restore that
-          # had lost its entire authorization layer.
-          #
-          # Creating them mirrors db/00-bootstrap and makes this a faithful
-          # rehearsal rather than a data-only load. MEASURED: 37 unexpected
-          # errors before, 0 after.
           echo "  creating the roles the RLS policies name"
           psql "$VERIFY" -q -c "CREATE ROLE anon NOLOGIN;" \
                             -c "CREATE ROLE authenticated NOLOGIN;" \
