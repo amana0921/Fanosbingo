@@ -245,9 +245,19 @@ jobs:
           # An earlier version went straight to psql here and the step died with
           # exit 2 -- psql's "connection went bad" -- and printed nothing at all,
           # which is a remarkably unhelpful way to spend a debugging session.
-          for i in $(seq 1 30); do
+          for i in $(seq 1 15); do
             if pg_isready -h 127.0.0.1 -p 5433 -U postgres -q; then break; fi
-            [ "$i" = "30" ] && { echo "::error::Verification database never accepted connections."; exit 1; }
+            if [ "$i" = "15" ]; then
+              # Say WHY, rather than only that it timed out. A silent timeout
+              # here cost two runs to narrow down; these three commands
+              # distinguish "the container is gone", "the port is not published"
+              # and "it is published and refusing" from each other immediately.
+              echo "::error::Verification database never accepted connections."
+              echo "--- pg_isready ---";  pg_isready -h 127.0.0.1 -p 5433 -U postgres || true
+              echo "--- listening ---";   ss -ltnp 2>/dev/null | head -20 || true
+              echo "--- containers ---";  docker ps --format '{{.Names}} {{.Status}} {{.Ports}}' || true
+              exit 1
+            fi
             sleep 2
           done
           echo "  verify database is accepting connections"
