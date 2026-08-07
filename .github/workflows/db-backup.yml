@@ -26,8 +26,12 @@ name: Database backup
 # "the dump fails and nobody finds out until they need it". Every design choice
 # below follows from that:
 #
-#   * the archive is VERIFIED after upload, by parsing it back, because a
-#     truncated or empty dump uploads perfectly happily
+#   * the dump is RESTORED into a throwaway PostgreSQL and its tables counted,
+#     BEFORE it is uploaded. Parsing an archive proves it is well formed; only
+#     restoring it proves it works, and a bad backup that looks fine is worse
+#     than none -- it turns "we know we are exposed" into "we think we are
+#     covered". Uploading happens only after the restore succeeds, so a dump
+#     that cannot be loaded is never stored as though it were good
 #   * a failure PUBLISHES TO THE ALERTS TOPIC, which now reaches email and
 #     Telegram, rather than colouring a tab red where nobody is looking
 #   * a heartbeat metric is published on success, so an alarm can catch this
@@ -65,6 +69,47 @@ jobs:
   backup:
     name: Dump ${{ github.event.inputs.environment || 'dev' }}
     runs-on: ubuntu-latest
+
+    # A THROWAWAY POSTGRES TO RESTORE INTO, so this workflow proves the dump is
+    # RESTORABLE rather than merely parseable.
+    #
+    # `pg_restore --list` reads the table of contents. That catches truncation
+    # and corruption and nothing else -- an archive can list perfectly and still
+    # fail to load. The only way to know a backup works is to restore it, and
+    # until that happens "we have backups" is a belief rather than a fact.
+    #
+    # A SERVICE CONTAINER rather than the RDS restore-drill instance, for three
+    # reasons that all point the same way: it costs nothing, it needs no tunnel,
+    # and -- most importantly -- it requires NO s3:GetObject. The dump is still
+    # on local disk at this point, so it is verified before it is uploaded and
+    # the deploy role never gains the ability to read the ledger back out of S3.
+    #
+    # The alternative shapes were both worse. Passing the dump between jobs
+    # needs upload-artifact, and on a PUBLIC repository an artifact containing
+    # player balances is downloadable by anyone. Restoring from S3 in a later job
+    # needs read access this role is deliberately denied.
+    #
+    # db-restore-drill.yml still exists and still matters: it proves the RDS
+    # SNAPSHOT path and the tunnel. This proves the dump path. Different
+    # artefacts, different failure modes, both worth exercising.
+    services:
+      verify:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: verify-only-never-leaves-this-runner
+          POSTGRES_DB: verify
+        # 5433 on the host. scripts/db-tunnel.sh forwards RDS to 15432 (and
+        # walks upward if that is taken), so there is no collision either way --
+        # but the two must never converge, because a restore aimed at the tunnel
+        # would load the backup INTO THE LIVE DATABASE. Checked rather than
+        # assumed: scripts/db-tunnel.sh:41.
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
 
     # Declaring the environment is what puts this behind its protection rules
     # and gives the OIDC subject `environment:<name>`. infra/modules/iam is
@@ -170,6 +215,71 @@ jobs:
           fi
           echo "archive contains $(wc -l < /tmp/toc.txt) entries"
 
+          # ---------------------------------------------------------------
+          # ACTUALLY RESTORE IT.
+          #
+          # Everything above proves the file is well formed. This proves it
+          # works, which is a different claim and the only one that matters at
+          # 3am. It runs BEFORE the upload on purpose: a dump that cannot be
+          # restored must not be stored as though it were good, because a bad
+          # backup that looks fine is worse than no backup at all -- it converts
+          # "we know we are exposed" into "we think we are covered".
+          #
+          # The tunnel is closed first. Restoring while a forwarder to the LIVE
+          # database is open on this runner is a hazard worth removing rather
+          # than relying on port numbers to avoid.
+          # ---------------------------------------------------------------
+          stop_db_tunnel
+          trap - EXIT
+
+          export PGPASSWORD='verify-only-never-leaves-this-runner'
+          VERIFY="postgresql://postgres@127.0.0.1:5433/verify"
+
+          # NOT --exit-on-error, and this is a judgement rather than laziness.
+          #
+          # The dump contains CREATE EXTENSION pg_cron, which RDS provides and a
+          # stock postgres:16 image does not. That single statement will fail
+          # here and means nothing about the backup. Failing the whole restore on
+          # it would make this check permanently red and therefore ignored.
+          #
+          # So errors are captured and CLASSIFIED instead: anything mentioning an
+          # extension is expected, anything else is a real restore failure. That
+          # keeps the check strict without making it a liar.
+          set +e
+          pg_restore --dbname="$VERIFY" --no-owner --no-privileges "$LOCAL" 2> /tmp/restore.err
+          set -e
+
+          UNEXPECTED="$(grep -i 'error' /tmp/restore.err | grep -viE 'extension|pg_cron|must be owner|already exists' || true)"
+          if [ -n "$UNEXPECTED" ]; then
+            echo "::error::Restore produced errors that are not about extensions:"
+            echo "$UNEXPECTED" | head -20
+            exit 1
+          fi
+
+          # THE TABLES THE MONEY LIVES IN. Naming them explicitly is the point:
+          # a restore that succeeds into an empty database also "succeeds", and
+          # row counts are what tell the two apart.
+          for t in telegram_users games players deposit_requests withdrawal_requests; do
+            N="$(psql "$VERIFY" -tAc "SELECT count(*) FROM public.${t}" 2>/dev/null || echo MISSING)"
+            if [ "$N" = "MISSING" ]; then
+              echo "::error::Table public.${t} is absent from the restored database."
+              exit 1
+            fi
+            echo "  restored ${t}: ${N} rows"
+          done
+
+          # A schema with no players in it restored fine and is still not a
+          # backup of anything. This is the difference between "the file loaded"
+          # and "the ledger is in there".
+          USERS="$(psql "$VERIFY" -tAc 'SELECT count(*) FROM public.telegram_users')"
+          if [ "$USERS" -lt 1 ]; then
+            echo "::error::Restored telegram_users is empty. This is not a backup of a live system."
+            exit 1
+          fi
+
+          echo "restore verified: ${USERS} players present"
+          echo "restored_users=$USERS" >> "$GITHUB_OUTPUT"
+
           aws s3 cp "$LOCAL" "s3://${BUCKET}/${KEY}" --only-show-errors
 
           # Confirm from the SERVICE, not from the exit code of the upload.
@@ -231,7 +341,8 @@ jobs:
             echo
             if [ "${{ steps.dump.outcome }}" = "success" ]; then
               echo "- \`s3://${{ steps.dump.outputs.bucket }}/${{ steps.dump.outputs.key }}\`"
-              echo "- ${{ steps.dump.outputs.size }} bytes, archive parsed back with \`pg_restore --list\`"
+              echo "- ${{ steps.dump.outputs.size }} bytes"
+              echo "- **restored into a throwaway PostgreSQL 16 and checked**: ${{ steps.dump.outputs.restored_users }} players present"
               echo "- kept 30 days by the bucket lifecycle rule"
             else
               echo "- **FAILED.** No recovery point older than 24 hours exists until this succeeds."
