@@ -229,11 +229,28 @@ jobs:
           # database is open on this runner is a hazard worth removing rather
           # than relying on port numbers to avoid.
           # ---------------------------------------------------------------
-          stop_db_tunnel
+          echo "::group::restore verification"
+          stop_db_tunnel || echo "  (tunnel already closed)"
           trap - EXIT
+          echo "  tunnel closed"
 
           export PGPASSWORD='verify-only-never-leaves-this-runner'
           VERIFY="postgresql://postgres@127.0.0.1:5433/verify"
+
+          # WAIT FOR THE SERVICE, rather than assuming Docker's health check and
+          # readiness for CONNECTIONS are the same moment. They are not: the
+          # container reports healthy as soon as pg_isready passes inside it,
+          # while the published port can still refuse for a beat afterwards.
+          #
+          # An earlier version went straight to psql here and the step died with
+          # exit 2 -- psql's "connection went bad" -- and printed nothing at all,
+          # which is a remarkably unhelpful way to spend a debugging session.
+          for i in $(seq 1 30); do
+            if pg_isready -h 127.0.0.1 -p 5433 -U postgres -q; then break; fi
+            [ "$i" = "30" ] && { echo "::error::Verification database never accepted connections."; exit 1; }
+            sleep 2
+          done
+          echo "  verify database is accepting connections"
 
           # THE THREE ROLES THE POLICIES NAME, created before the restore.
           #
@@ -247,6 +264,7 @@ jobs:
           # Creating them mirrors db/00-bootstrap and makes this a faithful
           # rehearsal rather than a data-only load. MEASURED: 37 unexpected
           # errors before, 0 after.
+          echo "  creating the roles the RLS policies name"
           psql "$VERIFY" -q -c "CREATE ROLE anon NOLOGIN;" \
                             -c "CREATE ROLE authenticated NOLOGIN;" \
                             -c "CREATE ROLE service_role NOLOGIN;"
@@ -263,6 +281,7 @@ jobs:
           # narrow -- extension and cron only. An earlier version also excused
           # "must be owner" and "already exists", which would have hidden real
           # restore failures.
+          echo "  restoring"
           set +e
           pg_restore --dbname="$VERIFY" --no-owner --no-privileges "$LOCAL" 2> /tmp/restore.err
           set -e
@@ -301,6 +320,7 @@ jobs:
           fi
 
           echo "restore verified: ${USERS} players present"
+          echo "::endgroup::"
           echo "restored_users=$USERS" >> "$GITHUB_OUTPUT"
 
           aws s3 cp "$LOCAL" "s3://${BUCKET}/${KEY}" --only-show-errors
