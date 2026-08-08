@@ -466,7 +466,7 @@ export function createTotpConfirmHandler(pool) {
 
     try {
       const { rows } = await pool.query(
-        'SELECT totp_secret, totp_confirmed_at FROM telegram_users WHERE id = $1',
+        'SELECT secret, confirmed_at FROM admin_totp WHERE user_id = $1',
         [uid],
       );
 
