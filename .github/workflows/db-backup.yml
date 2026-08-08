@@ -241,10 +241,21 @@ jobs:
           # torn down explicitly instead of hoping the health check means what it
           # appears to mean.
           #
-          # PGPORT=5433 rather than the default: scripts/db-tunnel.sh forwards
-          # RDS to 15432 and walks upward from there, so the two cannot converge
-          # -- and they must not, because a restore aimed at the tunnel would
-          # load the backup INTO THE LIVE DATABASE.
+          # `-p 5433` AS A SERVER ARGUMENT, not -e PGPORT=5433, and this was the
+          # last cause of the verifier being unreachable.
+          #
+          # PGPORT is a LIBPQ CLIENT variable. The postgres server does not read
+          # it, so the container bound its default port and 5433 was never there
+          # -- which is why pg_isready reported "no response" while the container
+          # log cheerfully said "ready to accept connections". Both were true.
+          #
+          # The official image passes trailing arguments through to the server,
+          # so -p is how you actually move the port.
+          #
+          # 5433 rather than the default because scripts/db-tunnel.sh forwards
+          # RDS to 15432 and walks upward from there; the two must never
+          # converge, since a restore aimed at the tunnel would load the backup
+          # INTO THE LIVE DATABASE.
           # PULLED FIRST, so the download is not inside the readiness window.
           # `docker run` returns as soon as the container is created, so a pull
           # counted against the wait below and helped exhaust it.
@@ -253,8 +264,7 @@ jobs:
           docker run -d --rm --name verifydb --network host \
             -e POSTGRES_PASSWORD=verify-only-never-leaves-this-runner \
             -e POSTGRES_DB=verify \
-            -e PGPORT=5433 \
-            postgres:16 > /dev/null
+            postgres:16 -p 5433 > /dev/null
           trap 'docker rm -f verifydb >/dev/null 2>&1 || true' EXIT
 
           export PGPASSWORD='verify-only-never-leaves-this-runner'
