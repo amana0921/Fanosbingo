@@ -29,6 +29,12 @@
  * is free in any sense that matters.
  */
 
+import {
+  verify as verifyTotp,
+  generateSecret as generateTotpSecret,
+  otpauthUri as totpUri,
+} from './totp.js';
+
 /**
  * Express middleware. Chain AFTER requireAuth, which puts the proven identity on
  * req.auth.
@@ -302,5 +308,173 @@ export function createUpdateSettingHandler(pool) {
     });
 
     return res.json(result);
+  };
+}
+
+/**
+ * SECOND FACTOR, ON THE ACTION.
+ *
+ * Mounted after requireAdmin on the two operations that can invent or discharge
+ * money: approving a deposit and completing a withdrawal. Not on the login, and
+ * that is the design rather than an accident of where it was easy to put --
+ * a factor presented once at sign-in leaves fifteen minutes of session in which
+ * everything is single-factor again, and that window is exactly when the damage
+ * happens. See db/20-post/016.
+ *
+ * NOT MOUNTED on reads, on ending a game, or on settings. Six digits per
+ * approval is a real imposition on somebody clearing an overnight queue, and it
+ * is worth paying only where the operation moves money.
+ *
+ * NOT ENFORCED UNTIL ENROLLED, deliberately. An operator who has not enrolled
+ * keeps working exactly as before. Enforcing on an un-enrolled admin would lock
+ * the queue the moment this deploys -- and a deposit queue that cannot be
+ * cleared is the failure `deposits-waiting-too-long` exists to catch, caused by
+ * the control meant to protect it. Enrolment is therefore a decision, and the
+ * gap until it is made is stated rather than hidden.
+ */
+export function requireSecondFactor(pool) {
+  return async function secondFactor(req, res, next) {
+    const uid = req.auth?.uid;
+    if (!uid) {
+      req.log?.error?.({ event: 'second_factor_misconfigured' });
+      return res.status(500).json({ error: 'route misconfigured' });
+    }
+
+    let row;
+    try {
+      const { rows } = await pool.query(
+        'SELECT totp_secret, totp_confirmed_at FROM telegram_users WHERE id = $1',
+        [uid],
+      );
+      row = rows[0];
+    } catch (err) {
+      req.log?.error?.({ event: 'second_factor_lookup_failed', error: err.message });
+      return res.status(500).json({ error: 'internal error' });
+    }
+
+    // Not enrolled: proceed, and say so in the log every time. A gap that is
+    // recorded on each use is one somebody eventually closes; a silent one is
+    // one that is discovered afterwards.
+    if (!row?.totp_secret || !row?.totp_confirmed_at) {
+      req.log?.warn?.({ event: 'money_action_without_second_factor', admin_uid: uid, path: req.path });
+      return next();
+    }
+
+    const token = req.get('X-Admin-TOTP') ?? req.body?.totp;
+
+    if (!verifyTotp(row.totp_secret, typeof token === 'string' ? token.trim() : token)) {
+      // 428, not 401 or 403. The caller IS authenticated and IS an admin -- the
+      // request is refused because a precondition is unmet, and a client that
+      // reads 401 as "log in again" would send the operator round a loop that
+      // cannot fix anything.
+      req.log?.warn?.({
+        event: 'second_factor_rejected',
+        admin_uid: uid,
+        path: req.path,
+        supplied: typeof token === 'string' && token.length > 0,
+      });
+      return res.status(428).json({
+        error: 'second factor required',
+        code: 'TOTP_REQUIRED',
+      });
+    }
+
+    return next();
+  };
+}
+
+/**
+ * POST /admin/totp/enroll -> { secret, uri }
+ *
+ * Returns the secret ONCE, in the only response that will ever contain it.
+ * db/20-post/016 revokes SELECT on the column from anon and authenticated, so
+ * it cannot be read back through PostgREST afterwards -- which is the point: a
+ * stolen session must not be able to read the second factor it is trying to
+ * bypass.
+ *
+ * REFUSES TO OVERWRITE A CONFIRMED ENROLMENT. Otherwise this route is itself a
+ * single-factor way to replace the second factor, which is the same as not
+ * having one. Losing the phone is recovered by a human with database access,
+ * through the SSM tunnel -- the same bar as becoming an admin in the first place.
+ */
+export function createTotpEnrollHandler(pool) {
+  return async function totpEnroll(req, res) {
+    const uid = req.auth.uid;
+
+    try {
+      const { rows } = await pool.query(
+        'SELECT totp_confirmed_at FROM telegram_users WHERE id = $1',
+        [uid],
+      );
+
+      if (rows[0]?.totp_confirmed_at) {
+        return res.status(409).json({
+          error: 'already enrolled',
+          code: 'TOTP_ALREADY_ENROLLED',
+        });
+      }
+
+      const secret = generateTotpSecret();
+
+      // Confirmed_at stays null: a secret written but never proven is not
+      // enforced, so an abandoned enrolment cannot lock the operator out.
+      await pool.query(
+        'UPDATE telegram_users SET totp_secret = $2, totp_confirmed_at = NULL WHERE id = $1',
+        [uid, secret],
+      );
+
+      req.log?.warn?.({ event: 'totp_enrolment_started', admin_uid: uid });
+
+      return res.json({
+        secret,
+        uri: totpUri(secret, `admin-${req.auth.telegramUserId}`),
+      });
+    } catch (err) {
+      req.log?.error?.({ event: 'totp_enroll_failed', error: err.message });
+      return res.status(500).json({ error: 'internal error' });
+    }
+  };
+}
+
+/**
+ * POST /admin/totp/confirm { totp } -> { confirmed: true }
+ *
+ * Proves the operator can actually generate codes before anything starts
+ * depending on it. Without this step an enrolment that was mis-scanned would
+ * only be discovered at the moment somebody needed to approve a deposit.
+ */
+export function createTotpConfirmHandler(pool) {
+  return async function totpConfirm(req, res) {
+    const uid = req.auth.uid;
+    const token = typeof req.body?.totp === 'string' ? req.body.totp.trim() : null;
+
+    try {
+      const { rows } = await pool.query(
+        'SELECT totp_secret, totp_confirmed_at FROM telegram_users WHERE id = $1',
+        [uid],
+      );
+
+      if (!rows[0]?.totp_secret) {
+        return res.status(409).json({ error: 'not enrolled', code: 'TOTP_NOT_ENROLLED' });
+      }
+      if (rows[0].totp_confirmed_at) {
+        return res.status(409).json({ error: 'already enrolled', code: 'TOTP_ALREADY_ENROLLED' });
+      }
+      if (!verifyTotp(rows[0].totp_secret, token)) {
+        req.log?.warn?.({ event: 'totp_confirm_rejected', admin_uid: uid });
+        return res.status(400).json({ error: 'invalid code', code: 'TOTP_INVALID' });
+      }
+
+      await pool.query(
+        'UPDATE telegram_users SET totp_confirmed_at = now() WHERE id = $1',
+        [uid],
+      );
+
+      req.log?.warn?.({ event: 'totp_enrolment_confirmed', admin_uid: uid });
+      return res.json({ confirmed: true });
+    } catch (err) {
+      req.log?.error?.({ event: 'totp_confirm_failed', error: err.message });
+      return res.status(500).json({ error: 'internal error' });
+    }
   };
 }
