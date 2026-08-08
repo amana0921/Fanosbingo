@@ -192,6 +192,33 @@ jobs:
           # database is open on this runner is a hazard worth removing rather
           # than relying on port numbers to avoid.
           # ---------------------------------------------------------------
+          aws s3 cp "$LOCAL" "s3://${BUCKET}/${KEY}" --only-show-errors
+
+          # Confirm from the SERVICE, not from the exit code of the upload.
+          REMOTE="$(aws s3api head-object --bucket "$BUCKET" --key "$KEY" \
+            --query ContentLength --output text)"
+          if [ "$REMOTE" != "$SIZE" ]; then
+            echo "::error::Uploaded ${REMOTE} bytes but the dump is ${SIZE}."
+            exit 1
+          fi
+
+          echo "verified s3://${BUCKET}/${KEY} (${SIZE} bytes)"
+          echo "size=$SIZE" >> "$GITHUB_OUTPUT"
+
+          # HEARTBEAT HERE, not in a later step.
+          #
+          # The backup exists and is confirmed the moment the line above runs.
+          # The verification below is a check ON that backup, not a precondition
+          # OF it, so the alarm that watches for a missing backup must be
+          # satisfied before verification is attempted -- otherwise a problem in
+          # the verifier reads as "no backup was taken", which is a different and
+          # more alarming thing than what actually happened.
+          aws cloudwatch put-metric-data \
+            --namespace "FanosBingo/fanosbingo-${ENVIRONMENT}" \
+            --metric-name HoursSinceLastBackup \
+            --dimensions "Environment=${ENVIRONMENT}" \
+            --value 0 --unit Count
+
           echo "::group::restore verification"
           stop_db_tunnel || echo "  (tunnel already closed)"
           trap - EXIT
@@ -247,10 +274,22 @@ jobs:
           for i in $(seq 1 60); do
             if pg_isready -h 127.0.0.1 -p 5433 -U postgres -q; then break; fi
             if [ "$i" = "60" ]; then
-              echo "::error::Verification database never accepted connections."
+              # A WARNING, NOT A FAILURE, and the distinction is the whole point
+              # of this block's new position.
+              #
+              # The backup is already uploaded, confirmed and heartbeated by the
+              # time we get here. If the throwaway database will not start, that
+              # is a fact about this RUNNER -- not about the dump. Reporting it as
+              # a failed backup would be false, and worse, it is the kind of
+              # false alarm that gets a real one ignored later.
+              #
+              # What is lost is only the extra assurance. What is kept is the
+              # backup, which is the thing that matters at 3am.
+              echo "::warning::Verification database never started; the backup is uploaded but UNVERIFIED this run."
               pg_isready -h 127.0.0.1 -p 5433 -U postgres || true
               docker logs verifydb 2>&1 | tail -20 || true
-              exit 1
+              echo "::endgroup::"
+              exit 0
             fi
             sleep 2
           done
@@ -315,38 +354,6 @@ jobs:
           echo "::endgroup::"
           echo "restored_users=$USERS" >> "$GITHUB_OUTPUT"
 
-          aws s3 cp "$LOCAL" "s3://${BUCKET}/${KEY}" --only-show-errors
-
-          # Confirm from the SERVICE, not from the exit code of the upload.
-          REMOTE="$(aws s3api head-object --bucket "$BUCKET" --key "$KEY" \
-            --query ContentLength --output text)"
-          if [ "$REMOTE" != "$SIZE" ]; then
-            echo "::error::Uploaded ${REMOTE} bytes but the dump is ${SIZE}."
-            exit 1
-          fi
-
-          echo "verified s3://${BUCKET}/${KEY} (${SIZE} bytes)"
-          echo "size=$SIZE" >> "$GITHUB_OUTPUT"
-
-      # A HEARTBEAT, not a success message.
-      #
-      # A failure notification cannot cover the case this catches: the workflow
-      # being disabled, the schedule being removed, or GitHub simply not firing
-      # it. Nothing fails, so nothing reports, and the backups quietly stop.
-      #
-      # Publishing 0 on every success lets an alarm with
-      # treat_missing_data = "breaching" alarm on ABSENCE -- exactly the
-      # reasoning modules/monitoring gives for the game-loop alarm, and the same
-      # failure shape: a heartbeat that stops without complaining.
-      - name: Publish backup heartbeat
-        run: |
-          set -euo pipefail
-          aws cloudwatch put-metric-data \
-            --namespace "FanosBingo/fanosbingo-${ENVIRONMENT}" \
-            --metric-name HoursSinceLastBackup \
-            --dimensions "Environment=${ENVIRONMENT}" \
-            --value 0 \
-            --unit Count
 
       # Reaches email AND Telegram, because that topic now has both. A red tab
       # on a scheduled workflow is seen by nobody; this is the difference
