@@ -118,6 +118,48 @@ export function BankDepositQueue() {
         body: JSON.stringify(body),
       });
 
+
+      if (res.status === 428) {
+        // The second factor. NOT an auth failure -- the session is fine, and
+        // treating it as one would send the operator to re-login, which cannot
+        // help. Ask for the code and retry the same action.
+        //
+        // Prompted at the moment of approval rather than at sign-in, which is
+        // the whole point: a session left open otherwise credits freely. See
+        // db/20-post/016.
+        const code = window.prompt(
+          'Approving money requires your authenticator code.\n\nEnter the 6-digit code:',
+        );
+        if (!code) {
+          setError('Cancelled. Nothing was approved.');
+          return;
+        }
+
+        const retry = await fetch(`${API}/functions/v1/admin/deposits/${id}/${action}`, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${token}`,
+            'Content-Type': 'application/json',
+            'X-Admin-TOTP': code.trim(),
+          },
+          body: JSON.stringify(body),
+        });
+
+        if (retry.status === 428) {
+          setError('That code was not accepted. Check your authenticator and try again.');
+          return;
+        }
+
+        const retried = await retry.json();
+        if (!retry.ok || !retried.success) {
+          setError(retried.error ?? `Request failed (${retry.status})`);
+          return;
+        }
+
+        await load();
+        return;
+      }
+
       if (res.status === 409) {
         // Already decided. Reload rather than retry: somebody else got there, or
         // the button was pressed twice, and the useful thing is the current state.

@@ -147,6 +147,45 @@ export function BankWithdrawalQueue() {
 
       const result = await res.json().catch(() => ({}));
 
+
+      if (res.status === 428) {
+        // The second factor on recording a payout. NOT an auth failure -- the
+        // session is valid, so sending the operator to re-login could not help.
+        // Asked at the moment of the action rather than at sign-in: a session
+        // left open otherwise discharges money freely. See db/20-post/016.
+        const code = window.prompt(
+          'Recording a payout requires your authenticator code.\n\nEnter the 6-digit code:',
+        );
+        if (!code) {
+          setError('Cancelled. Nothing was recorded.');
+          return;
+        }
+
+        const retry = await fetch(`${API}/functions/v1/admin/withdrawals/${id}/${action}`, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${token}`,
+            'Content-Type': 'application/json',
+            'X-Admin-TOTP': code.trim(),
+          },
+          body: JSON.stringify(body),
+        });
+
+        if (retry.status === 428) {
+          setError('That code was not accepted. Check your authenticator and try again.');
+          return;
+        }
+
+        const retried = await retry.json().catch(() => ({}));
+        if (!retry.ok || !retried.success) {
+          setError(retried.error ?? `Request failed (${retry.status})`);
+          return;
+        }
+
+        await load();
+        return;
+      }
+
       if (res.status === 409) {
         // Three distinct causes, and the operator needs to know which.
         if (result.error_code === 'DUPLICATE_REFERENCE') {

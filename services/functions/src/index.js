@@ -63,6 +63,9 @@ import { createClaimBingoHandler } from './claim-bingo.js';
 import { createDeselectCardHandler } from './deselect-card.js';
 import {
   requireAdmin,
+  requireSecondFactor,
+  createTotpEnrollHandler,
+  createTotpConfirmHandler,
   createAdminWhoamiHandler,
   createAdminBootstrapHandler,
   createEndGameHandler,
@@ -502,6 +505,17 @@ app.get('/admin/ping', requireAuth(JWT_SECRET), requireAdmin(pool), (_req, res) 
 );
 
 /**
+ * Enrolling a second factor.
+ *
+ * NOT behind requireSecondFactor, necessarily: an admin cannot present a code
+ * from a secret they do not yet have. The enroll route refuses to overwrite a
+ * CONFIRMED enrolment instead, which is what stops this being a single-factor
+ * path to replacing the second factor.
+ */
+app.post('/admin/totp/enroll', requireAuth(JWT_SECRET), requireAdmin(pool), createTotpEnrollHandler(pool));
+app.post('/admin/totp/confirm', requireAuth(JWT_SECRET), requireAdmin(pool), createTotpConfirmHandler(pool));
+
+/**
  * Deposits.
  *
  * The player transfers to the house account themselves and files a claim; the
@@ -522,10 +536,17 @@ app.get(
   createListDepositsHandler(pool),
 );
 
+// SECOND FACTOR HERE, and on /admin/withdrawals/:id/complete, and nowhere else.
+//
+// These two are the operations that can invent money and discharge it.
+// Everything else an admin does -- reading a queue, ending a game, changing a
+// setting -- is reversible or bounded, and six digits per action is a real cost
+// to somebody clearing an overnight backlog. See db/20-post/016.
 app.post(
   '/admin/deposits/:id/approve',
   requireAuth(JWT_SECRET),
   requireAdmin(pool),
+  requireSecondFactor(pool),
   createApproveDepositHandler(pool),
 );
 
@@ -583,6 +604,7 @@ app.post(
   '/admin/withdrawals/:id/complete',
   requireAuth(JWT_SECRET),
   requireAdmin(pool),
+  requireSecondFactor(pool),
   createCompleteWithdrawalHandler(pool),
 );
 
