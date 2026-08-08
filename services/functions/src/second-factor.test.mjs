@@ -40,7 +40,7 @@ const makeReq = (over = {}) => ({
 });
 const poolOf = (row, onUpdate) => ({
   query: async (sql, params) => {
-    if (/^UPDATE/i.test(sql.trim())) { onUpdate?.(sql, params); return { rows: [] }; }
+    if (/^(UPDATE|INSERT)/i.test(sql.trim())) { onUpdate?.(sql, params); return { rows: [] }; }
     return { rows: row ? [row] : [] };
   },
 });
@@ -55,7 +55,7 @@ const run = async (mw, req) => {
 // --- enrolled: the code decides -------------------------------------------
 {
   const secret = generateSecret();
-  const row = { totp_secret: secret, totp_confirmed_at: new Date() };
+  const row = { secret: secret, confirmed_at: new Date() };
   const mw = requireSecondFactor(poolOf(row));
 
   const good = await run(mw, makeReq({ get: (h) => (h === 'X-Admin-TOTP' ? generate(secret) : undefined) }));
@@ -76,18 +76,18 @@ const run = async (mw, req) => {
 
 // --- not enrolled: must NOT block ------------------------------------------
 {
-  const mw = requireSecondFactor(poolOf({ totp_secret: null, totp_confirmed_at: null }));
+  const mw = requireSecondFactor(poolOf({ secret: null, confirmed_at: null }));
   const r = await run(mw, makeReq());
   check('an UN-ENROLLED admin is not blocked', r.nexts === 1);
 
-  const started = requireSecondFactor(poolOf({ totp_secret: generateSecret(), totp_confirmed_at: null }));
+  const started = requireSecondFactor(poolOf({ secret: generateSecret(), confirmed_at: null }));
   const r2 = await run(started, makeReq());
   check('nor is a half-finished enrolment -- it cannot lock the queue', r2.nexts === 1);
 }
 
 // --- wiring and failure modes ---------------------------------------------
 {
-  const mw = requireSecondFactor(poolOf({ totp_secret: generateSecret(), totp_confirmed_at: new Date() }));
+  const mw = requireSecondFactor(poolOf({ secret: generateSecret(), confirmed_at: new Date() }));
   const r = await run(mw, makeReq({ auth: undefined }));
   check('no req.auth is a 500, not a silent pass', r.nexts === 0 && r.res.statusCode === 500);
 
@@ -101,14 +101,14 @@ console.log('\nenrolment');
 // --- enroll ----------------------------------------------------------------
 {
   let updated = null;
-  const h = createTotpEnrollHandler(poolOf({ totp_confirmed_at: null }, (_s, p) => { updated = p; }));
+  const h = createTotpEnrollHandler(poolOf({ confirmed_at: null }, (_s, p) => { updated = p; }));
   const res = makeRes();
   await h(makeReq(), res);
 
   check('returns a secret and an otpauth uri', typeof res.body?.secret === 'string' && res.body.uri.startsWith('otpauth://'));
   check('and writes it', updated?.[1] === res.body.secret);
 
-  const confirmed = createTotpEnrollHandler(poolOf({ totp_confirmed_at: new Date() }));
+  const confirmed = createTotpEnrollHandler(poolOf({ confirmed_at: new Date() }));
   const res2 = makeRes();
   await confirmed(makeReq(), res2);
   check('REFUSES to overwrite a confirmed enrolment', res2.statusCode === 409);
@@ -119,7 +119,7 @@ console.log('\nenrolment');
 {
   const secret = generateSecret();
   let updated = false;
-  const h = createTotpConfirmHandler(poolOf({ totp_secret: secret, totp_confirmed_at: null }, () => { updated = true; }));
+  const h = createTotpConfirmHandler(poolOf({ secret: secret, confirmed_at: null }, () => { updated = true; }));
 
   const res = makeRes();
   await h(makeReq({ body: { totp: generate(secret) } }), res);
@@ -130,7 +130,7 @@ console.log('\nenrolment');
   await h(makeReq({ body: { totp: '000000' } }), res2);
   check('a wrong code does not confirm', res2.statusCode === 400 && updated === false);
 
-  const notEnrolled = createTotpConfirmHandler(poolOf({ totp_secret: null }));
+  const notEnrolled = createTotpConfirmHandler(poolOf({ secret: null }));
   const res3 = makeRes();
   await notEnrolled(makeReq({ body: { totp: '123456' } }), res3);
   check('confirming without enrolling is a 409', res3.statusCode === 409);

@@ -343,7 +343,7 @@ export function requireSecondFactor(pool) {
     let row;
     try {
       const { rows } = await pool.query(
-        'SELECT totp_secret, totp_confirmed_at FROM telegram_users WHERE id = $1',
+        'SELECT secret, confirmed_at FROM admin_totp WHERE user_id = $1',
         [uid],
       );
       row = rows[0];
@@ -355,14 +355,14 @@ export function requireSecondFactor(pool) {
     // Not enrolled: proceed, and say so in the log every time. A gap that is
     // recorded on each use is one somebody eventually closes; a silent one is
     // one that is discovered afterwards.
-    if (!row?.totp_secret || !row?.totp_confirmed_at) {
+    if (!row?.secret || !row?.confirmed_at) {
       req.log?.warn?.({ event: 'money_action_without_second_factor', admin_uid: uid, path: req.path });
       return next();
     }
 
     const token = req.get('X-Admin-TOTP') ?? req.body?.totp;
 
-    if (!verifyTotp(row.totp_secret, typeof token === 'string' ? token.trim() : token)) {
+    if (!verifyTotp(row.secret, typeof token === 'string' ? token.trim() : token)) {
       // 428, not 401 or 403. The caller IS authenticated and IS an admin -- the
       // request is refused because a precondition is unmet, and a client that
       // reads 401 as "log in again" would send the operator round a loop that
@@ -403,11 +403,11 @@ export function createTotpEnrollHandler(pool) {
 
     try {
       const { rows } = await pool.query(
-        'SELECT totp_confirmed_at FROM telegram_users WHERE id = $1',
+        'SELECT confirmed_at FROM admin_totp WHERE user_id = $1',
         [uid],
       );
 
-      if (rows[0]?.totp_confirmed_at) {
+      if (rows[0]?.confirmed_at) {
         return res.status(409).json({
           error: 'already enrolled',
           code: 'TOTP_ALREADY_ENROLLED',
@@ -419,7 +419,9 @@ export function createTotpEnrollHandler(pool) {
       // Confirmed_at stays null: a secret written but never proven is not
       // enforced, so an abandoned enrolment cannot lock the operator out.
       await pool.query(
-        'UPDATE telegram_users SET totp_secret = $2, totp_confirmed_at = NULL WHERE id = $1',
+        `INSERT INTO admin_totp (user_id, secret, confirmed_at)
+         VALUES ($1, $2, NULL)
+         ON CONFLICT (user_id) DO UPDATE SET secret = EXCLUDED.secret, confirmed_at = NULL`,
         [uid, secret],
       );
 
@@ -454,19 +456,19 @@ export function createTotpConfirmHandler(pool) {
         [uid],
       );
 
-      if (!rows[0]?.totp_secret) {
+      if (!rows[0]?.secret) {
         return res.status(409).json({ error: 'not enrolled', code: 'TOTP_NOT_ENROLLED' });
       }
-      if (rows[0].totp_confirmed_at) {
+      if (rows[0].confirmed_at) {
         return res.status(409).json({ error: 'already enrolled', code: 'TOTP_ALREADY_ENROLLED' });
       }
-      if (!verifyTotp(rows[0].totp_secret, token)) {
+      if (!verifyTotp(rows[0].secret, token)) {
         req.log?.warn?.({ event: 'totp_confirm_rejected', admin_uid: uid });
         return res.status(400).json({ error: 'invalid code', code: 'TOTP_INVALID' });
       }
 
       await pool.query(
-        'UPDATE telegram_users SET totp_confirmed_at = now() WHERE id = $1',
+        'UPDATE admin_totp SET confirmed_at = now() WHERE user_id = $1',
         [uid],
       );
 
