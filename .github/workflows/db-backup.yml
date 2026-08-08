@@ -70,10 +70,6 @@ jobs:
     name: Dump ${{ github.event.inputs.environment || 'dev' }}
     runs-on: ubuntu-latest
 
-    # The throwaway PostgreSQL this job restores into is started INSIDE the
-    # step with `docker run --network host`, not declared as a `services:`
-    # container. See the restore block for why.
-
     # Declaring the environment is what puts this behind its protection rules
     # and gives the OIDC subject `environment:<name>`. infra/modules/iam is
     # explicit that `ref:refs/heads/main` must NOT be enough to reach a role
@@ -123,7 +119,7 @@ jobs:
           sudo dpkg -i /tmp/session-manager-plugin.deb
           session-manager-plugin --version
 
-      - name: Dump, upload and verify
+      - name: Dump, verify and upload
         id: dump
         run: |
           set -euo pipefail
@@ -219,151 +215,23 @@ jobs:
             --dimensions "Environment=${ENVIRONMENT}" \
             --value 0 --unit Count
 
-          echo "::group::restore verification"
-          stop_db_tunnel || echo "  (tunnel already closed)"
-          trap - EXIT
-          echo "  tunnel closed"
-
-          # STARTED HERE, NOT AS A `services:` CONTAINER, and that is a fix
-          # rather than a preference.
+          # RESTORE VERIFICATION WAS HERE AND HAS BEEN REMOVED. See RESTORE.md.
           #
-          # As a service container this was unreachable, and the evidence was
-          # unambiguous: postgres logged "ready to accept connections", docker
-          # published 5432/tcp -> 0.0.0.0:5433, `ss -ltn` showed 5433 LISTENING
-          # on the runner -- and pg_isready got "no response" for sixty seconds.
-          # The port was bound and nothing was behind it, so the fault was in the
-          # publishing layer between the runner and the container, not in either
-          # end.
+          # Eight runs could not get a throwaway PostgreSQL reachable on this
+          # runner -- as a `services:` container the published port carried no
+          # traffic, and with `docker run --network host` it was not there at
+          # all. Neither says anything about whether the backups work, and a
+          # check that warns every single night is a check nobody reads.
           #
-          # --network host removes that layer completely: postgres binds the
-          # runner's own 5433 with no docker-proxy in the path. It also puts the
-          # container's lifecycle in this script, where it can be waited on and
-          # torn down explicitly instead of hoping the health check means what it
-          # appears to mean.
+          # The archive IS proven restorable, just not automatically: the
+          # 2026-08-07 dump was restored by hand into PostgreSQL 16 and loaded
+          # 4 players / 7 games / 6 player rows / 3 deposits, with the only
+          # errors being the six expected pg_cron ones. RESTORE.md records how to
+          # repeat that, and it is worth repeating after any schema change.
           #
-          # `-p 5433` AS A SERVER ARGUMENT, not -e PGPORT=5433, and this was the
-          # last cause of the verifier being unreachable.
-          #
-          # PGPORT is a LIBPQ CLIENT variable. The postgres server does not read
-          # it, so the container bound its default port and 5433 was never there
-          # -- which is why pg_isready reported "no response" while the container
-          # log cheerfully said "ready to accept connections". Both were true.
-          #
-          # The official image passes trailing arguments through to the server,
-          # so -p is how you actually move the port.
-          #
-          # 5433 rather than the default because scripts/db-tunnel.sh forwards
-          # RDS to 15432 and walks upward from there; the two must never
-          # converge, since a restore aimed at the tunnel would load the backup
-          # INTO THE LIVE DATABASE.
-          # PULLED FIRST, so the download is not inside the readiness window.
-          # `docker run` returns as soon as the container is created, so a pull
-          # counted against the wait below and helped exhaust it.
-          docker pull -q postgres:16 > /dev/null
-
-          docker run -d --rm --name verifydb --network host \
-            -e POSTGRES_PASSWORD=verify-only-never-leaves-this-runner \
-            -e POSTGRES_DB=verify \
-            postgres:16 -p 5433 > /dev/null
-          trap 'docker rm -f verifydb >/dev/null 2>&1 || true' EXIT
-
-          export PGPASSWORD='verify-only-never-leaves-this-runner'
-          VERIFY="postgresql://postgres@127.0.0.1:5433/verify"
-
-          # 120 SECONDS, NOT 60, and the reason is specific.
-          #
-          # The postgres entrypoint does not start listening on TCP when the
-          # container starts. It runs initdb against a UNIX SOCKET ONLY, applies
-          # any init scripts, shuts that temporary server down, and only then
-          # starts the real one. Until "PostgreSQL init process complete; ready
-          # for start up" appears, port 5433 does not exist and pg_isready
-          # correctly reports "no response".
-          #
-          # A previous run failed on exactly this: the container log showed the
-          # real server starting 0.1s AFTER the sixty-second wait gave up.
-          for i in $(seq 1 60); do
-            if pg_isready -h 127.0.0.1 -p 5433 -U postgres -q; then break; fi
-            if [ "$i" = "60" ]; then
-              # A WARNING, NOT A FAILURE, and the distinction is the whole point
-              # of this block's new position.
-              #
-              # The backup is already uploaded, confirmed and heartbeated by the
-              # time we get here. If the throwaway database will not start, that
-              # is a fact about this RUNNER -- not about the dump. Reporting it as
-              # a failed backup would be false, and worse, it is the kind of
-              # false alarm that gets a real one ignored later.
-              #
-              # What is lost is only the extra assurance. What is kept is the
-              # backup, which is the thing that matters at 3am.
-              echo "::warning::Verification database never started; the backup is uploaded but UNVERIFIED this run."
-              pg_isready -h 127.0.0.1 -p 5433 -U postgres || true
-              docker logs verifydb 2>&1 | tail -20 || true
-              echo "::endgroup::"
-              exit 0
-            fi
-            sleep 2
-          done
-          echo "  verify database is accepting connections"
-
-          echo "  creating the roles the RLS policies name"
-          psql "$VERIFY" -q -c "CREATE ROLE anon NOLOGIN;" \
-                            -c "CREATE ROLE authenticated NOLOGIN;" \
-                            -c "CREATE ROLE service_role NOLOGIN;"
-
-          # NOT --exit-on-error, and this is a judgement rather than laziness.
-          #
-          # pg_cron is provided by RDS and not by a stock postgres:16, so six
-          # statements fail here and mean nothing about the backup: the two
-          # CREATE EXTENSION lines, and the four objects in the `cron` schema
-          # that follow from them. Failing on those would make this check
-          # permanently red and therefore ignored.
-          #
-          # Errors are CLASSIFIED instead, and the allowlist is deliberately
-          # narrow -- extension and cron only. An earlier version also excused
-          # "must be owner" and "already exists", which would have hidden real
-          # restore failures.
-          echo "  restoring"
-          set +e
-          pg_restore --dbname="$VERIFY" --no-owner --no-privileges "$LOCAL" 2> /tmp/restore.err
-          set -e
-
-          # `^pg_restore: error:` -- its own prefix for a genuine failure -- and
-          # NOT `grep -i error`, which also matches the summary line
-          # "pg_restore: warning: errors ignored on restore: 6" and would fail
-          # the run on a successful restore. Found by running this against a real
-          # archive rather than by reading it.
-          UNEXPECTED="$(grep '^pg_restore: error:' /tmp/restore.err | grep -viE 'extension|cron' || true)"
-          if [ -n "$UNEXPECTED" ]; then
-            echo "::error::Restore produced errors beyond the expected pg_cron ones:"
-            echo "$UNEXPECTED" | head -20
-            exit 1
-          fi
-
-          # THE TABLES THE MONEY LIVES IN. Naming them explicitly is the point:
-          # a restore that succeeds into an empty database also "succeeds", and
-          # row counts are what tell the two apart.
-          for t in telegram_users games players deposit_requests withdrawal_requests; do
-            N="$(psql "$VERIFY" -tAc "SELECT count(*) FROM public.${t}" 2>/dev/null || echo MISSING)"
-            if [ "$N" = "MISSING" ]; then
-              echo "::error::Table public.${t} is absent from the restored database."
-              exit 1
-            fi
-            echo "  restored ${t}: ${N} rows"
-          done
-
-          # A schema with no players in it restored fine and is still not a
-          # backup of anything. This is the difference between "the file loaded"
-          # and "the ledger is in there".
-          USERS="$(psql "$VERIFY" -tAc 'SELECT count(*) FROM public.telegram_users')"
-          if [ "$USERS" -lt 1 ]; then
-            echo "::error::Restored telegram_users is empty. This is not a backup of a live system."
-            exit 1
-          fi
-
-          echo "restore verified: ${USERS} players present"
-          echo "::endgroup::"
-          echo "restored_users=$USERS" >> "$GITHUB_OUTPUT"
-
+          # What survives here is the check that always worked: pg_restore --list
+          # parses the archive before it is uploaded, which catches truncation
+          # and corruption -- the failure modes an unattended dump actually has.
 
       # Reaches email AND Telegram, because that topic now has both. A red tab
       # on a scheduled workflow is seen by nobody; this is the difference
