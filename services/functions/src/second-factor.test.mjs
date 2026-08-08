@@ -38,9 +38,25 @@ const makeReq = (over = {}) => ({
   log: { warn() {}, error() {} },
   ...over,
 });
+// The double ASSERTS THE TABLE, and that is not fussiness.
+//
+// It previously answered any SELECT with the row it was given, so
+// createTotpConfirmHandler kept passing while it read `totp_secret` from
+// `telegram_users` -- columns that do not exist on a table that is not the one
+// the secret lives in. Green tests, and a 500 for the operator on the live
+// system: "column totp_secret does not exist".
+//
+// A double that answers questions the real database would refuse is not a
+// double, it is a way of not testing.
 const poolOf = (row, onUpdate) => ({
   query: async (sql, params) => {
+    if (!/admin_totp/.test(sql)) {
+      throw new Error(`query does not target admin_totp: ${sql.replace(/\s+/g, ' ').trim()}`);
+    }
     if (/^(UPDATE|INSERT)/i.test(sql.trim())) { onUpdate?.(sql, params); return { rows: [] }; }
+    if (/totp_secret|totp_confirmed_at/.test(sql)) {
+      throw new Error(`column does not exist on admin_totp: ${sql.replace(/\s+/g, ' ').trim()}`);
+    }
     return { rows: row ? [row] : [] };
   },
 });
