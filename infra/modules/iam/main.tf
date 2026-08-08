@@ -328,15 +328,51 @@ data "aws_iam_policy_document" "github_deploy" {
   # The Environment tag is propagated to the instance by the ASG (see
   # modules/ecs), the same tag the ec2:AssociateAddress condition already relies
   # on, so this needs nothing new to be true.
+  # TWO STATEMENTS, NOT ONE, AND THAT IS A BUG FIX.
+  #
+  # StartSession touches TWO resources -- the SSM document that implements port
+  # forwarding, and the instance being tunnelled through -- and IAM must allow
+  # BOTH. This used to be a single statement listing both resources under one
+  # `ssm:resourceTag/Environment` condition, which cannot work: the document is
+  # AWS-owned and carries no tags, so the condition can never be satisfied for
+  # it and the whole request is denied.
+  #
+  # It broke the migration path to the production database on 2026-08-01 and
+  # nobody noticed for a week, because nothing runs a migration unless somebody
+  # asks it to. The symptom is unhelpful:
+  #
+  #   AccessDeniedException: not authorized to perform ssm:StartSession on
+  #   resource .../document/AWS-StartPortForwardingSessionToRemoteHost
+  #
+  # which reads as "the document is not allowed" when the document IS listed --
+  # the condition is what excludes it.
+  #
+  # PROVEN with the IAM simulator rather than by another failed run:
+  #
+  #   before  document -> implicitDeny,  dev instance -> allowed
+  #   after   document -> allowed,       dev instance -> allowed,
+  #           PROD-tagged instance -> implicitDeny
+  #
+  # THE SCOPING IS UNCHANGED, which is the part that matters. The document is
+  # only the mechanism; what constrains a tunnel is which INSTANCE it may
+  # terminate at, and that condition stays exactly where it was. AGENTS.md notes
+  # that naming the document in Resource constrains nothing -- still true, and
+  # still why the tag condition is on the instance.
   statement {
-    sid     = "OpenDatabaseTunnel"
-    effect  = "Allow"
-    actions = ["ssm:StartSession"]
-    resources = [
-      "arn:${local.partition}:ec2:*:${local.account_id}:instance/*",
-      "arn:${local.partition}:ssm:*::document/AWS-StartPortForwardingSessionToRemoteHost",
-    ]
+    sid       = "OpenTunnelDocument"
+    effect    = "Allow"
+    actions   = ["ssm:StartSession"]
+    resources = ["arn:${local.partition}:ssm:*::document/AWS-StartPortForwardingSessionToRemoteHost"]
+  }
 
+  statement {
+    sid       = "OpenTunnelTarget"
+    effect    = "Allow"
+    actions   = ["ssm:StartSession"]
+    resources = ["arn:${local.partition}:ec2:*:${local.account_id}:instance/*"]
+
+    # The real constraint: a session may only terminate at an instance tagged
+    # for this environment, so the dev role cannot tunnel into prod.
     condition {
       test     = "StringEquals"
       variable = "ssm:resourceTag/Environment"

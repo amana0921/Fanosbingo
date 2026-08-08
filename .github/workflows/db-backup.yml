@@ -92,7 +92,18 @@ jobs:
       - name: Assume AWS role
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          # THE SCOPED DEPLOY ROLE, not vars.AWS_ROLE_ARN.
+          #
+          # That variable is the TERRAFORM EXECUTOR, which holds
+          # AdministratorAccess -- so this workflow was taking a nightly dump of
+          # the ledger with full admin rights, and every restriction written for
+          # it in modules/iam was decorative because nothing used them: write-only
+          # to its own prefix, no GetObject, no DeleteObject, sns:Publish scoped
+          # to one topic. A policy that nothing assumes constrains nothing.
+          #
+          # The other database workflows already use this role; this one was the
+          # odd path out.
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/fanosbingo-${{ github.event.inputs.environment || 'dev' }}-github-deploy
           aws-region: ${{ vars.AWS_REGION }}
           role-session-name: db-backup-${{ github.run_id }}
 
