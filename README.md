@@ -367,6 +367,19 @@ that sentence**, which is a different failure from not knowing:
 > `<prefix>-backup-did-not-run`, which treats **absent data as breaching** — so
 > the workflow being disabled, or GitHub never firing the cron, alarms. A failure
 > notification alone cannot cover that: nothing fails, so nothing reports.
+>
+> **See [RESTORE.md](RESTORE.md) before you need it.** It covers which of the two
+> paths to reach for, and the one mistake that turns a good backup into a bad
+> recovery: `--no-privileges` does not skip RLS policies, so restoring without
+> first creating `anon`, `authenticated` and `service_role` silently drops every
+> policy and leaves a database that looks restored and has lost its authorization
+> layer.
+>
+> **Restorability is proven by hand, not automatically.** The 2026-08-07 dump was
+> restored into PostgreSQL 16 and loaded 4 players / 7 games / 3 deposits. Eight
+> CI runs failed to get a throwaway database reachable on a GitHub runner, so
+> that check was removed rather than left warning every night — RESTORE.md
+> records what was ruled out. Repeat the manual restore after any schema change.
 - `terraform.yml`'s destroy job refused `prod` and `account` and waved `dev`
   through, on the same assumption. Destroy now requires the environment name to
   be **typed**, and refuses any environment whose database has deletion
