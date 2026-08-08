@@ -21,6 +21,8 @@ import { CRYPTO_ENABLED } from '../lib/features';
 // manage-bnb-withdrawal, get-withdrawal-wallet-info -- are all 404 today, so
 // with crypto deferred these panels could only ever show an error. Nothing is
 // deleted: flip VITE_CRYPTO_ENABLED and they return. See src/lib/features.ts.
+import { TotpEnrollment } from './TotpEnrollment';
+
 const DepositManagement = lazy(() =>
   import('./DepositManagement').then((m) => ({ default: m.DepositManagement })),
 );
@@ -50,6 +52,8 @@ interface UserSpending {
 
 export function Admin() {
   const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [totpEnrolled, setTotpEnrolled] = useState(false);
+  const [totpStarted, setTotpStarted] = useState(false);
   const [accessKey, setAccessKey] = useState('');
   const [games, setGames] = useState<Game[]>([]);
   const [playersByGame, setPlayersByGame] = useState<Record<string, Player[]>>({});
@@ -423,8 +427,10 @@ export function Admin() {
       );
 
       if (whoami.ok) {
-        const { is_admin } = await whoami.json();
+        const { is_admin, totp_enrolled, totp_started } = await whoami.json();
         if (is_admin) {
+          setTotpEnrolled(totp_enrolled === true);
+          setTotpStarted(totp_started === true);
           setIsAuthenticated(true);
           return;
         }
@@ -859,6 +865,17 @@ export function Admin() {
 
         {currentPage === 'settings' && (
           <div className="bg-white rounded-2xl shadow-xl p-6 mb-6">
+            {/* First on the page, because it is the only setting here that
+                decides whether a stolen session can move money. */}
+            <div className="mb-6">
+              <h2 className="text-2xl font-bold text-gray-900 mb-3">Security</h2>
+              <TotpEnrollment
+                enrolled={totpEnrolled}
+                started={totpStarted}
+                onEnrolled={() => setTotpEnrolled(true)}
+              />
+            </div>
+
             <div className="flex items-center justify-between mb-4">
               <h2 className="text-2xl font-bold text-gray-900">Telegram Bot Settings</h2>
               <button

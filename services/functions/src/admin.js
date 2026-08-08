@@ -86,10 +86,24 @@ export function requireAdmin(pool) {
 export function createAdminWhoamiHandler(pool) {
   return async function adminWhoami(req, res) {
     const { rows } = await pool.query(
-      'SELECT is_admin FROM telegram_users WHERE id = $1',
+      `SELECT u.is_admin,
+              (t.secret IS NOT NULL)       AS totp_started,
+              (t.confirmed_at IS NOT NULL) AS totp_enrolled
+         FROM telegram_users u
+         LEFT JOIN admin_totp t ON t.user_id = u.id
+        WHERE u.id = $1`,
       [req.auth.uid],
     );
-    return res.json({ uid: req.auth.uid, is_admin: rows[0]?.is_admin === true });
+    // totp_* reported here rather than from a route of their own: the panel
+    // already calls whoami on load to decide whether to render at all, and one
+    // boolean does not justify a second round trip on a mobile network this
+    // project's rate-limit reasoning is written around.
+    return res.json({
+      uid: req.auth.uid,
+      is_admin: rows[0]?.is_admin === true,
+      totp_started: rows[0]?.totp_started === true,
+      totp_enrolled: rows[0]?.totp_enrolled === true,
+    });
   };
 }
 

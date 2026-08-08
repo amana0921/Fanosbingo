@@ -41,8 +41,16 @@ function fakePool({ isAdmin = false, adminCount = 0, promoted = true } = {}) {
       if (sql.startsWith('UPDATE telegram_users')) {
         return { rows: promoted ? [{ id: UID, telegram_user_id: 424946351 }] : [] };
       }
-      if (sql.includes('SELECT is_admin')) {
-        return { rows: isAdmin === null ? [] : [{ is_admin: isAdmin }] };
+      // Matches both shapes: requireAdmin reads is_admin alone, while
+      // /admin/whoami joins admin_totp and therefore selects `u.is_admin`.
+      // Matching only the bare string silently returned no rows for whoami,
+      // which read as "not an admin" rather than as a broken double.
+      if (/SELECT\s+(u\.)?is_admin/.test(sql)) {
+        return {
+          rows: isAdmin === null
+            ? []
+            : [{ is_admin: isAdmin, totp_started: false, totp_enrolled: false }],
+        };
       }
       return { rows: [] };
     },
